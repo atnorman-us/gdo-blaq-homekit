@@ -4,3 +4,7 @@ dependencies.lock
 .cache
 .aider*
 sdkconfig.old
+sdkconfig
+.vscode
+.clangd
+

@@ -140,8 +140,6 @@ void homekit_task_entry(void* ctx) {
 
     hap_start();
 
-    wifi_init_sta();
-
     GDOEvent e;
 
     hap_char_t* dest = NULL;

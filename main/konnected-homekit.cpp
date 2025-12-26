@@ -86,24 +86,6 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
 
 extern "C" void app_main(void)
 {
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << GPIO_NUM_5);
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    gpio_config(&io_conf);
-
-    int gpio_level = gpio_get_level(GPIO_NUM_5);
-    if (gpio_level == 0) {
-        ESP_LOGI(TAG, "reset is low, entering infinite loop");
-        while (1) {
-            vTaskDelay(portMAX_DELAY);
-        }
-    } else {
-        ESP_LOGI(TAG, "reset not triggered");
-    }
-
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart = true;
     gdo_conf.obst_from_status = true;

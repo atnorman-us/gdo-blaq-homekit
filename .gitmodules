@@ -1,6 +1,9 @@
 [submodule "components/gdolib"]
 	path = components/gdolib
 	url = https://github.com/konnected-io/gdolib.git
+[submodule "components/nvs_wifi_connect"]
+	path = components/nvs_wifi_connect
+	url = https://github.com/h2zero/nvs_wifi_connect.git
 [submodule "esp-homekit-sdk"]
 	path = esp-homekit-sdk
 	url = https://github.com/espressif/esp-homekit-sdk.git
