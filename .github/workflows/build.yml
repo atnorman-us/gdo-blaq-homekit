@@ -71,11 +71,16 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ github.token }}
 
+    - name: Rename binary
+      if: github.event.release
+      run: |
+        mv build/konnected-gdo-blaq-homekit.bin build/konnected-gdo-blaq-homekit-${{ steps.get_release.outputs.tag_name }}.bin
+
     - name: Upload asset to release
       if: github.event.release
       uses: bgpat/release-asset-action@03b0c30db1c4031ce3474740b0e4275cd7e126a3
       with:
-        pattern: build/konnected-gdo-blaq-homekit.bin
+        pattern: build/konnected-gdo-blaq-homekit-${{ steps.get_release.outputs.tag_name }}.bin
         release-url: ${{ steps.get_release.outputs.upload_url }}
         allow-overwrite: true
         github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -85,7 +90,7 @@ jobs:
       uses: keithweaver/aws-s3-github-action@v1.0.0
       with:
         command: cp
-        source: build/konnected-gdo-blaq-homekit.bin
+        source: build/konnected-gdo-blaq-homekit-${{ steps.get_release.outputs.tag_name }}.bin
         destination: s3://konnected-io/builds/homekit/konnected-gdo-blaq-homekit-${{ steps.get_release.outputs.tag_name }}.bin
         aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
