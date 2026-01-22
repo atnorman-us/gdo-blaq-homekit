@@ -6,11 +6,16 @@ on:
   pull_request:
     branches: [ main, develop ]
   workflow_dispatch:
+  release:
+    types: [ created ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
     steps:
     - name: Checkout repository with submodules
       uses: actions/checkout@v4
@@ -64,3 +69,52 @@ jobs:
         name: build-size-report
         path: size-report.txt
         if-no-files-found: ignore
+
+    - name: Get release
+      if: github.event.release
+      id: get_release
+      uses: bruceadams/get-release@v1.3.2
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+
+    - name: Upload asset to release
+      if: github.event.release
+      uses: bgpat/release-asset-action@03b0c30db1c4031ce3474740b0e4275cd7e126a3
+      with:
+        pattern: build/konnected-gdo-blaq-homekit.bin
+        release-url: ${{ steps.get_release.outputs.upload_url }}
+        allow-overwrite: true
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload firmware image to S3
+      if: github.event.release
+      uses: keithweaver/aws-s3-github-action@v1.0.0
+      with:
+        command: cp
+        source: build/konnected-gdo-blaq-homekit.bin
+        destination: s3://konnected-io/builds/homekit/konnected-gdo-blaq-homekit-${{ steps.get_release.outputs.tag_name }}.bin
+        aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws_region: us-east-2
+        flags: --acl public-read
+
+    - name: Build Manifest
+      if: github.event.release
+      run: |
+        mkdir -p install-konnected/manifests
+        ruby ./scripts/update-espwebtools-manifest.rb
+      env:
+        MANIFEST_NAME: Konnected GDO blaQ (GDOv2-Q) for HomeKit
+        MANIFEST_FNAME: homekit-gdov2-q.json
+        MANIFEST_VERSION: ${{ steps.get_release.outputs.tag_name }}
+        ESP32_S3_IMAGE_URI: https://konnected-io.s3.us-east-2.amazonaws.com/builds/homekit/konnected-gdo-blaq-homekit-${{ steps.get_release.outputs.tag_name }}.bin
+
+    - name: Deploy
+      if: github.event.release
+      uses: reggionick/s3-deploy@v4
+      with:
+        folder: install-konnected
+        bucket: install-konnected
+        bucket-region: us-east-1
+        dist-id: E2FDL2RANMI9J7
+        invalidation: /manifests/*
