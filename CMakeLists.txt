@@ -9,4 +9,4 @@ endif(DEFINED ENV{HOMEKIT_PATH})
 set(EXTRA_COMPONENT_DIRS ${HOMEKIT_PATH}/components ${HOMEKIT_PATH}/components/homekit)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(konnected-homekit)
+project(gdo-blaq-homekit)
