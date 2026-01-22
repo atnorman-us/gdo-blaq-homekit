@@ -1,5 +1,5 @@
-# Konnected HomeKit Firmware
- This is the firmware for Konnected's HomeKit-enabled door opener.
+# HomeKit Firmware for the GDO blaQ
+ This is a HomeKit native firmware for Konnected's GDO blaQ, a smart garage door opener control accessory for Chamberlain/LiftMaster/Craftsman/Merlin garage openers with Security+ or Security+2.0.
   
  ## Submodules
  
