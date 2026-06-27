@@ -31,6 +31,72 @@ char device_name[DEVICE_NAME_SIZE];
 // Make serial_number available
 char serial_number[SERIAL_NAME_SIZE];
 
+// minimal watchdog task to monitor HomeKit transport state and restart if not running
+static void minimal_hap_watchdog_task(void *pvParameters)
+{
+    while (true) {
+        // Check WiFi
+        wifi_ap_record_t ap_info;
+        bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+
+        // Check IP
+        esp_netif_ip_info_t ip_info;
+        bool ip_ok = (esp_netif_get_ip_info(
+            esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
+
+        // Only check HomeKit if WiFi + IP are good
+        if (wifi_ok && ip_ok) {
+            hap_server_state_t state = hap_get_server_state();
+
+            if (state != HAP_SERVER_STATE_RUNNING) {
+                ESP_LOGE(TAG, "HomeKit transport not running — restarting");
+                hap_stop();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                hap_start();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));  // check every 10 seconds
+    }
+}
+
+// Wifi event handler to handle disconnections and reconnections
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected — retrying");
+        esp_wifi_connect();
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "Got IP — network restored");
+    }
+}
+
+// Watchdog task to monitor network connectivity and attempt reconnection if lost
+static void network_watchdog_task(void *pvParameters)
+{
+    while (true) {
+        wifi_ap_record_t ap_info;
+        esp_netif_ip_info_t ip_info;
+
+        bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+        bool ip_ok = (esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
+
+        if (!wifi_ok || !ip_ok) {
+            ESP_LOGW(TAG, "Network lost — reconnecting");
+            esp_wifi_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_wifi_connect();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));  // check every 5 seconds
+    }
+}
+
+
 // Queue to store GDO notification events
 static QueueHandle_t gdo_notif_event_q;
 
@@ -139,6 +205,15 @@ void homekit_task_entry(void* ctx) {
     app_wifi_init();
 
     hap_start();
+
+    // Register WiFi/IP event handlers
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    // Start watchdog
+    xTaskCreate(network_watchdog_task, "net_watchdog", 4096, NULL, 5, NULL);
+    // Start minimal HomeKit watchdog
+    xTaskCreate(minimal_hap_watchdog_task, "hap_watchdog", 4096, NULL, 5, NULL);
 
     GDOEvent e;
 
