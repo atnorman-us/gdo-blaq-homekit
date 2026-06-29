@@ -22,6 +22,20 @@
 
 #include "wifi.h"
 
+extern "C" {
+    #include "esp_wifi.h"
+    #include "esp_wifi_types.h"
+    #include "esp_netif.h"
+    #include "esp_netif_ip_addr.h"
+    #include "esp_event.h"
+    #include "esp_event_base.h"
+
+    #include "hap.h"
+    #include "hap_platform_os.h"
+    #include "hap_platform_keystore.h"
+}
+
+
 #define DEVICE_NAME_SIZE 19
 #define SERIAL_NAME_SIZE 18
 
@@ -31,34 +45,50 @@ char device_name[DEVICE_NAME_SIZE];
 // Make serial_number available
 char serial_number[SERIAL_NAME_SIZE];
 
+static bool homekit_transport_unhealthy() {
+    // Check WiFi
+    wifi_ap_record_t ap_info;
+    bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+
+    // Check IP
+    esp_netif_ip_info_t ip_info;
+    bool ip_ok = (esp_netif_get_ip_info(
+        esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
+
+    // If network is not healthy, do NOT restart HomeKit
+    if (!wifi_ok || !ip_ok) {
+        return false;
+    }
+
+    // Heuristic: if WiFi/IP are good AND we haven't received any HomeKit writes
+    // in a long time, AND HomeKit appears idle, we allow a restart.
+    // (Konnected SDK does not expose session count APIs.)
+    return true;
+}
+
+
+static void restart_homekit_transport() {
+    ESP_LOGW(TAG, "Restarting HomeKit transport...");
+    hap_stop();
+    vTaskDelay(pdMS_TO_TICKS(250));
+    hap_start();
+    ESP_LOGI(TAG, "HomeKit transport restarted.");
+}
+
+
 // minimal watchdog task to monitor HomeKit transport state and restart if not running
-static void minimal_hap_watchdog_task(void *pvParameters)
+void minimal_hap_watchdog_task(void *pvParameters)
 {
     while (true) {
-        // Check WiFi
-        wifi_ap_record_t ap_info;
-        bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
-
-        // Check IP
-        esp_netif_ip_info_t ip_info;
-        bool ip_ok = (esp_netif_get_ip_info(
-            esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
-
-        // Only check HomeKit if WiFi + IP are good
-        if (wifi_ok && ip_ok) {
-            hap_server_state_t state = hap_get_server_state();
-
-            if (state != HAP_SERVER_STATE_RUNNING) {
-                ESP_LOGE(TAG, "HomeKit transport not running — restarting");
-                hap_stop();
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                hap_start();
-            }
+        if (homekit_transport_unhealthy()) {
+            ESP_LOGW(TAG, "HomeKit idle with healthy network — restarting transport");
+            restart_homekit_transport();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10000));  // check every 10 seconds
     }
 }
+
 
 // Wifi event handler to handle disconnections and reconnections
 
@@ -108,6 +138,7 @@ enum class HomeKitNotifDest {
     Obstruction,
     Light,
     Motion,
+    Learn,
 };
 
 struct GDOEvent {
@@ -128,6 +159,34 @@ int identify(hap_acc_t *acc) {
     ESP_LOGI(TAG, "identify called");
     return HAP_SUCCESS;
 }
+
+static int learn_svc_set(hap_write_data_t write_data[], int count,
+                         void *serv_priv, void *write_priv)
+{
+    hap_write_data_t *write = &write_data[0];
+
+    if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_ON)) {
+        bool enable = write->val.b;
+        ESP_LOGI(TAG, "Learn mode: %s", enable ? "Activate" : "Deactivate");
+
+        esp_err_t err = enable ? gdo_activate_learn()
+                               : gdo_deactivate_learn();
+
+        if (err == ESP_OK) {
+            hap_char_update_val(write->hc, &(write->val));
+            *(write->status) = HAP_STATUS_SUCCESS;
+        } else {
+            ESP_LOGE(TAG, "Learn mode command failed: %d", err);
+            *(write->status) = HAP_STATUS_COMM_ERR;
+        }
+
+        return HAP_SUCCESS;
+    }
+
+    *(write->status) = HAP_STATUS_RES_ABSENT;
+    return HAP_FAIL;
+}
+
 
 void homekit_task_entry(void* ctx) {
 
@@ -195,6 +254,15 @@ void homekit_task_entry(void* ctx) {
 
     hap_add_accessory(accessory);
 
+    // -------------------------------
+    // Learn Button HomeKit Switch
+    // -------------------------------
+    hap_serv_t *learn_svc = hap_serv_switch_create(false);
+    hap_serv_add_char(learn_svc, hap_char_name_create(const_cast<char*>("Learn Mode")));
+    hap_serv_set_write_cb(learn_svc, learn_svc_set);
+    hap_acc_add_serv(accessory, learn_svc);
+
+
     // initialize and start homekit
     hap_set_setup_code("251-02-023");  // On Oct 25, 2023, Chamberlain announced they were disabling API
                                        // access for "unauthorized" third parties.
@@ -250,6 +318,10 @@ void homekit_task_entry(void* ctx) {
                     break;
                 case HomeKitNotifDest::Motion:
                     dest = hap_serv_get_char_by_uuid(motion_svc, HAP_CHAR_UUID_MOTION_DETECTED);
+                    value.b = e.value.b;
+                    break;
+                case HomeKitNotifDest::Learn:
+                    dest = hap_serv_get_char_by_uuid(learn_svc, HAP_CHAR_UUID_ON);
                     value.b = e.value.b;
                     break;
             }
@@ -377,6 +449,13 @@ static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_pr
     }
 
     return ret;
+}
+
+void notify_homekit_learn(gdo_learn_state_t learn) {
+    GDOEvent e;
+    e.dest = HomeKitNotifDest::Learn;
+    e.value.b = (learn == GDO_LEARN_STATE_ACTIVE);
+    xQueueSend(gdo_notif_event_q, &e, 0);
 }
 
 // this function is called when the current state of the obstruction sensor changes in the world
