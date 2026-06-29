@@ -389,11 +389,41 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
                     hap_char_update_val(write->hc, &(write->val));
                     *(write->status) = HAP_STATUS_SUCCESS;
                     break;
-                case TGT_CLOSED:
+                case TGT_CLOSED: {
+
+    ESP_LOGI(TAG, "Remote close requested");
+
+    // Retrieve current GDO status so we know the protocol
+                    gdo_status_t st;
+                    gdo_get_status(&st);
+
+                    bool is_secplus2 = (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
+
+                    if (!is_secplus2) {
+                        // UL-325 warning for Security+ 1.0
+                        ESP_LOGW(TAG, "UL-325 warning: Security+ 1.0 — generating 5-second alert");
+
+                        // Smart panel beeps automatically when the light is flashed
+                        for (int i = 0; i < 5; i++) {
+                            gdo_light_on();
+                            vTaskDelay(pdMS_TO_TICKS(500));
+
+                            gdo_light_off();
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                        }
+                    } else {
+                        ESP_LOGI(TAG, "Security+ 2.0 — opener will handle UL-325 warning automatically");
+                    }
+
+                    // Now close the door (both protocols)
                     gdo_door_close();
+
                     hap_char_update_val(write->hc, &(write->val));
                     *(write->status) = HAP_STATUS_SUCCESS;
+
                     break;
+                }
+
                 default:
                     ESP_LOGE(TAG, "invalid target door state set requested: %" PRIu32, write->val.u);
                     *(write->status) = HAP_STATUS_VAL_INVALID;
