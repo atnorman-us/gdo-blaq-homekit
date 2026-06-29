@@ -13,6 +13,13 @@
 #include "homekit_decl.h"
 #include "homekit.h"
 
+static gdo_light_state_t last_light = GDO_LIGHT_STATE_MAX;
+static gdo_lock_state_t last_lock = GDO_LOCK_STATE_MAX;
+static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
+static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
+static gdo_motion_state_t last_motion = GDO_MOTION_STATE_MAX;
+static gdo_learn_state_t last_learn = GDO_LEARN_STATE_MAX;
+
 static const char* TAG = "test_main";
 
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
@@ -23,7 +30,6 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
             ESP_LOGI(TAG, "Client ID: %" PRIu32 ", Rolling code: %" PRIu32, status->client_id, status->rolling_code);
         }
-
         if (!status->synced) {
             if (gdo_set_rolling_code(status->rolling_code + 100) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to set rolling code");
@@ -34,29 +40,48 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         }
         break;
     case GDO_CB_EVENT_LIGHT:
-        ESP_LOGI(TAG, "Light: %s", gdo_light_state_to_string(status->light));
-        notify_homekit_light(status->light);
+        if (status->light != last_light) {
+            last_light = status->light;
+            ESP_LOGI(TAG, "Light: %s", gdo_light_state_to_string(status->light));
+            notify_homekit_light(status->light);
+        }
         break;
     case GDO_CB_EVENT_LOCK:
-        ESP_LOGI(TAG, "Lock: %s", gdo_lock_state_to_string(status->lock));
-        notify_homekit_current_lock(status->lock);
+        if (status->lock != last_lock) {
+            last_lock = status->lock;
+            ESP_LOGI(TAG, "Lock: %s", gdo_lock_state_to_string(status->lock));
+            notify_homekit_current_lock(status->lock);
+        }
         break;
     case GDO_CB_EVENT_DOOR_POSITION:
-        ESP_LOGI(TAG, "Door: %s, %.2f%%, target: %.2f%%", gdo_door_state_to_string(status->door),
-                 (float)status->door_position, (float)status->door_target);
-        notify_homekit_current_door_state_change(status->door);
+        if (status->door != last_door) {
+            last_door = status->door;
+            ESP_LOGI(TAG, "Door: %s, %.2f%%, target: %.2f%%",
+                    gdo_door_state_to_string(status->door),
+                    (float)status->door_position,
+                    (float)status->door_target);
+            notify_homekit_current_door_state_change(status->door);
+        }
         break;
+
     case GDO_CB_EVENT_LEARN:
-        ESP_LOGI(TAG, "Learn: %s", gdo_learn_state_to_string(status->learn));
+        // Learn is not supported on Security+ 1.0 — ignore
         break;
+
     case GDO_CB_EVENT_OBSTRUCTION:
-        ESP_LOGI(TAG, "Obstruction: %s", gdo_obstruction_state_to_string(status->obstruction));
-        notify_homekit_obstruction(status->obstruction);
+        if (status->obstruction != last_obstruction) {
+            last_obstruction = status->obstruction;
+            ESP_LOGI(TAG, "Obstruction: %s", gdo_obstruction_state_to_string(status->obstruction));
+            notify_homekit_obstruction(status->obstruction);
+        }
         break;
     case GDO_CB_EVENT_MOTION:
-        ESP_LOGI(TAG, "Motion: %s", gdo_motion_state_to_string(status->motion));
-        notify_homekit_motion(status->motion);
-        break;
+        if (status->motion != last_motion) {
+            last_motion = status->motion;
+            ESP_LOGI(TAG, "Motion: %s", gdo_motion_state_to_string(status->motion));
+            notify_homekit_motion(status->motion);
+        }
+        break; 
     case GDO_CB_EVENT_BATTERY:
         ESP_LOGI(TAG, "Battery: %s", gdo_battery_state_to_string(status->battery));
         break;
