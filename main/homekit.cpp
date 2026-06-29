@@ -33,8 +33,13 @@ extern "C" {
     #include "hap.h"
     #include "hap_platform_os.h"
     #include "hap_platform_keystore.h"
+
+    #include "esp_timer.h"   // ← REQUIRED for esp_timer_get_time()
 }
 
+static bool learn_supported = false;
+static uint32_t last_hap_restart_ms = 0;
+static const uint32_t MIN_RESTART_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
 
 #define DEVICE_NAME_SIZE 19
 #define SERIAL_NAME_SIZE 18
@@ -55,26 +60,28 @@ static bool homekit_transport_unhealthy() {
     bool ip_ok = (esp_netif_get_ip_info(
         esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
 
-    // If network is not healthy, do NOT restart HomeKit
     if (!wifi_ok || !ip_ok) {
+        return false;  // Never restart HomeKit during network instability
+    }
+
+    // Debounce: ensure enough time has passed since last restart
+    uint32_t now = esp_timer_get_time() / 1000;  // microseconds → ms
+    if (now - last_hap_restart_ms < MIN_RESTART_INTERVAL_MS) {
         return false;
     }
 
-    // Heuristic: if WiFi/IP are good AND we haven't received any HomeKit writes
-    // in a long time, AND HomeKit appears idle, we allow a restart.
-    // (Konnected SDK does not expose session count APIs.)
+    // If we reach here, network is good and restart interval has passed.
     return true;
 }
-
 
 static void restart_homekit_transport() {
     ESP_LOGW(TAG, "Restarting HomeKit transport...");
     hap_stop();
     vTaskDelay(pdMS_TO_TICKS(250));
     hap_start();
+    last_hap_restart_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "HomeKit transport restarted.");
 }
-
 
 // minimal watchdog task to monitor HomeKit transport state and restart if not running
 void minimal_hap_watchdog_task(void *pvParameters)
@@ -85,7 +92,7 @@ void minimal_hap_watchdog_task(void *pvParameters)
             restart_homekit_transport();
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10000));  // check every 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(30000));  // check every 30 seconds
     }
 }
 
@@ -187,7 +194,6 @@ static int learn_svc_set(hap_write_data_t write_data[], int count,
     return HAP_FAIL;
 }
 
-
 void homekit_task_entry(void* ctx) {
 
     uint8_t mac[8] = {0};
@@ -255,13 +261,19 @@ void homekit_task_entry(void* ctx) {
     hap_add_accessory(accessory);
 
     // -------------------------------
-    // Learn Button HomeKit Switch
+    // Learn Button HomeKit Switch (Sec+ v2 only)
     // -------------------------------
-    hap_serv_t *learn_svc = hap_serv_switch_create(false);
-    hap_serv_add_char(learn_svc, hap_char_name_create(const_cast<char*>("Learn Mode")));
-    hap_serv_set_write_cb(learn_svc, learn_svc_set);
-    hap_acc_add_serv(accessory, learn_svc);
+    hap_serv_t *learn_svc = NULL;
 
+    if (learn_supported) {
+        learn_svc = hap_serv_switch_create(false);
+        hap_serv_add_char(learn_svc, hap_char_name_create(const_cast<char*>("Learn Mode")));
+        hap_serv_set_write_cb(learn_svc, learn_svc_set);
+        hap_acc_add_serv(accessory, learn_svc);
+        ESP_LOGI(TAG, "Learn Mode supported — HomeKit Learn tile enabled");
+    } else {
+        ESP_LOGW(TAG, "Learn Mode NOT supported — HomeKit Learn tile hidden");
+    }
 
     // initialize and start homekit
     hap_set_setup_code("251-02-023");  // On Oct 25, 2023, Chamberlain announced they were disabling API
@@ -273,6 +285,17 @@ void homekit_task_entry(void* ctx) {
     app_wifi_init();
 
     hap_start();
+
+    // Determine if Learn Mode is supported (Sec+ v2 only)
+    gdo_status_t st;
+    gdo_get_status(&st);
+
+    learn_supported = (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
+
+    if (!learn_supported) {
+        ESP_LOGW(TAG, "Learn Mode disabled: opener protocol is not Security+ 2.0");
+    }
+
 
     // Register WiFi/IP event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
@@ -321,8 +344,12 @@ void homekit_task_entry(void* ctx) {
                     value.b = e.value.b;
                     break;
                 case HomeKitNotifDest::Learn:
-                    dest = hap_serv_get_char_by_uuid(learn_svc, HAP_CHAR_UUID_ON);
-                    value.b = e.value.b;
+                    if (learn_supported && learn_svc) {
+                        dest = hap_serv_get_char_by_uuid(learn_svc, HAP_CHAR_UUID_ON);
+                        value.b = e.value.b;
+                    } else {
+                        dest = NULL;  // ignore learn notifications
+                    }
                     break;
             }
             if (dest) {
@@ -452,6 +479,10 @@ static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_pr
 }
 
 void notify_homekit_learn(gdo_learn_state_t learn) {
+    if (!learn_supported) {
+        return; // ignore learn events entirely
+    }
+
     GDOEvent e;
     e.dest = HomeKitNotifDest::Learn;
     e.value.b = (learn == GDO_LEARN_STATE_ACTIVE);
