@@ -1,3 +1,4 @@
+#include "homekit_notify.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -6,6 +7,7 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "wifi.h"
+#include <inttypes.h> 
 
 #include "gdo.h"
 
@@ -62,57 +64,54 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         }
         break;
 
-    case GDO_CB_EVENT_DOOR_POSITION: {
+case GDO_CB_EVENT_DOOR_POSITION: {
 
-        ESP_LOGI(TAG, "Door raw: %s, %.2f%%, target: %.2f%%",
-                gdo_door_state_to_string(status->door),
-                (float)status->door_position,
-                (float)status->door_target);
+    uint32_t raw = status->door_position;
+    if (raw > 10000) raw = 10000;
 
-        gdo_door_state_t inferred;
+    ESP_LOGI(TAG,
+             "Door raw: %s, raw=%" PRIu32 ", target=%" PRIu32,
+             gdo_door_state_to_string(status->door),
+             raw,
+             (uint32_t)status->door_target);
 
-        // Fully closed
-        if (status->door_position >= 9999) {
+    gdo_door_state_t inferred = status->door;
+
+    if (status->door == GDO_DOOR_STATE_STOPPED ||
+        status->door == GDO_DOOR_STATE_MAX) {
+
+        if (raw <= 1) {
+            inferred = GDO_DOOR_STATE_OPEN;
+        } else if (raw >= 9999) {
             inferred = GDO_DOOR_STATE_CLOSED;
         }
-        // Fully open
-        else if (status->door_position <= 1) {
-            inferred = GDO_DOOR_STATE_OPEN;
-        }
-        else {
-            // Movement direction from position delta
-            static float last_pos = -1;
-
-            if (last_pos >= 0) {
-                if (status->door_position < last_pos) {
-                    inferred = GDO_DOOR_STATE_OPENING;
-                } else if (status->door_position > last_pos) {
-                    inferred = GDO_DOOR_STATE_CLOSING;
-                } else {
-                    inferred = last_door; // no movement
-                }
-            } else {
-                inferred = last_door; // first sample
-            }
-
-            last_pos = status->door_position;
-        }
-
-        // Notify HomeKit only when inferred state changes
-        if (inferred != last_door) {
-            last_door = inferred;
-            notify_homekit_current_door_state_change(inferred);
-        }
-
-        // Light updates
-        if (status->light != last_light) {
-            last_light = status->light;
-            notify_homekit_light(status->light);
-        }
-
-        break;
     }
 
+    // PATCH: Update HomeKit TargetDoorState when movement begins
+    if (inferred != last_door) {
+
+        if (inferred == GDO_DOOR_STATE_OPENING) {
+            notify_homekit_target_door_state_change(TGT_OPEN);
+        }
+        else if (inferred == GDO_DOOR_STATE_CLOSING) {
+            notify_homekit_target_door_state_change(TGT_CLOSED);
+        }
+
+        last_door = inferred;
+
+        ESP_LOGI(TAG, "Inferred door state: %s",
+                 gdo_door_state_to_string(inferred));
+
+        notify_homekit_current_door_state_change(inferred);
+    }
+
+    if (status->light != last_light) {
+        last_light = status->light;
+        notify_homekit_light(status->light);
+    }
+
+    break;
+}
 
 
     case GDO_CB_EVENT_LEARN:

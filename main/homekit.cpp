@@ -1,10 +1,9 @@
 // Copyright 2023 Brandon Matthews <thenewwazoo@optimaltour.us>
 // All rights reserved. GPLv3 License
-#define TAG ("HOMEKIT")
-
+static const char *TAG = "HOMEKIT";
+#include "homekit_notify.h"
 #include <cstring>
 #include <inttypes.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -13,7 +12,6 @@
 #include <esp_system.h>
 #include <esp_mac.h>
 
-#include <hap.h>
 #include <hap_apple_servs.h>
 #include <hap_apple_chars.h>
 
@@ -35,6 +33,7 @@ extern "C" {
     #include "hap_platform_keystore.h"
 
     #include "esp_timer.h"   // ← REQUIRED for esp_timer_get_time()
+
 }
 
 static bool learn_supported = false;
@@ -139,7 +138,6 @@ static void network_watchdog_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(5000));  // check every 5 seconds
     }
 }
-
 
 // Queue to store GDO notification events
 static QueueHandle_t gdo_notif_event_q;
@@ -246,8 +244,6 @@ void homekit_task_entry(void* ctx) {
             HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN,
             HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR);
     hap_serv_add_char(gdo_svc, hap_char_name_create(const_cast<char*>("Konnected blaQ")));
-    hap_serv_add_char(gdo_svc, hap_char_lock_current_state_create(0));
-    hap_serv_add_char(gdo_svc, hap_char_lock_target_state_create(0));
 
     hap_serv_set_write_cb(gdo_svc, gdo_svc_set);
 
@@ -473,6 +469,15 @@ GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state) {
     }
 }
 
+void notify_homekit_target_door_state_change(uint8_t tgt) {
+    GDOEvent e;
+    e.dest = HomeKitNotifDest::DoorTargetState;
+    e.value.u = tgt;
+    if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
+        ESP_LOGE("HOMEKIT", "could not queue homekit notif of target door state");
+    }
+}
+
 // this function is called when the current state of the door changes in the world (i.e. we wish to
 // update the representation in homekit)
 void notify_homekit_current_door_state_change(gdo_door_state_t door) {
@@ -491,7 +496,6 @@ void notify_homekit_current_door_state_change(gdo_door_state_t door) {
 // this function is called by HomeKit when the value of a characteristic changes (i.e. has been set
 // by the user) for the light service. It effectuates the value of the characteristic.
 static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv) {
-
     int i, ret = HAP_SUCCESS;
     hap_write_data_t *write;
     for (i = 0; i < count; i++) {
