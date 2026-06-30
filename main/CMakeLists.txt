@@ -3,7 +3,7 @@ idf_component_register(
         "gdo-blaq-homekit.cpp"
         "homekit.cpp"
         "wifi.cpp"
-    INCLUDE_DIRS "."
+    INCLUDE_DIRS "." "include"
     PRIV_REQUIRES
         esp_wifi
         esp_netif
