@@ -1,6 +1,15 @@
 // Copyright 2023 Brandon Matthews <thenewwazoo@optimaltour.us>
 // All rights reserved. GPLv3 License
 #pragma once
+#include "hap.h"
+
+// Add these two declarations
+extern hap_char_t *wifi_ssid_char;
+extern hap_char_t *wifi_pass_char;
+
+// Add this initializer (you will call it from app_main)
+void homekit_init(void);
+
 
 // Possible values for characteristic CURRENT_DOOR_STATE:
 #define HOMEKIT_CHARACTERISTIC_CURRENT_DOOR_STATE_OPEN       0

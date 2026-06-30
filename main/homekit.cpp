@@ -1,6 +1,5 @@
 // Copyright 2023 Brandon Matthews <thenewwazoo@optimaltour.us>
 // All rights reserved. GPLv3 License
-#define TAG ("HOMEKIT")
 
 #include <cstring>
 #include <inttypes.h>
@@ -36,6 +35,20 @@ extern "C" {
 
     #include "esp_timer.h"   // ← REQUIRED for esp_timer_get_time()
 }
+
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "hap.h"
+#include "homekit_decl.h"
+
+static const char *TAG = "HOMEKIT";
+
+hap_char_t *wifi_ssid_char = nullptr;
+hap_char_t *wifi_pass_char = nullptr;
+static nvs_handle_t wifi_nvs = 0;
+
 
 static bool learn_supported = false;
 static uint32_t last_hap_restart_ms = 0;
@@ -203,6 +216,10 @@ static int learn_svc_set(hap_write_data_t write_data[], int count,
 
 void homekit_task_entry(void* ctx) {
 
+    if (nvs_open("wifi", NVS_READWRITE, &wifi_nvs) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open Wi-Fi NVS namespace");
+    }
+
     uint8_t mac[8] = {0};
     ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
 
@@ -253,6 +270,26 @@ void homekit_task_entry(void* ctx) {
 
     hap_acc_add_serv(accessory, gdo_svc);
 
+    // -------------------------------
+    // Wi-Fi SSID + Password (runtime update)
+    // -------------------------------
+    wifi_ssid_char = hap_char_string_create(
+        const_cast<char*>("wifi-ssid"),
+        HAP_CHAR_PERM_PR | HAP_CHAR_PERM_WR,
+        NULL
+    );
+
+    wifi_pass_char = hap_char_string_create(
+        const_cast<char*>("wifi-pass"),
+        HAP_CHAR_PERM_PR | HAP_CHAR_PERM_WR,
+        NULL
+    );
+
+    // Add to garage door service
+    hap_serv_add_char(gdo_svc, wifi_ssid_char);
+    hap_serv_add_char(gdo_svc, wifi_pass_char);
+   
+
     // create the motion sensor service with no optional characteristics (e.g. active)
     motion_svc = hap_serv_motion_sensor_create(false);
 
@@ -267,6 +304,7 @@ void homekit_task_entry(void* ctx) {
 
     hap_add_accessory(accessory);
 
+ 
     // -------------------------------
     // Learn Button HomeKit Switch (Sec+ v2 only)
     // -------------------------------
@@ -371,43 +409,46 @@ void homekit_task_entry(void* ctx) {
 
 /******************************** GETTERS AND SETTERS ***************************************/
 
+
 // this function is called by HomeKit when the value of a characteristic changes (i.e. has been set
 // by the user) for the garage door service. It effectuates the value of the characteristic.
-static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv) {
+static int gdo_svc_set(hap_write_data_t write_data[], int count,
+                       void *serv_priv, void *write_priv)
+{
+    int ret = HAP_SUCCESS;
 
-    int i, ret = HAP_SUCCESS;
-    hap_write_data_t *write;
+    for (int i = 0; i < count; i++) {
+        hap_write_data_t *write = &write_data[i];
+        const char *uuid = hap_char_get_type_uuid(write->hc);
 
-    for (i = 0; i < count; i++) {
-        write = &write_data[i];
+        /* ------------------------------
+         * Garage Door Target State
+         * ------------------------------ */
+        if (!strcmp(uuid, HAP_CHAR_UUID_TARGET_DOOR_STATE)) {
 
-        if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_TARGET_DOOR_STATE)) {
             ESP_LOGI(TAG, "set door state: %" PRIu32, write->val.u);
+
             switch (write->val.u) {
                 case TGT_OPEN:
                     gdo_door_open();
                     hap_char_update_val(write->hc, &(write->val));
                     *(write->status) = HAP_STATUS_SUCCESS;
                     break;
+
                 case TGT_CLOSED: {
+                    ESP_LOGI(TAG, "Remote close requested");
 
-    ESP_LOGI(TAG, "Remote close requested");
-
-    // Retrieve current GDO status so we know the protocol
                     gdo_status_t st;
                     gdo_get_status(&st);
 
                     bool is_secplus2 = (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
 
                     if (!is_secplus2) {
-                        // UL-325 warning for Security+ 1.0
                         ESP_LOGW(TAG, "UL-325 warning: Security+ 1.0 — generating 5-second alert");
 
-                        // Smart panel beeps automatically when the light is flashed
                         for (int i = 0; i < 5; i++) {
                             gdo_light_on();
                             vTaskDelay(pdMS_TO_TICKS(500));
-
                             gdo_light_off();
                             vTaskDelay(pdMS_TO_TICKS(500));
                         }
@@ -415,42 +456,94 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
                         ESP_LOGI(TAG, "Security+ 2.0 — opener will handle UL-325 warning automatically");
                     }
 
-                    // Now close the door (both protocols)
                     gdo_door_close();
 
                     hap_char_update_val(write->hc, &(write->val));
                     *(write->status) = HAP_STATUS_SUCCESS;
-
                     break;
                 }
 
                 default:
-                    ESP_LOGE(TAG, "invalid target door state set requested: %" PRIu32, write->val.u);
+                    ESP_LOGE(TAG, "invalid target door state: %" PRIu32, write->val.u);
                     *(write->status) = HAP_STATUS_VAL_INVALID;
                     ret = HAP_FAIL;
                     break;
             }
-            hap_char_update_val(write->hc, &(write->val));
-            *(write->status) = HAP_STATUS_SUCCESS;
+        }
 
-        } else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_LOCK_TARGET_STATE)) {
+        /* ------------------------------
+         * Lock Target State
+         * ------------------------------ */
+        else if (!strcmp(uuid, HAP_CHAR_UUID_LOCK_TARGET_STATE)) {
+
             ESP_LOGI(TAG, "set lock state: %s", write->val.b ? "Locked" : "Unlocked");
+
             if (write->val.b) {
                 gdo_lock();
             } else {
                 gdo_unlock();
             }
+
             hap_char_update_val(write->hc, &(write->val));
             *(write->status) = HAP_STATUS_SUCCESS;
+        }
 
-        } else {
-            // no other characteristics are settable
-            ESP_LOGE(TAG, "invalid characteristic set, requested UUID: %s", hap_char_get_type_uuid(write->hc));
+        /* ------------------------------
+         * Wi-Fi SSID
+         * ------------------------------ */
+        else if (!strcmp(uuid, "wifi-ssid")) {
+
+            const char *ssid = write->val.s;
+            ESP_LOGI(TAG, "Wi-Fi SSID updated: %s", ssid);
+
+            nvs_set_str(wifi_nvs, "wifi_ssid", ssid);
+            nvs_commit(wifi_nvs);
+
+            *(write->status) = HAP_STATUS_SUCCESS;
+        }
+
+        /* ------------------------------
+         * Wi-Fi Password
+         * ------------------------------ */
+        else if (!strcmp(uuid, "wifi-pass")) {
+
+            const char *pass = write->val.s;
+            ESP_LOGI(TAG, "Wi-Fi password updated");
+
+            nvs_set_str(wifi_nvs, "wifi_pass", pass);
+            nvs_commit(wifi_nvs);
+
+            *(write->status) = HAP_STATUS_SUCCESS;
+        }
+
+        /* ------------------------------
+         * Unknown characteristic
+         * ------------------------------ */
+        else {
+            ESP_LOGE(TAG, "invalid characteristic set, requested UUID: %s", uuid);
             *(write->status) = HAP_STATUS_RES_ABSENT;
             ret = HAP_FAIL;
-
         }
     }
+
+    /* ----------------------------------------------------
+     * Apply Wi-Fi changes (if SSID or password was updated)
+     * ---------------------------------------------------- */
+    wifi_config_t cfg = {};
+    size_t ssid_len = sizeof(cfg.sta.ssid);
+    size_t pass_len = sizeof(cfg.sta.password);
+
+    nvs_get_str(wifi_nvs, "wifi_ssid", (char*)cfg.sta.ssid, &ssid_len);
+    nvs_get_str(wifi_nvs, "wifi_pass", (char*)cfg.sta.password, &pass_len);
+
+    ESP_LOGW(TAG, "Restarting Wi-Fi with new credentials...");
+    esp_wifi_stop();
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_start();
+
+    ESP_LOGW(TAG, "Restarting HomeKit transport...");
+    hap_stop();
+    hap_start();
 
     return ret;
 }
