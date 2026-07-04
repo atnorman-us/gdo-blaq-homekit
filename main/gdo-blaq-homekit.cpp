@@ -23,15 +23,17 @@ static gdo_lock_state_t        last_lock        = GDO_LOCK_STATE_MAX;
 static gdo_door_state_t        last_door        = GDO_DOOR_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
-static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
+//static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
 {
     switch (event) {
+
     case GDO_CB_EVENT_SYNCED:
         ESP_LOGI(TAG, "Synced: %s, protocol: %s",
                  status->synced ? "true" : "false",
                  gdo_protocol_type_to_string(status->protocol));
+
         if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
             ESP_LOGI(TAG, "Client ID: %" PRIu32 ", Rolling code: %" PRIu32,
                      status->client_id, status->rolling_code);
@@ -41,7 +43,7 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             if (gdo_set_rolling_code(status->rolling_code + 100) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to set rolling code");
             } else {
-                ESP_LOGI(TAG, "Rolling code set to %" PRIu32 ", retryng sync",
+                ESP_LOGI(TAG, "Rolling code set to %" PRIu32 ", retrying sync",
                          status->rolling_code);
                 gdo_sync();
             }
@@ -70,38 +72,124 @@ case GDO_CB_EVENT_DOOR_POSITION: {
     if (raw > 10000) raw = 10000;
 
     ESP_LOGI(TAG,
-             "Door raw: %s, raw=%" PRIu32 ", target=%" PRIu32,
+             "Door raw: %s, raw=%" PRIu32 ", target=%" PRIu32 ", proto=%s",
              gdo_door_state_to_string(status->door),
              raw,
-             (uint32_t)status->door_target);
+             (uint32_t)status->door_target,
+             gdo_protocol_type_to_string(status->protocol));
+
+    //
+    // Do NOT infer anything until sync completes
+    //
+    if (!status->synced) {
+        break;
+    }
 
     gdo_door_state_t inferred = status->door;
 
-    if (status->door == GDO_DOOR_STATE_STOPPED ||
-        status->door == GDO_DOOR_STATE_MAX) {
+    //
+    // ────────────────────────────────────────────────
+    //  SECURITY+ 1.0
+    // ────────────────────────────────────────────────
+    //
+    if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V1 ||
+        status->protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL) {
 
-        if (raw <= 1) {
-            inferred = GDO_DOOR_STATE_OPEN;
-        } else if (raw >= 9999) {
-            inferred = GDO_DOOR_STATE_CLOSED;
+        if (status->door == GDO_DOOR_STATE_STOPPED ||
+            status->door == GDO_DOOR_STATE_MAX) {
+
+            if (raw <= 1)
+                inferred = GDO_DOOR_STATE_OPEN;
+            else if (raw >= 9999)
+                inferred = GDO_DOOR_STATE_CLOSED;
+        }
+
+        if (inferred == GDO_DOOR_STATE_OPENING)
+            notify_homekit_target_door_state_change(TGT_OPEN);
+        else if (inferred == GDO_DOOR_STATE_CLOSING)
+            notify_homekit_target_door_state_change(TGT_CLOSED);
+    }
+
+    //
+    // ────────────────────────────────────────────────
+    //  SECURITY+ 2.0
+    // ────────────────────────────────────────────────
+    //
+//
+// SECURITY+ 2.0 movement inference (raw may NOT change mid‑movement)
+//
+if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+
+    static uint32_t last_raw    = raw;
+    static uint32_t last_target = status->door_target;
+    static gdo_door_state_t last_state = status->door;
+
+    bool raw_changed    = (raw != last_raw);
+    bool target_changed = (status->door_target != last_target);
+    bool state_changed  = (status->door != last_state);
+
+    last_raw    = raw;
+    last_target = status->door_target;
+    last_state  = status->door;
+
+    //
+    // Final OPEN/CLOSED detection
+    //
+    if (raw <= 1) {
+        inferred = GDO_DOOR_STATE_OPEN;
+    }
+    else if (raw >= 9999) {
+        inferred = GDO_DOOR_STATE_CLOSED;
+    }
+    else {
+
+        //
+        // Movement start triggered by target change
+        //
+        if (target_changed) {
+            if (status->door_target == 0)
+                inferred = GDO_DOOR_STATE_OPENING;
+            else if (status->door_target == 10000)
+                inferred = GDO_DOOR_STATE_CLOSING;
+        }
+
+        //
+        // Movement start triggered by door state change
+        //
+        else if (state_changed) {
+            if (status->door == GDO_DOOR_STATE_OPENING)
+                inferred = GDO_DOOR_STATE_OPENING;
+            else if (status->door == GDO_DOOR_STATE_CLOSING)
+                inferred = GDO_DOOR_STATE_CLOSING;
+        }
+
+        //
+        // Movement start triggered by raw change (if your opener ever sends mid‑movement frames)
+        //
+        else if (raw_changed) {
+            if (status->door_target == 0)
+                inferred = GDO_DOOR_STATE_OPENING;
+            else if (status->door_target == 10000)
+                inferred = GDO_DOOR_STATE_CLOSING;
         }
     }
 
-    // PATCH: Update HomeKit TargetDoorState when movement begins
+    //
+    // Drive HomeKit target from door_target
+    //
+    if (status->door_target == 0)
+        notify_homekit_target_door_state_change(TGT_OPEN);
+    else if (status->door_target == 10000)
+        notify_homekit_target_door_state_change(TGT_CLOSED);
+}
+
+    //
+    // ────────────────────────────────────────────────
+    //  HOMEKIT UPDATE (shared)
+    // ────────────────────────────────────────────────
+    //
     if (inferred != last_door) {
-
-        if (inferred == GDO_DOOR_STATE_OPENING) {
-            notify_homekit_target_door_state_change(TGT_OPEN);
-        }
-        else if (inferred == GDO_DOOR_STATE_CLOSING) {
-            notify_homekit_target_door_state_change(TGT_CLOSED);
-        }
-
         last_door = inferred;
-
-        ESP_LOGI(TAG, "Inferred door state: %s",
-                 gdo_door_state_to_string(inferred));
-
         notify_homekit_current_door_state_change(inferred);
     }
 
@@ -113,20 +201,9 @@ case GDO_CB_EVENT_DOOR_POSITION: {
     break;
 }
 
-
-    case GDO_CB_EVENT_LEARN:
-        if (status->learn != last_learn) {
-            last_learn = status->learn;
-            ESP_LOGI(TAG, "Learn: %s", gdo_learn_state_to_string(status->learn));
-            // Learn → HomeKit is handled in homekit.cpp when supported
-        }
-        break;
-
     case GDO_CB_EVENT_OBSTRUCTION:
         if (status->obstruction != last_obstruction) {
             last_obstruction = status->obstruction;
-            ESP_LOGI(TAG, "Obstruction: %s",
-                     gdo_obstruction_state_to_string(status->obstruction));
             notify_homekit_obstruction(status->obstruction);
         }
         break;
@@ -174,6 +251,7 @@ case GDO_CB_EVENT_DOOR_POSITION: {
         break;
     }
 }
+
 
 extern "C" void app_main(void)
 {
