@@ -222,7 +222,7 @@ void homekit_task_entry(void* ctx) {
     hap_serv_t *motion_svc;
     hap_serv_t *light_svc;
 
-    gdo_notif_event_q = xQueueCreate(5, sizeof(GDOEvent));
+    gdo_notif_event_q = xQueueCreate(16, sizeof(GDOEvent));
 
     hap_init(HAP_TRANSPORT_WIFI);
 
@@ -473,8 +473,9 @@ void notify_homekit_target_door_state_change(uint8_t tgt) {
     GDOEvent e;
     e.dest = HomeKitNotifDest::DoorTargetState;
     e.value.u = tgt;
-    if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
-        ESP_LOGE("HOMEKIT", "could not queue homekit notif of target door state");
+    if (!gdo_notif_event_q ||
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) != pdTRUE) {
+        ESP_LOGE(TAG, "could not queue homekit notif of target door state");
     }
 }
 
@@ -482,13 +483,23 @@ void notify_homekit_target_door_state_change(uint8_t tgt) {
 // update the representation in homekit)
 void notify_homekit_current_door_state_change(gdo_door_state_t door) {
     if (door == last_door) return;
-    last_door = door;
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::DoorCurrentState;
     e.value.u = map_gdo_to_homekit_state(door);
-    if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
-        ESP_LOGE(TAG, "could not queue homekit notif of door current state");
+
+    // Give the consumer loop a brief window to drain (e.g. during the ~250ms
+    // HomeKit transport restart in minimal_hap_watchdog_task) instead of
+    // dropping instantly. Only commit last_door once the event is actually
+    // queued - committing it unconditionally means a dropped notification
+    // becomes permanently invisible: the next time the door reaches this
+    // same state, the dedup check above would think HomeKit already knows,
+    // and never retry.
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_door = door;
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of door current state (queue full)");
     }
 }
 
@@ -526,13 +537,16 @@ static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_pr
 // this function is called when the current state of the light changes
 void notify_homekit_light(gdo_light_state_t light) {
     if (light == last_light) return;
-    last_light = light;
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::Light;
     e.value.b = (light == GDO_LIGHT_STATE_ON);
-    if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
-        ESP_LOGE(TAG, "could not queue homekit notif of light state");
+
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_light = light;
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of light state (queue full)");
     }
 }
 
@@ -541,53 +555,73 @@ void notify_homekit_light(gdo_light_state_t light) {
 void notify_homekit_learn(gdo_learn_state_t learn) {
     if (!learn_supported) return;
     if (learn == last_learn) return;
-    last_learn = learn;
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::Learn;
     e.value.b = (learn == GDO_LEARN_STATE_ACTIVE);
-    xQueueSend(gdo_notif_event_q, &e, 0);
+
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_learn = learn;
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of learn state (queue full)");
+    }
 }
 
 // this function is called when the current state of the obstruction sensor changes in the world
 // (i.e. we wish to update the representation in homekit)
 void notify_homekit_obstruction(gdo_obstruction_state_t obstructed) {
     if (obstructed == last_obstruction) return;
-    last_obstruction = obstructed;
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::Obstruction;
     e.value.b = (obstructed == GDO_OBSTRUCTION_STATE_OBSTRUCTED)
                   ? HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED
                   : HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR;
-    xQueueSend(gdo_notif_event_q, &e, 0);
+
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_obstruction = obstructed;
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of obstruction state (queue full)");
+    }
 }
 
 // this function is called when the current state of the lock changes in the world (i.e. we wish to
 // update the representation in homekit)
 void notify_homekit_current_lock(gdo_lock_state_t lock) {
     if (lock == last_lock) return;
-    last_lock = lock;
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::LockCurrentState;
     e.value.b = (lock == GDO_LOCK_STATE_UNLOCKED)
         ? HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED
         : HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_SECURED;
-    xQueueSend(gdo_notif_event_q, &e, 0);
+
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_lock = lock;
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of lock state (queue full)");
+    }
 }
 
 // this function is called when the state of the motion sensor changes in the world (i.e. we wish to
 // update the representation in homekit)
 void notify_homekit_motion(gdo_motion_state_t motion) {
     if (motion == last_motion) return;
-    last_motion = motion;
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::Motion;
     e.value.b = (motion == GDO_MOTION_STATE_CLEAR)
         ? HOMEKIT_CHARACTERISTIC_MOTION_NOT_DETECTED
         : HOMEKIT_CHARACTERISTIC_MOTION_DETECTED;
-    xQueueSend(gdo_notif_event_q, &e, 0);
+
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_motion = motion;
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of motion state (queue full)");
+    }
 }
 
