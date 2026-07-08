@@ -20,6 +20,10 @@ static const char *TAG = "HOMEKIT";
 #include <gdo.h>
 
 #include "wifi.h"
+#include "diag_webserver.h"
+
+// Defined in gdo-blaq-homekit.cpp - blocks until real GDO sync completes.
+extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms);
 
 extern "C" {
     #include "esp_wifi.h"
@@ -37,7 +41,7 @@ extern "C" {
 
 }
 
-static bool learn_supported = false;
+static bool learn_supported = true;
 static uint32_t last_hap_restart_ms = 0;
 static const uint32_t MIN_RESTART_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
 static gdo_light_state_t last_light = GDO_LIGHT_STATE_MAX;
@@ -174,6 +178,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ESP_LOGI(TAG, "Got IP — network restored");
+        diag_webserver_restart();
     }
 }
 
@@ -219,6 +224,20 @@ struct GDOEvent {
         uint8_t u;
     } value;
 };
+
+// Called from app_main() *before* gdo_start(), so the queue exists before
+// any GDO event callback could possibly fire. Previously this queue was
+// only created inside homekit_task_entry - a separate task that isn't
+// guaranteed to have run yet by the time the first GDO events arrive,
+// which silently dropped the very first boot-time Light/Lock/Door values
+// (logged as "queue full" even though the real cause was "doesn't exist
+// yet"). Idempotent - safe to call more than once.
+extern "C" void homekit_notif_queue_init(void)
+{
+    if (!gdo_notif_event_q) {
+        gdo_notif_event_q = xQueueCreate(16, sizeof(GDOEvent));
+    }
+}
 
 static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
@@ -281,7 +300,27 @@ void homekit_task_entry(void* ctx) {
     hap_serv_t *motion_svc;
     hap_serv_t *light_svc;
 
-    gdo_notif_event_q = xQueueCreate(16, sizeof(GDOEvent));
+    // Learn Mode must be decided before the accessory is finalized below -
+    // HAP's service database can't change after hap_start(). Block briefly
+    // for real GDO sync so we know the actual protocol rather than reading
+    // gdo_get_status() before sync has had any chance to complete (it needs
+    // real UART round-trips with the opener, which haven't happened yet
+    // this early in the task). Confirmed via testing: Sec+1.0 openers
+    // return ESP_ERR_NOT_SUPPORTED (262) from gdo_activate_learn(), so this
+    // is now an evidence-based gate, not an assumption.
+    gdo_status_t st;
+    bool gdo_synced = gdo_wait_for_sync(8000);
+    gdo_get_status(&st);
+    learn_supported = gdo_synced && (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
+
+    if (!gdo_synced) {
+        ESP_LOGW(TAG, "GDO sync did not complete within timeout - hiding Learn Mode tile as a safe default");
+    } else if (!learn_supported) {
+        ESP_LOGW(TAG, "Learn Mode not supported on protocol %s - tile hidden",
+                 gdo_protocol_type_to_string(st.protocol));
+    }
+
+    homekit_notif_queue_init(); // already created earlier by app_main() in the normal case; idempotent
 
     hap_init(HAP_TRANSPORT_WIFI);
 
@@ -303,6 +342,25 @@ void homekit_task_entry(void* ctx) {
             HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN,
             HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR);
     hap_serv_add_char(gdo_svc, hap_char_name_create(const_cast<char*>("Konnected blaQ")));
+
+    // The comment above claims "optional lock characteristics" but
+    // hap_serv_garage_door_opener_create() only takes door/obstruction
+    // params - Lock was never actually attached to the service. Confirmed
+    // via real pairing logs: "Events Enabled for aid=1 iid=..." only ever
+    // listed 5 characteristics (door x3, motion, light) - no Lock IIDs at
+    // all, meaning notify_homekit_current_lock() was updating a
+    // characteristic that didn't exist in the published accessory.
+    //
+    // NOTE: HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED is inferred
+    // from this codebase's existing naming convention (matches
+    // HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED, already used
+    // elsewhere in this file) - verify it matches your actual SDK headers;
+    // if the build fails on this line, grep your hap_apple_*.h headers for
+    // the real constant name.
+    hap_serv_add_char(gdo_svc, hap_char_lock_current_state_create(
+            HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED));
+    hap_serv_add_char(gdo_svc, hap_char_lock_target_state_create(
+            HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED));
 
     hap_serv_set_write_cb(gdo_svc, gdo_svc_set);
 
@@ -348,15 +406,11 @@ void homekit_task_entry(void* ctx) {
 
     hap_start();
 
-    // Determine if Learn Mode is supported (Sec+ v2 only)
-    gdo_status_t st;
-    gdo_get_status(&st);
-
-    learn_supported = (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
-
-    if (!learn_supported) {
-        ESP_LOGW(TAG, "Learn Mode disabled: opener protocol is not Security+ 2.0");
-    }
+    // Learn Mode support is now decided early (see gdo_wait_for_sync() call
+    // near the top of this function), before hap_add_accessory()/hap_start()
+    // finalize the service database. That's the only point it can actually
+    // affect whether the tile exists - deciding it here (after hap_start())
+    // would be a no-op, which is the mistake this comment used to document.
 
 
     // Register WiFi/IP event handlers
@@ -687,4 +741,3 @@ void notify_homekit_motion(gdo_motion_state_t motion) {
         ESP_LOGE(TAG, "could not queue homekit notif of motion state (queue full)");
     }
 }
-
