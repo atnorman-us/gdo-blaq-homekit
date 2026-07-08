@@ -63,6 +63,13 @@ char serial_number[SERIAL_NAME_SIZE];
 // whether staleness reports correlate with an actual disconnected session.
 static std::atomic<int> s_hap_connected_controllers{0};
 
+// Public read-only accessor for diag_webserver.cpp - avoids exposing the
+// atomic itself outside this file.
+extern "C" int homekit_get_connected_session_count(void)
+{
+    return s_hap_connected_controllers.load();
+}
+
 static void hap_session_event_handler(void* arg, esp_event_base_t event_base,
                                        int32_t event_id, void* event_data)
 {
@@ -680,3 +687,4 @@ void notify_homekit_motion(gdo_motion_state_t motion) {
         ESP_LOGE(TAG, "could not queue homekit notif of motion state (queue full)");
     }
 }
+
