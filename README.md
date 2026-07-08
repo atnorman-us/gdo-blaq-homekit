@@ -20,11 +20,16 @@
 ## Accessing the diagnostics web server
 Find the device's IP — same one your router/Home app already knows it by (or check the boot log for esp_netif_handlers: sta ip: ...).
 Open in a browser, on the same network as the device:
-What you wantURLDashboard (
+
+URLDashboard(
 status + live log, auto-refreshing) --> http://<device-ip>:8080/
+
 Raw status as JSON --> http://<device-ip>:8080/status
+
 Log buffer, plain text (view/copy) --> http://<device-ip>:8080/logs
+
 Log buffer, forced download --> http://<device-ip>:8080/logs/download → saves gdo-log.txt
+
 ## On the dashboard (/):
 Status table: door / light / lock / obstruction / motion state, uptime, free heap, WiFi RSSI, connected HomeKit sessions, last reset reason, current log buffer usage.
 
