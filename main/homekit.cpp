@@ -3,6 +3,7 @@
 static const char *TAG = "HOMEKIT";
 #include "homekit_notify.h"
 #include <cstring>
+#include <atomic>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -56,28 +57,79 @@ char device_name[DEVICE_NAME_SIZE];
 // Make serial_number available
 char serial_number[SERIAL_NAME_SIZE];
 
+// Tracks whether at least one controller currently has a live, pair-verified
+// HAP session. This is real signal (from the HAP core itself via HAP_EVENT),
+// unlike the old timer-based "unhealthy" check - useful for diagnosing
+// whether staleness reports correlate with an actual disconnected session.
+static std::atomic<int> s_hap_connected_controllers{0};
+
+static void hap_session_event_handler(void* arg, esp_event_base_t event_base,
+                                       int32_t event_id, void* event_data)
+{
+    if (event_base != HAP_EVENT) {
+        return;
+    }
+
+    const char *ctrl_id = event_data ? (const char *)event_data : "unknown";
+
+    switch (event_id) {
+        case HAP_EVENT_CTRL_CONNECTED: {
+            int count = s_hap_connected_controllers.fetch_add(1) + 1;
+            ESP_LOGI(TAG, "HAP controller connected: %s (active sessions: %d)",
+                     ctrl_id, count);
+            break;
+        }
+
+        case HAP_EVENT_CTRL_DISCONNECTED: {
+            int count = s_hap_connected_controllers.fetch_sub(1) - 1;
+            if (count < 0) {
+                count = 0;
+                s_hap_connected_controllers.store(0);
+            }
+            ESP_LOGW(TAG, "HAP controller disconnected: %s (active sessions: %d)",
+                     ctrl_id, count);
+            break;
+        }
+
+        case HAP_EVENT_CTRL_PAIRED:
+            ESP_LOGI(TAG, "HAP controller paired: %s", ctrl_id);
+            break;
+
+        case HAP_EVENT_CTRL_UNPAIRED:
+            ESP_LOGW(TAG, "HAP controller unpaired: %s", ctrl_id);
+            break;
+
+        case HAP_EVENT_PAIRING_STARTED:
+            ESP_LOGI(TAG, "HAP pairing started");
+            break;
+
+        case HAP_EVENT_PAIRING_ABORTED:
+            ESP_LOGW(TAG, "HAP pairing aborted (timeout or wrong setup code)");
+            break;
+
+        default:
+            // GET_ACC_COMPLETED / GET_CHAR_COMPLETED etc. - too chatty to log
+            // at INFO by default, but the case is here if you want them later.
+            break;
+    }
+}
+
 static bool homekit_transport_unhealthy() {
-    // Check WiFi
-    wifi_ap_record_t ap_info;
-    bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
-
-    // Check IP
-    esp_netif_ip_info_t ip_info;
-    bool ip_ok = (esp_netif_get_ip_info(
-        esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
-
-    if (!wifi_ok || !ip_ok) {
-        return false;  // Never restart HomeKit during network instability
-    }
-
-    // Debounce: ensure enough time has passed since last restart
-    uint32_t now = esp_timer_get_time() / 1000;  // microseconds → ms
-    if (now - last_hap_restart_ms < MIN_RESTART_INTERVAL_MS) {
-        return false;
-    }
-
-    // If we reach here, network is good and restart interval has passed.
-    return true;
+    // NOTE: this used to return true whenever WiFi+IP were healthy and 5
+    // minutes had passed since the last restart - i.e. it never actually
+    // checked HomeKit transport health at all. In practice that meant
+    // restart_homekit_transport() fired every ~5 minutes forever on any
+    // stable network, tearing down the live HAP session Home app/Home Hub
+    // had open. Symptom: characteristic values were always correct
+    // internally, but live push notifications didn't arrive - only a fresh
+    // Home app foreground (which forces a reconnect + full read) showed the
+    // real state.
+    //
+    // Disabled until there's a real signal to check here (e.g. something
+    // from hap.h indicating the transport actually failed - not available
+    // in this file). Restarting a healthy transport on a timer is worse
+    // than not restarting at all.
+    return false;
 }
 
 static void restart_homekit_transport() {
@@ -303,6 +355,10 @@ void homekit_task_entry(void* ctx) {
     // Register WiFi/IP event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    // Register HAP session event handler (real signal for controller
+    // connect/disconnect/pairing - see hap_session_event_handler above)
+    ESP_ERROR_CHECK(esp_event_handler_register(HAP_EVENT, ESP_EVENT_ANY_ID, &hap_session_event_handler, NULL));
 
     // Start watchdog
     xTaskCreate(network_watchdog_task, "net_watchdog", 4096, NULL, 5, NULL);
@@ -624,4 +680,3 @@ void notify_homekit_motion(gdo_motion_state_t motion) {
         ESP_LOGE(TAG, "could not queue homekit notif of motion state (queue full)");
     }
 }
-

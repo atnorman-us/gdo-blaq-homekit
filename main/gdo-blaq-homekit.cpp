@@ -16,6 +16,12 @@
 #include "homekit_decl.h"
 #include "homekit.h"
 
+// notify_homekit_learn is defined in homekit.cpp but isn't declared in
+// homekit.h or homekit_notify.h in this codebase - declared here as a
+// stopgap. Worth adding it to homekit.h properly alongside the other
+// notify_homekit_* declarations so future callers don't hit this too.
+void notify_homekit_learn(gdo_learn_state_t learn);
+
 static const char* TAG = "test_main";
 
 // ────────────────────────────────────────────────
@@ -48,7 +54,7 @@ static gdo_lock_state_t        last_lock        = GDO_LOCK_STATE_MAX;
 static gdo_door_state_t        last_door        = GDO_DOOR_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
-//static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
+static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 
 // Recovery/monitoring state
 static volatile int64_t          s_last_status_event_ms = 0;
@@ -136,9 +142,16 @@ case GDO_CB_EVENT_DOOR_POSITION: {
     if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V1 ||
         status->protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL) {
 
-        if (status->door == GDO_DOOR_STATE_STOPPED ||
-            status->door == GDO_DOOR_STATE_MAX) {
-
+        // Only fall back to raw position when the protocol has never told
+        // us a state at all (GDO_DOOR_STATE_MAX, e.g. right after sync).
+        // Do NOT do this for STOPPED: raw position can be stale on this
+        // protocol (this device only sends a fresh position at the end of
+        // a full open/closed cycle, not while genuinely mid-travel), so
+        // guessing OPEN/CLOSED off it while STOPPED can misreport a
+        // door that's actually stopped halfway as fully OPEN. Trust
+        // STOPPED at face value - HomeKit has a real "Stopped" current
+        // door state value for exactly this.
+        if (status->door == GDO_DOOR_STATE_MAX) {
             if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD)
                 inferred = GDO_DOOR_STATE_OPEN;
             else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD)
@@ -304,6 +317,14 @@ if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
                  status->paired_devices.total_all);
         break;
 
+    case GDO_CB_EVENT_LEARN:
+        if (status->learn != last_learn) {
+            last_learn = status->learn;
+            ESP_LOGI(TAG, "Learn: %s", gdo_learn_state_to_string(status->learn));
+            notify_homekit_learn(status->learn);
+        }
+        break;
+
     case GDO_CB_EVENT_OPEN_DURATION_MEASUREMENT:
         ESP_LOGI(TAG, "Measured open duration: %u ms", status->open_ms);
         break;
@@ -358,21 +379,53 @@ static void gdo_watchdog_task(void *arg)
                     if (raw > 10000) raw = 10000;
 
                     gdo_door_state_t resolved = GDO_DOOR_STATE_MAX;
-                    if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD)
-                        resolved = GDO_DOOR_STATE_OPEN;
-                    else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD)
-                        resolved = GDO_DOOR_STATE_CLOSED;
+
+                    bool is_secplus1 = (status.protocol == GDO_PROTOCOL_SEC_PLUS_V1 ||
+                                        status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL);
+
+                    if (is_secplus1) {
+                        // Sec+1.0 doesn't give continuous position telemetry -
+                        // status.door is the authoritative signal (same rule
+                        // the primary event handler uses). Trust OPEN/CLOSED/
+                        // STOPPED directly whenever the protocol has already
+                        // reported one - do not second-guess STOPPED using
+                        // raw position, since raw can be stale (last full
+                        // arrival value) rather than reflecting wherever the
+                        // door actually stopped. Only fall back to raw when
+                        // the protocol has told us nothing at all (MAX).
+                        if (status.door == GDO_DOOR_STATE_OPEN ||
+                            status.door == GDO_DOOR_STATE_CLOSED ||
+                            status.door == GDO_DOOR_STATE_STOPPED) {
+                            resolved = status.door;
+                        } else if (status.door == GDO_DOOR_STATE_MAX) {
+                            if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD) {
+                                resolved = GDO_DOOR_STATE_OPEN;
+                            } else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD) {
+                                resolved = GDO_DOOR_STATE_CLOSED;
+                            }
+                        }
+                    } else {
+                        // Sec+2.0: position telemetry is the primary source
+                        // of truth, same as the event handler.
+                        if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD)
+                            resolved = GDO_DOOR_STATE_OPEN;
+                        else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD)
+                            resolved = GDO_DOOR_STATE_CLOSED;
+                    }
 
                     s_door_in_transition = false;
 
                     if (resolved != GDO_DOOR_STATE_MAX) {
                         // The door actually arrived - our own event handler
                         // just never got (or acted on) the frame saying so.
+                        bool from_protocol_state = is_secplus1 && (status.door == resolved);
                         ESP_LOGW(TAG,
                                  "%s timed out after %" PRIu32 " ms (limit %" PRIu32
-                                 " ms) - re-derived %s from raw=%" PRIu32,
+                                 " ms) - re-derived %s from %s (raw=%" PRIu32 ")",
                                  gdo_door_state_to_string(s_transition_target), elapsed,
-                                 timeout_ms, gdo_door_state_to_string(resolved), raw);
+                                 timeout_ms, gdo_door_state_to_string(resolved),
+                                 from_protocol_state ? "status.door" : "raw position",
+                                 raw);
 
                         if (resolved != last_door) {
                             last_door = resolved;
