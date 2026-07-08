@@ -1,6 +1,7 @@
 #include "homekit_notify.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_timer.h"
@@ -16,6 +17,10 @@
 #include "homekit_decl.h"
 #include "homekit.h"
 #include "diag_webserver.h"
+
+// Defined in homekit.cpp - creates the HomeKit notification queue early,
+// before gdo_start() so no GDO event can fire before it exists.
+extern "C" void homekit_notif_queue_init(void);
 
 // notify_homekit_learn is defined in homekit.cpp but isn't declared in
 // homekit.h or homekit_notify.h in this codebase - declared here as a
@@ -57,7 +62,11 @@ static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
 static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 
-// Recovery/monitoring state
+// Signaled once GDO sync genuinely completes. Lets other code (e.g.
+// homekit.cpp deciding whether to show the Learn Mode tile) block until the
+// real protocol is known, instead of reading gdo_get_status() before sync
+// has had any chance to run.
+static SemaphoreHandle_t s_gdo_synced_sem = nullptr;
 static volatile int64_t          s_last_status_event_ms = 0;
 static volatile bool             s_door_in_transition   = false;
 static volatile int64_t          s_transition_start_ms  = 0;
@@ -95,6 +104,8 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
                          status->rolling_code);
                 gdo_sync();
             }
+        } else if (s_gdo_synced_sem) {
+            xSemaphoreGive(s_gdo_synced_sem);
         }
         break;
 
@@ -516,6 +527,18 @@ extern "C" void gdo_diag_get_last_states(gdo_door_state_t *door,
     if (motion)      *motion = last_motion;
 }
 
+// Blocks until GDO sync completes or timeout_ms elapses, whichever is
+// first. Returns true if sync completed within the timeout. Used by
+// homekit.cpp to know the real protocol before it has to finalize the HAP
+// accessory database (which can't be changed after hap_start()).
+extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms)
+{
+    if (!s_gdo_synced_sem) {
+        return false;
+    }
+    return xSemaphoreTake(s_gdo_synced_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
 extern "C" void app_main(void)
 {
     gdo_config_t gdo_conf;
@@ -525,6 +548,15 @@ extern "C" void app_main(void)
     gdo_conf.uart_tx_pin    = GPIO_NUM_1;
     gdo_conf.uart_rx_pin    = GPIO_NUM_2;
     gdo_conf.obst_in_pin    = GPIO_NUM_5;
+
+    s_gdo_synced_sem = xSemaphoreCreateBinary();
+
+    // Defined in homekit.cpp - must run before gdo_start() so the
+    // notification queue exists before any GDO event callback can fire.
+    // Previously this only happened inside homekit_task_entry (a separate
+    // task not guaranteed to have run yet), which silently dropped the
+    // very first boot-time Light/Lock/Door values.
+    homekit_notif_queue_init();
 
     ESP_ERROR_CHECK(gdo_init(&gdo_conf));
     ESP_ERROR_CHECK(gdo_start(gdo_event_handler, NULL));

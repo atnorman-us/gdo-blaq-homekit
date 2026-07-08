@@ -15,6 +15,11 @@ extern "C" {
 // if that's ever a concern for your network.
 void diag_webserver_start(void);
 
+// Stops and recreates the httpd server. Call this after a WiFi reconnect -
+// the underlying socket doesn't reliably survive the interface bouncing.
+// Safe to call even if the server was never started (no-op in that case).
+void diag_webserver_restart(void);
+
 #ifdef __cplusplus
 }
 #endif

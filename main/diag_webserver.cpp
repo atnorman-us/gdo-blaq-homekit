@@ -30,6 +30,11 @@ static const char *TAG = "DIAGWEB";
 #define DIAG_WEB_PORT 8080
 #define LOG_BUFFER_CAPACITY (64 * 1024)
 
+// Persistent so diag_webserver_restart() can stop and recreate it after a
+// WiFi bounce - the underlying httpd socket doesn't reliably survive an
+// interface going down and coming back up.
+static httpd_handle_t s_server = nullptr;
+
 static const char *reset_reason_to_string(esp_reset_reason_t reason)
 {
     switch (reason) {
@@ -45,6 +50,26 @@ static const char *reset_reason_to_string(esp_reset_reason_t reason)
         case ESP_RST_SDIO:      return "SDIO";
         default:                return "Unknown";
     }
+}
+
+static void delayed_restart_task(void *arg)
+{
+    // Give the HTTP response time to actually flush over the socket before
+    // rebooting - esp_restart() doesn't wait for pending sends.
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static esp_err_t restart_post_handler(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "Restart requested via diagnostics web server");
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Restarting...", HTTPD_RESP_USE_STRLEN);
+
+    xTaskCreate(delayed_restart_task, "diag_restart", 2048, NULL,
+                tskIDLE_PRIORITY + 1, NULL);
+    return ESP_OK;
 }
 
 static esp_err_t favicon_get_handler(httpd_req_t *req)
@@ -72,6 +97,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "button,a.btn{background:#2a2a2a;color:#ddd;border:1px solid #444;padding:6px 12px;"
         "border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block;"
         "margin-right:8px;font-size:13px;}"
+        "button.danger{background:#3a1f1f;border-color:#663;color:#f88;}"
         "label{color:#9aa0a6;font-size:13px;margin-left:4px;}"
         "</style></head><body>"
         "<h1>GDO Diagnostics</h1>"
@@ -80,10 +106,22 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<div style='margin-bottom:8px;'>"
         "<button onclick='refresh()'>Refresh now</button>"
         "<a class='btn' href='/logs/download'>Download full log</a>"
+        "<button class='danger' onclick='restartDevice()'>Restart device</button>"
         "<label><input type='checkbox' id='auto' checked> auto-refresh (3s)</label>"
         "</div>"
         "<pre id='log'>Loading...</pre>"
         "<script>"
+        "async function restartDevice(){"
+        "  if(!confirm('Restart the device now? HomeKit and the door link will be briefly unavailable.')) return;"
+        "  try{"
+        "    await fetch('/restart', {method:'POST'});"
+        "    document.getElementById('log').textContent = 'Restarting... page will reload automatically in a few seconds.';"
+        "    document.getElementById('auto').checked = false;"
+        "    setTimeout(()=>{ location.reload(); }, 8000);"
+        "  }catch(e){"
+        "    document.getElementById('log').textContent = 'Restarting... (connection dropped, as expected). Reload the page in a few seconds.';"
+        "  }"
+        "}"
         "async function refresh(){"
         "  try{"
         "    const s = await (await fetch('/status')).json();"
@@ -206,9 +244,9 @@ static void start_httpd_server(void)
     config.max_uri_handlers = 8;
     config.lru_purge_enable = true;
 
-    httpd_handle_t server = nullptr;
-    if (httpd_start(&server, &config) != ESP_OK) {
+    if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start diagnostics web server on port %d", DIAG_WEB_PORT);
+        s_server = nullptr;
         return;
     }
 
@@ -237,11 +275,17 @@ static void start_httpd_server(void)
     favicon_uri.method = HTTP_GET;
     favicon_uri.handler = favicon_get_handler;
 
-    httpd_register_uri_handler(server, &root_uri);
-    httpd_register_uri_handler(server, &status_uri);
-    httpd_register_uri_handler(server, &logs_uri);
-    httpd_register_uri_handler(server, &logs_dl_uri);
-    httpd_register_uri_handler(server, &favicon_uri);
+    httpd_uri_t restart_uri = {};
+    restart_uri.uri = "/restart";
+    restart_uri.method = HTTP_POST;
+    restart_uri.handler = restart_post_handler;
+
+    httpd_register_uri_handler(s_server, &root_uri);
+    httpd_register_uri_handler(s_server, &status_uri);
+    httpd_register_uri_handler(s_server, &logs_uri);
+    httpd_register_uri_handler(s_server, &logs_dl_uri);
+    httpd_register_uri_handler(s_server, &favicon_uri);
+    httpd_register_uri_handler(s_server, &restart_uri);
 
     ESP_LOGI(TAG, "Diagnostics web server started on port %d", DIAG_WEB_PORT);
 }
@@ -291,6 +335,22 @@ static void wait_for_network_and_start_task(void *arg)
     ESP_LOGI(TAG, "Network ready, starting diagnostics web server...");
     start_httpd_server();
     vTaskDelete(NULL);
+}
+
+// Call after a WiFi reconnect (interface went down and came back up). Only
+// acts if the server was already running - if it's null, either it was
+// never started yet or wait_for_network_and_start_task is still in the
+// process of starting it for the first time, and this avoids racing that.
+extern "C" void diag_webserver_restart(void)
+{
+    if (!s_server) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Restarting diagnostics web server after network change");
+    httpd_stop(s_server);
+    s_server = nullptr;
+    start_httpd_server();
 }
 
 void diag_webserver_start(void)
