@@ -15,6 +15,7 @@
 #include "tasks.h"
 #include "homekit_decl.h"
 #include "homekit.h"
+#include "diag_webserver.h"
 
 // notify_homekit_learn is defined in homekit.cpp but isn't declared in
 // homekit.h or homekit_notify.h in this codebase - declared here as a
@@ -262,6 +263,29 @@ if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
     if (inferred != last_door) {
         last_door = inferred;
         notify_homekit_current_door_state_change(inferred);
+
+        // Keep Target in sync whenever Current resolves to a definite
+        // OPEN/CLOSED. This matters most right after boot: the HAP
+        // service is created with Target hardcoded to OPEN every time
+        // (see hap_serv_garage_door_opener_create() in homekit.cpp),
+        // regardless of the door's actual state, and we only otherwise
+        // push Target during an active OPENING/CLOSING transition - so a
+        // door that's already Closed at boot (or any other path that
+        // resolves Current without going through that transition) would
+        // leave Target stuck at Open forever. Home app renders that
+        // Target/Current mismatch as a phantom "Opening..." even though
+        // Current correctly says Closed.
+        //
+        // Re-enabled after ruling this out as the cause of a door
+        // open/close/open cycling incident - that was actually a crash
+        // loop in diag_webserver.cpp hammering gdo_init()/gdo_start() on
+        // every reboot (fixed separately). Re-tested clean before
+        // re-enabling this.
+        if (inferred == GDO_DOOR_STATE_OPEN) {
+            notify_homekit_target_door_state_change(TGT_OPEN);
+        } else if (inferred == GDO_DOOR_STATE_CLOSED) {
+            notify_homekit_target_door_state_change(TGT_CLOSED);
+        }
     }
 
     if (status->light != last_light) {
@@ -472,6 +496,26 @@ static void gdo_watchdog_task(void *arg)
     }
 }
 
+// ────────────────────────────────────────────────
+//  Diagnostics accessor
+// ────────────────────────────────────────────────
+//
+// Read-only snapshot of the last-known states above, for the diagnostics
+// web server (see diag_webserver.cpp). Kept here rather than exposing the
+// statics directly so this file stays the single owner of this state.
+extern "C" void gdo_diag_get_last_states(gdo_door_state_t *door,
+                                          gdo_light_state_t *light,
+                                          gdo_lock_state_t *lock,
+                                          gdo_obstruction_state_t *obstruction,
+                                          gdo_motion_state_t *motion)
+{
+    if (door)        *door = last_door;
+    if (light)       *light = last_light;
+    if (lock)        *lock = last_lock;
+    if (obstruction) *obstruction = last_obstruction;
+    if (motion)      *motion = last_motion;
+}
+
 extern "C" void app_main(void)
 {
     gdo_config_t gdo_conf;
@@ -498,6 +542,8 @@ extern "C" void app_main(void)
                 NULL,
                 tskIDLE_PRIORITY + 2,
                 NULL);
+
+    diag_webserver_start();
 
     ESP_LOGI(TAG, "GDO started!");
 }
