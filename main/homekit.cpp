@@ -308,8 +308,14 @@ void homekit_task_entry(void* ctx) {
     // this early in the task). Confirmed via testing: Sec+1.0 openers
     // return ESP_ERR_NOT_SUPPORTED (262) from gdo_activate_learn(), so this
     // is now an evidence-based gate, not an assumption.
+    //
+    // Timeout is 20s, not a few seconds, because gdolib's own protocol
+    // auto-detection (try V1, fall back to V2 emulation on failure) can
+    // itself take 10+ seconds on real Sec+2.0 hardware - confirmed via a
+    // real capture where full sync didn't complete until ~10.4s. An 8s
+    // timeout previously hid Learn on hardware that genuinely supports it.
     gdo_status_t st;
-    bool gdo_synced = gdo_wait_for_sync(8000);
+    bool gdo_synced = gdo_wait_for_sync(20000);
     gdo_get_status(&st);
     learn_supported = gdo_synced && (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
 

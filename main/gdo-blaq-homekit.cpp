@@ -48,9 +48,18 @@ static const char* TAG = "test_main";
 #define GDO_DOOR_TRANSIT_FALLBACK_MS   35000
 #define GDO_DOOR_TRANSIT_MARGIN_MS     10000
 
-// If we haven't seen *any* door-position frame in this long, the UART link
-// itself is probably dead (not just "door is idle") - kick a resync.
-#define GDO_LINK_STALE_TIMEOUT_MS      60000
+// If we haven't seen *any* GDO event (of any kind) in this long, the UART
+// link itself is probably dead (not just "door is idle") - kick a resync.
+//
+// 5 minutes, not 60s: confirmed via a real Sec+2.0 capture that this
+// protocol doesn't send periodic idle status frames the way Sec+1.0 with
+// smart panel does (which chatters roughly once a second even when
+// nothing's happening). On that V2 capture, 61 seconds of total silence
+// was completely normal idle behavior, not a stalled link - a 60s
+// threshold was forcing an unnecessary gdo_sync() during ordinary idle
+// periods. 5 minutes gives real margin above that while still catching a
+// genuinely dead link in a reasonable time.
+#define GDO_LINK_STALE_TIMEOUT_MS      300000
 
 #define GDO_WATCHDOG_PERIOD_MS         5000
 
@@ -272,6 +281,23 @@ if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
     // ────────────────────────────────────────────────
     //
     if (inferred != last_door) {
+        // If we're jumping directly between two resolved states (Closed <->
+        // Open) without ever having reported an intermediate Opening/Closing,
+        // the opener likely only sent a single status frame reflecting the
+        // final position - confirmed via real Sec+2.0 captures where one
+        // transition showed "Closing" mid-travel and another, on the same
+        // device in the same session, went straight from Closed to Open
+        // with zero transitional frames. We can't report the transition in
+        // real time (we didn't know about it until it was already done),
+        // but we can at least push a brief transitional state before the
+        // final one so HomeKit shows *something* changed rather than an
+        // unexplained instant flip.
+        if (last_door == GDO_DOOR_STATE_CLOSED && inferred == GDO_DOOR_STATE_OPEN) {
+            notify_homekit_current_door_state_change(GDO_DOOR_STATE_OPENING);
+        } else if (last_door == GDO_DOOR_STATE_OPEN && inferred == GDO_DOOR_STATE_CLOSED) {
+            notify_homekit_current_door_state_change(GDO_DOOR_STATE_CLOSING);
+        }
+
         last_door = inferred;
         notify_homekit_current_door_state_change(inferred);
 
