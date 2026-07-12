@@ -299,6 +299,7 @@ void homekit_task_entry(void* ctx) {
     hap_serv_t *gdo_svc;
     hap_serv_t *motion_svc;
     hap_serv_t *light_svc;
+    hap_serv_t *lock_svc;
 
     // Learn Mode must be decided before the accessory is finalized below -
     // HAP's service database can't change after hap_start(). Block briefly
@@ -309,13 +310,23 @@ void homekit_task_entry(void* ctx) {
     // return ESP_ERR_NOT_SUPPORTED (262) from gdo_activate_learn(), so this
     // is now an evidence-based gate, not an assumption.
     //
-    // Timeout is 20s, not a few seconds, because gdolib's own protocol
+    // Timeout is 32s, not a few seconds, because gdolib's own protocol
     // auto-detection (try V1, fall back to V2 emulation on failure) can
     // itself take 10+ seconds on real Sec+2.0 hardware - confirmed via a
     // real capture where full sync didn't complete until ~10.4s. An 8s
     // timeout previously hid Learn on hardware that genuinely supports it.
+    // Bumped from 20s to 25s after a capture where the first sync
+    // attempt failed (bad rolling code) and the retry re-ran the whole
+    // ~7.5s V1-detection sequence a second time, pushing real sync past 22s.
+    // Bumped again from 25s to 32s after a capture where BOTH retry fixes
+    // (protocol persisted across retries, scaled rolling-code jump) were
+    // confirmed working exactly as designed - closing a real ~750-unit
+    // gap in the minimum 3 rounds required - and sync still only missed
+    // the 25s timeout by 310ms. This time leaving real margin (~6s)
+    // rather than a tight one, since a near-miss at the previous "safe"
+    // value shows tight margins keep getting found by real hardware.
     gdo_status_t st;
-    bool gdo_synced = gdo_wait_for_sync(20000);
+    bool gdo_synced = gdo_wait_for_sync(32000);
     gdo_get_status(&st);
     learn_supported = gdo_synced && (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
 
@@ -349,28 +360,34 @@ void homekit_task_entry(void* ctx) {
             HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR);
     hap_serv_add_char(gdo_svc, hap_char_name_create(const_cast<char*>("Konnected blaQ")));
 
-    // The comment above claims "optional lock characteristics" but
-    // hap_serv_garage_door_opener_create() only takes door/obstruction
-    // params - Lock was never actually attached to the service. Confirmed
-    // via real pairing logs: "Events Enabled for aid=1 iid=..." only ever
-    // listed 5 characteristics (door x3, motion, light) - no Lock IIDs at
-    // all, meaning notify_homekit_current_lock() was updating a
-    // characteristic that didn't exist in the published accessory.
-    //
-    // NOTE: HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED is inferred
-    // from this codebase's existing naming convention (matches
-    // HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED, already used
-    // elsewhere in this file) - verify it matches your actual SDK headers;
-    // if the build fails on this line, grep your hap_apple_*.h headers for
-    // the real constant name.
-    hap_serv_add_char(gdo_svc, hap_char_lock_current_state_create(
-            HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED));
-    hap_serv_add_char(gdo_svc, hap_char_lock_target_state_create(
-            HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED));
-
     hap_serv_set_write_cb(gdo_svc, gdo_svc_set);
 
     hap_acc_add_serv(accessory, gdo_svc);
+
+    // Lock as its own Lock Mechanism service, not attached to the garage
+    // door service. Confirmed earlier this session: Lock characteristics
+    // WERE successfully registered on gdo_svc (visible via IID evidence
+    // in pairing logs), but Apple Home does not render Lock controls for
+    // optional Lock characteristics on a GarageDoorOpener service type -
+    // the tile silently never showed up despite the accessory being
+    // functionally correct. A genuine, separate Lock Mechanism service is
+    // a real HomeKit service type Apple Home does render as a tappable
+    // lock tile. Verify hap_serv_lock_mechanism_create()'s exact signature
+    // against your SDK headers if the build fails here - inferred from
+    // this codebase's existing service-creation naming convention
+    // (hap_serv_garage_door_opener_create, hap_serv_motion_sensor_create,
+    // etc.), not directly confirmed against the SDK source.
+    lock_svc = hap_serv_lock_mechanism_create(
+            HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED,
+            HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED);
+    hap_serv_add_char(lock_svc, hap_char_name_create(const_cast<char*>("Garage Lock")));
+
+    // gdo_svc_set() matches purely on characteristic UUID
+    // (HAP_CHAR_UUID_LOCK_TARGET_STATE), not which service it came from -
+    // safe to reuse directly rather than duplicating the write logic.
+    hap_serv_set_write_cb(lock_svc, gdo_svc_set);
+
+    hap_acc_add_serv(accessory, lock_svc);
 
     // create the motion sensor service with no optional characteristics (e.g. active)
     motion_svc = hap_serv_motion_sensor_create(false);
@@ -450,11 +467,11 @@ void homekit_task_entry(void* ctx) {
                     value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::LockCurrentState:
-                    dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE);
+                    dest = hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE);
                     value.b = e.value.b;
                     break;
                 case HomeKitNotifDest::LockTargetState:
-                    dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE);
+                    dest = hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE);
                     value.b = e.value.b;
                     break;
                 case HomeKitNotifDest::Obstruction:
