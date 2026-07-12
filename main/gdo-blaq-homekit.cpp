@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "wifi.h"
 #include <inttypes.h> 
 
@@ -69,6 +70,11 @@ static gdo_lock_state_t        last_lock        = GDO_LOCK_STATE_MAX;
 static gdo_door_state_t        last_door        = GDO_DOOR_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
+
+// Tracks consecutive sync failures within this boot, so the rolling-code
+// retry jump can scale up instead of always adding a fixed +100. Reset to
+// 0 on a successful sync.
+static uint32_t s_sync_retry_count = 0;
 static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 
 // Signaled once GDO sync genuinely completes. Lets other code (e.g.
@@ -86,56 +92,18 @@ static inline int64_t now_ms(void)
     return esp_timer_get_time() / 1000;
 }
 
-static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
+// Shared by the normal GDO_CB_EVENT_DOOR_POSITION path and the sync-complete
+// catch-up call below. Needed because a DOOR_POSITION event can legitimately
+// arrive a moment *before* status->synced flips true - that event used to be
+// silently dropped (logged, but never recorded into last_door), and since
+// gdolib only re-sends DOOR_POSITION on a genuine state *change*, a door that
+// doesn't move again afterward left last_door permanently stuck at its
+// GDO_DOOR_STATE_MAX startup sentinel for the rest of the session. Confirmed
+// via a real capture: "Door raw: Open" logged at 59.57s, sync completed at
+// 60.92s, and /status still showed "door":"null" 224 seconds later since the
+// door never moved again to trigger a fresh event.
+static void process_door_position(const gdo_status_t *status)
 {
-    // Any event at all (light, lock, position, obstruction, ...) means the
-    // serial link to the opener is alive. Used by the watchdog task below to
-    // detect a fully dead link vs. a door that's just legitimately idle.
-    s_last_status_event_ms = now_ms();
-
-    switch (event) {
-
-    case GDO_CB_EVENT_SYNCED:
-        ESP_LOGI(TAG, "Synced: %s, protocol: %s",
-                 status->synced ? "true" : "false",
-                 gdo_protocol_type_to_string(status->protocol));
-
-        if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
-            ESP_LOGI(TAG, "Client ID: %" PRIu32 ", Rolling code: %" PRIu32,
-                     status->client_id, status->rolling_code);
-        }
-
-        if (!status->synced) {
-            if (gdo_set_rolling_code(status->rolling_code + 100) != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to set rolling code");
-            } else {
-                ESP_LOGI(TAG, "Rolling code set to %" PRIu32 ", retrying sync",
-                         status->rolling_code);
-                gdo_sync();
-            }
-        } else if (s_gdo_synced_sem) {
-            xSemaphoreGive(s_gdo_synced_sem);
-        }
-        break;
-
-    case GDO_CB_EVENT_LIGHT:
-        if (status->light != last_light) {
-            last_light = status->light;
-            ESP_LOGI(TAG, "Light: %s", gdo_light_state_to_string(status->light));
-            notify_homekit_light(status->light);
-        }
-        break;
-
-    case GDO_CB_EVENT_LOCK:
-        if (status->lock != last_lock) {
-            last_lock = status->lock;
-            ESP_LOGI(TAG, "Lock: %s", gdo_lock_state_to_string(status->lock));
-            notify_homekit_current_lock(status->lock);
-        }
-        break;
-
-case GDO_CB_EVENT_DOOR_POSITION: {
-
     uint32_t raw = status->door_position;
     if (raw > 10000) raw = 10000;
 
@@ -150,7 +118,7 @@ case GDO_CB_EVENT_DOOR_POSITION: {
     // Do NOT infer anything until sync completes
     //
     if (!status->synced) {
-        break;
+        return;
     }
 
     gdo_door_state_t inferred = status->door;
@@ -190,73 +158,32 @@ case GDO_CB_EVENT_DOOR_POSITION: {
     //  SECURITY+ 2.0
     // ────────────────────────────────────────────────
     //
-//
-// SECURITY+ 2.0 movement inference (raw may NOT change mid‑movement)
-//
-if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
-
-    static uint32_t last_raw    = raw;
-    static uint32_t last_target = status->door_target;
-    static gdo_door_state_t last_state = status->door;
-
-    bool raw_changed    = (raw != last_raw);
-    bool target_changed = (status->door_target != last_target);
-    bool state_changed  = (status->door != last_state);
-
-    last_raw    = raw;
-    last_target = status->door_target;
-    last_state  = status->door;
-
-    //
-    // Final OPEN/CLOSED detection
-    //
-    if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD) {
-        inferred = GDO_DOOR_STATE_OPEN;
-    }
-    else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD) {
-        inferred = GDO_DOOR_STATE_CLOSED;
-    }
-    else {
-
-        //
-        // Movement start triggered by target change
-        //
-        if (target_changed) {
-            if (status->door_target == 0)
-                inferred = GDO_DOOR_STATE_OPENING;
-            else if (status->door_target == 10000)
-                inferred = GDO_DOOR_STATE_CLOSING;
+    // gdolib forwards status->door directly and immediately to HomeKit
+    // itself (see update_door_state() in gdo.c) - it's the raw,
+    // undecorated value decoded straight off the wire, not something we
+    // need to re-derive. door_position isn't independent wire data
+    // either: gdolib sets it to 0/10000 in the same call that sets
+    // status->door to OPEN/CLOSED, and dead-reckons it via a timer during
+    // OPENING/CLOSING using previously measured open_ms/close_ms - so
+    // checking raw against a threshold here was just re-deriving what
+    // status->door already says, through a value that originates from
+    // status->door in the first place. Trust it directly, matching the
+    // V1 approach above - only fall back to raw position when the
+    // protocol has told us nothing at all (GDO_DOOR_STATE_MAX).
+    if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+        if (status->door == GDO_DOOR_STATE_MAX) {
+            if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD)
+                inferred = GDO_DOOR_STATE_OPEN;
+            else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD)
+                inferred = GDO_DOOR_STATE_CLOSED;
         }
 
-        //
-        // Movement start triggered by door state change
-        //
-        else if (state_changed) {
-            if (status->door == GDO_DOOR_STATE_OPENING)
-                inferred = GDO_DOOR_STATE_OPENING;
-            else if (status->door == GDO_DOOR_STATE_CLOSING)
-                inferred = GDO_DOOR_STATE_CLOSING;
-        }
-
-        //
-        // Movement start triggered by raw change (if your opener ever sends mid‑movement frames)
-        //
-        else if (raw_changed) {
-            if (status->door_target == 0)
-                inferred = GDO_DOOR_STATE_OPENING;
-            else if (status->door_target == 10000)
-                inferred = GDO_DOOR_STATE_CLOSING;
-        }
+        // Drive HomeKit target from door_target
+        if (status->door_target == 0)
+            notify_homekit_target_door_state_change(TGT_OPEN);
+        else if (status->door_target == 10000)
+            notify_homekit_target_door_state_change(TGT_CLOSED);
     }
-
-    //
-    // Drive HomeKit target from door_target
-    //
-    if (status->door_target == 0)
-        notify_homekit_target_door_state_change(TGT_OPEN);
-    else if (status->door_target == 10000)
-        notify_homekit_target_door_state_change(TGT_CLOSED);
-}
 
     //
     // ────────────────────────────────────────────────
@@ -322,6 +249,34 @@ if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
             notify_homekit_target_door_state_change(TGT_OPEN);
         } else if (inferred == GDO_DOOR_STATE_CLOSED) {
             notify_homekit_target_door_state_change(TGT_CLOSED);
+        } else if (inferred == GDO_DOOR_STATE_STOPPED) {
+            // HomeKit's TargetDoorState only supports Open/Closed - there's
+            // no "stopped" option. Leaving Target at whatever it was before
+            // the stop (still pointing at the original direction of travel,
+            // e.g. Open if the door was mid-opening) makes HomeKit read the
+            // stop as an unconfirmed move still in progress rather than a
+            // settled state - confirmed via a real capture where stopping
+            // the door mid-open left Target stuck at Open while Current
+            // correctly said Stopped, and Home app showed "Open" instead of
+            // "Stopped". Pick whichever endpoint the door is actually
+            // closer to instead of leaving a stale value.
+            //
+            // Guard against status->door_position genuinely being unknown
+            // (gdolib's -1 sentinel, e.g. right after a fresh sync before
+            // any real position data exists) - our unsigned raw clamp turns
+            // that into raw=10000, which would be misread as "definitely
+            // near Closed" even though it isn't a real position at all.
+            // Confirmed via a real boot-time capture showing exactly this:
+            // "target=4294967295" (int32_t -1 as unsigned) right as sync
+            // completed. Skip the guess entirely rather than push a target
+            // based on data that was never a real reading.
+            if (status->door_position >= 0) {
+                if (raw <= 5000) {
+                    notify_homekit_target_door_state_change(TGT_OPEN);
+                } else {
+                    notify_homekit_target_door_state_change(TGT_CLOSED);
+                }
+            }
         }
     }
 
@@ -329,7 +284,86 @@ if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
         last_light = status->light;
         notify_homekit_light(status->light);
     }
+}
 
+static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
+{
+    // Any event at all (light, lock, position, obstruction, ...) means the
+    // serial link to the opener is alive. Used by the watchdog task below to
+    // detect a fully dead link vs. a door that's just legitimately idle.
+    s_last_status_event_ms = now_ms();
+
+    switch (event) {
+
+    case GDO_CB_EVENT_SYNCED:
+        ESP_LOGI(TAG, "Synced: %s, protocol: %s",
+                 status->synced ? "true" : "false",
+                 gdo_protocol_type_to_string(status->protocol));
+
+        if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+            ESP_LOGI(TAG, "Client ID: %" PRIu32 ", Rolling code: %" PRIu32,
+                     status->client_id, status->rolling_code);
+        }
+
+        if (!status->synced) {
+            // Scale the jump with consecutive failures instead of a fixed
+            // +100 every time. A real capture needed 5 retry rounds to
+            // close a ~500-unit rolling-code gap (likely from heavy real
+            // opener usage - remote/wall button/keypad - advancing the
+            // opener's counter well past what a single +100 step could
+            // catch up to in one round), taking over a minute total since
+            // each round re-pays the full ~12-13s detection sequence.
+            // Doubling per consecutive failure closes a large gap in far
+            // fewer rounds while still starting conservative (+100) for
+            // the common case of a small drift. Capped at +1600 to avoid
+            // a wild overshoot on a single retry.
+            s_sync_retry_count++;
+            uint32_t shift = (s_sync_retry_count > 4) ? 4 : (s_sync_retry_count - 1);
+            uint32_t jump = 100u << shift;
+
+            if (gdo_set_rolling_code(status->rolling_code + jump) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to set rolling code");
+            } else {
+                ESP_LOGI(TAG, "Rolling code set to %" PRIu32 " (+%" PRIu32 ", attempt %" PRIu32 "), retrying sync",
+                         status->rolling_code, jump, s_sync_retry_count);
+                gdo_sync();
+            }
+        } else {
+            s_sync_retry_count = 0;
+            if (s_gdo_synced_sem) {
+                xSemaphoreGive(s_gdo_synced_sem);
+            }
+            // Catch-up: a DOOR_POSITION event can legitimately arrive a
+            // moment before synced flips true, and that event's own call
+            // to process_door_position() would have bailed out early (it
+            // requires synced). Since gdolib only re-sends DOOR_POSITION on
+            // a genuine state *change*, a door that doesn't move again
+            // afterward would leave last_door stuck at its startup
+            // sentinel indefinitely. Re-run it now that we know sync is
+            // genuinely done, using the same status snapshot - cheap and
+            // idempotent if nothing was actually missed.
+            process_door_position(status);
+        }
+        break;
+
+    case GDO_CB_EVENT_LIGHT:
+        if (status->light != last_light) {
+            last_light = status->light;
+            ESP_LOGI(TAG, "Light: %s", gdo_light_state_to_string(status->light));
+            notify_homekit_light(status->light);
+        }
+        break;
+
+    case GDO_CB_EVENT_LOCK:
+        if (status->lock != last_lock) {
+            last_lock = status->lock;
+            ESP_LOGI(TAG, "Lock: %s", gdo_lock_state_to_string(status->lock));
+            notify_homekit_current_lock(status->lock);
+        }
+        break;
+
+case GDO_CB_EVENT_DOOR_POSITION: {
+    process_door_position(status);
     break;
 }
 
@@ -358,6 +392,47 @@ if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
 
     case GDO_CB_EVENT_MOTOR:
         ESP_LOGI(TAG, "Motor: %s", gdo_motor_state_to_string(status->motor));
+
+        // Motor turning on is a strong, direct signal that a transition
+        // has started - it arrives well before (often several real
+        // seconds before) any Door raw: Opening/Closing frame, if one
+        // ever comes at all. Confirmed via real logs: Motor:On preceded
+        // the final resolved frame by ~8-14s in transitions that produced
+        // zero telemetry in between. Direction is inferable with real
+        // confidence from the last confirmed resolved state - a door
+        // that was Closed can only be starting to open, and vice versa.
+        // Skip inference if the last known state was Stopped/unknown/
+        // already mid-transition, where direction genuinely isn't
+        // knowable from this signal alone.
+        if (status->motor == GDO_MOTOR_STATE_ON) {
+            gdo_door_state_t motor_inferred = GDO_DOOR_STATE_MAX;
+
+            if (last_door == GDO_DOOR_STATE_CLOSED) {
+                motor_inferred = GDO_DOOR_STATE_OPENING;
+            } else if (last_door == GDO_DOOR_STATE_OPEN) {
+                motor_inferred = GDO_DOOR_STATE_CLOSING;
+            }
+
+            if (motor_inferred != GDO_DOOR_STATE_MAX && motor_inferred != last_door) {
+                last_door = motor_inferred;
+                notify_homekit_current_door_state_change(motor_inferred);
+
+                if (motor_inferred == GDO_DOOR_STATE_OPENING) {
+                    notify_homekit_target_door_state_change(TGT_OPEN);
+                } else {
+                    notify_homekit_target_door_state_change(TGT_CLOSED);
+                }
+
+                // Start transition tracking now, at the earliest real
+                // signal we have, instead of waiting for a later
+                // DOOR_POSITION event (if one ever arrives) - gives the
+                // stuck-transition watchdog and status-refresh polling an
+                // accurate start time too.
+                s_door_in_transition  = true;
+                s_transition_start_ms = now_ms();
+                s_transition_target   = motor_inferred;
+            }
+        }
         break;
 
     case GDO_CB_EVENT_OPENINGS:
@@ -419,6 +494,23 @@ static void gdo_watchdog_task(void *arg)
         //    cheap read, unlike gdo_sync() which renegotiates the rolling
         //    code) and re-derive the real position ourselves.
         if (s_door_in_transition) {
+            // Actively ask the opener for a fresh status update while a
+            // transition is known to be in progress, rather than only
+            // waiting for it to volunteer one. Confirmed via real captures
+            // that some transitions produce zero telemetry between the
+            // start and end frames, leaving HomeKit showing stale state
+            // for the door's full ~10-15s travel time. This can't fix that
+            // if the opener genuinely never answers an on-demand request,
+            // but it's worth trying - requires gdo_refresh_status() to be
+            // added to gdolib (see gdo_refresh_status_patch.md); this call
+            // is a no-op error (logged, harmless) until that's applied.
+            esp_err_t refresh_err = gdo_refresh_status();
+            if (refresh_err == ESP_OK) {
+                ESP_LOGD(TAG, "Requesting status refresh during transition");
+            } else {
+                ESP_LOGD(TAG, "Status refresh request failed: %s", esp_err_to_name(refresh_err));
+            }
+
             gdo_status_t status;
             esp_err_t err = gdo_get_status(&status);
 
@@ -441,37 +533,25 @@ static void gdo_watchdog_task(void *arg)
 
                     gdo_door_state_t resolved = GDO_DOOR_STATE_MAX;
 
-                    bool is_secplus1 = (status.protocol == GDO_PROTOCOL_SEC_PLUS_V1 ||
-                                        status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL);
-
-                    if (is_secplus1) {
-                        // Sec+1.0 doesn't give continuous position telemetry -
-                        // status.door is the authoritative signal (same rule
-                        // the primary event handler uses). Trust OPEN/CLOSED/
-                        // STOPPED directly whenever the protocol has already
-                        // reported one - do not second-guess STOPPED using
-                        // raw position, since raw can be stale (last full
-                        // arrival value) rather than reflecting wherever the
-                        // door actually stopped. Only fall back to raw when
-                        // the protocol has told us nothing at all (MAX).
-                        if (status.door == GDO_DOOR_STATE_OPEN ||
-                            status.door == GDO_DOOR_STATE_CLOSED ||
-                            status.door == GDO_DOOR_STATE_STOPPED) {
-                            resolved = status.door;
-                        } else if (status.door == GDO_DOOR_STATE_MAX) {
-                            if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD) {
-                                resolved = GDO_DOOR_STATE_OPEN;
-                            } else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD) {
-                                resolved = GDO_DOOR_STATE_CLOSED;
-                            }
-                        }
-                    } else {
-                        // Sec+2.0: position telemetry is the primary source
-                        // of truth, same as the event handler.
-                        if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD)
+                    // gdolib's status.door is the authoritative signal for
+                    // every protocol (see gdo_event_handler's V1/V2
+                    // handling above - door_position turned out to be
+                    // derived from door state by gdolib itself, not
+                    // independent wire data, so there's no reason to treat
+                    // V1/V2 differently here anymore). Trust OPEN/CLOSED/
+                    // STOPPED directly whenever the protocol has already
+                    // reported one. Only fall back to raw position when
+                    // the protocol has told us nothing at all (MAX).
+                    if (status.door == GDO_DOOR_STATE_OPEN ||
+                        status.door == GDO_DOOR_STATE_CLOSED ||
+                        status.door == GDO_DOOR_STATE_STOPPED) {
+                        resolved = status.door;
+                    } else if (status.door == GDO_DOOR_STATE_MAX) {
+                        if (raw <= GDO_DOOR_POS_OPEN_THRESHOLD) {
                             resolved = GDO_DOOR_STATE_OPEN;
-                        else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD)
+                        } else if (raw >= GDO_DOOR_POS_CLOSED_THRESHOLD) {
                             resolved = GDO_DOOR_STATE_CLOSED;
+                        }
                     }
 
                     s_door_in_transition = false;
@@ -479,7 +559,7 @@ static void gdo_watchdog_task(void *arg)
                     if (resolved != GDO_DOOR_STATE_MAX) {
                         // The door actually arrived - our own event handler
                         // just never got (or acted on) the frame saying so.
-                        bool from_protocol_state = is_secplus1 && (status.door == resolved);
+                        bool from_protocol_state = (status.door == resolved);
                         ESP_LOGW(TAG,
                                  "%s timed out after %" PRIu32 " ms (limit %" PRIu32
                                  " ms) - re-derived %s from %s (raw=%" PRIu32 ")",
