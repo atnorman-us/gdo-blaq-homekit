@@ -36,3 +36,6 @@ Status table: door / light / lock / obstruction / motion state, uptime, free hea
 Log pane: shows the last ~64KB of log history, refreshes every 3s by default (toggle off with the checkbox if you want to read a specific moment without it jumping).
 
 Download full log button — same as hitting /logs/download directly, gives you a .txt file
+
+## Pre-Close Warning:
+GDO blaQ light will flash and speaker will beep for 5 seconds if closed from app.
