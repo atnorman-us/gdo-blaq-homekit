@@ -5,6 +5,7 @@ idf_component_register(
         "wifi.cpp"
         "diag_webserver.cpp"
         "log_ring_buffer.cpp"
+        "pre_close_warning.c"
     INCLUDE_DIRS "." "include"
     PRIV_REQUIRES
         esp_wifi
@@ -18,4 +19,5 @@ idf_component_register(
         esp_hap_extras
         esp_hap_apple_profiles
         esp_http_server
+        driver
 )

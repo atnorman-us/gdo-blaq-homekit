@@ -19,6 +19,7 @@
 #include "homekit_decl.h"
 #include "homekit.h"
 #include "diag_webserver.h"
+#include "pre_close_warning.h"
 
 // Defined in homekit.cpp - creates the HomeKit notification queue early,
 // before gdo_start() so no GDO event can fire before it exists.
@@ -777,6 +778,13 @@ extern "C" void app_main(void)
     gdo_conf.obst_in_pin    = GPIO_NUM_5;
 
     s_gdo_synced_sem = xSemaphoreCreateBinary();
+
+    // Sets up the onboard buzzer (GPIO4) and LED (GPIO3) used by the
+    // UL-325 pre-close warning in homekit.cpp's gdo_svc_set(). Independent
+    // of gdo_init()/gdo_start() below - no shared pins (those own GPIO1/2/5)
+    // - so ordering relative to them doesn't matter, but it must run before
+    // any door-close request could possibly arrive, hence here at boot.
+    pre_close_warning_init();
 
     // Defined in homekit.cpp - must run before gdo_start() so the
     // notification queue exists before any GDO event callback can fire.

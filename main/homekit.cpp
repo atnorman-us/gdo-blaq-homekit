@@ -21,6 +21,7 @@ static const char *TAG = "HOMEKIT";
 
 #include "wifi.h"
 #include "diag_webserver.h"
+#include "pre_close_warning.h"
 
 // Defined in gdo-blaq-homekit.cpp - blocks until real GDO sync completes.
 extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms);
@@ -529,29 +530,22 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
 
     ESP_LOGI(TAG, "Remote close requested");
 
-    // Retrieve current GDO status so we know the protocol
-                    gdo_status_t st;
-                    gdo_get_status(&st);
+    // UL-325 pre-close warning, driven locally by the GDO blaQ's own
+    // onboard buzzer (GPIO4) + LED (GPIO3) — see pre_close_warning.h.
+    //
+    // Previously this branched on Security+ protocol version: V1 got a
+    // light-flash warning (relying on the opener's smart panel to beep in
+    // response), and V2 got nothing at all, on the assumption the opener
+    // itself would handle the warning. That assumption doesn't hold for
+    // every opener - confirmed silent/no-flash on Security+ 2.0 hardware
+    // in the field - so we no longer trust the opener to do this. The
+    // local warning now runs unconditionally, for both protocols, using
+    // hardware this firmware fully controls.
+    ESP_LOGW(TAG, "UL-325 warning: sounding local buzzer/LED for %d ms before close",
+             PRE_CLOSE_WARNING_DURATION_MS);
+    pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
 
-                    bool is_secplus2 = (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
-
-                    if (!is_secplus2) {
-                        // UL-325 warning for Security+ 1.0
-                        ESP_LOGW(TAG, "UL-325 warning: Security+ 1.0 — generating 5-second alert");
-
-                        // Smart panel beeps automatically when the light is flashed
-                        for (int i = 0; i < 5; i++) {
-                            gdo_light_on();
-                            vTaskDelay(pdMS_TO_TICKS(500));
-
-                            gdo_light_off();
-                            vTaskDelay(pdMS_TO_TICKS(500));
-                        }
-                    } else {
-                        ESP_LOGI(TAG, "Security+ 2.0 — opener will handle UL-325 warning automatically");
-                    }
-
-                    // Now close the door (both protocols)
+                    // Now close the door
                     gdo_door_close();
 
                     hap_char_update_val(write->hc, &(write->val));
