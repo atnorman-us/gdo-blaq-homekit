@@ -6,6 +6,7 @@
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -286,6 +287,94 @@ static void process_door_position(const gdo_status_t *status)
     }
 }
 
+// Persists the Security+ 2.0 client_id/rolling_code across reboots so a
+// normal restart can seed sync from close to where the last session left
+// off, instead of gdolib's hardcoded defaults every single time.
+//
+// Confirmed the need for this via two consecutive real boots that needed
+// the IDENTICAL 5-round rolling-code retry sequence
+// (21->121->342->763->1584->3205, landing at the same final value both
+// times) - proof the starting point was completely disconnected from
+// wherever the real opener's counter had actually been left by real-world
+// use between boots. Without persistence, every reboot re-discovers the
+// gap from scratch via trial and error, no matter how recently the device
+// last synced successfully.
+#define GDO_NVS_NAMESPACE      "gdo_rolling"
+#define GDO_NVS_KEY_CLIENT_ID  "client_id"
+#define GDO_NVS_KEY_ROLLING    "rolling_code"
+
+// Called once, early in app_main(), before gdo_start() - seeds gdolib
+// with the last known-good values if any are saved. Safe to call even if
+// nothing has ever been saved (first boot, or NVS was erased): NVS simply
+// won't have the namespace/keys yet, which is treated as "nothing to
+// seed," not an error.
+static void gdo_load_persisted_rolling_state(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No persisted rolling-code state found (%s) - using gdolib defaults",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    uint32_t client_id = 0;
+    uint32_t rolling_code = 0;
+    bool have_client_id = (nvs_get_u32(handle, GDO_NVS_KEY_CLIENT_ID, &client_id) == ESP_OK);
+    bool have_rolling_code = (nvs_get_u32(handle, GDO_NVS_KEY_ROLLING, &rolling_code) == ESP_OK);
+    nvs_close(handle);
+
+    if (have_client_id) {
+        if (gdo_set_client_id(client_id) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to seed persisted client ID");
+        }
+    }
+
+    if (have_rolling_code) {
+        // Seeded at exactly the last saved value, no artificial margin -
+        // if the opener's real counter has moved further since the last
+        // save (likely, given any real-world use in between), the
+        // existing scaled-jump retry logic already closes that gap
+        // efficiently in a few rounds. Guessing at a speculative offset
+        // here would add complexity without evidence for what margin is
+        // actually safe on this protocol.
+        if (gdo_set_rolling_code(rolling_code) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to seed persisted rolling code");
+        } else {
+            ESP_LOGI(TAG, "Seeded client ID %" PRIu32 ", rolling code %" PRIu32 " from NVS",
+                     client_id, rolling_code);
+        }
+    }
+}
+
+// Called after a successful sync (see GDO_CB_EVENT_SYNCED). Deliberately
+// NOT called on every rolling-code change during normal operation (every
+// door/light/lock command increments it) - NVS flash has a limited
+// write-cycle lifetime, and sync only happens a handful of times per
+// boot, keeping write frequency low while still delivering the real
+// benefit: the next reboot starts from here instead of from scratch.
+static void gdo_save_rolling_state(uint32_t client_id, uint32_t rolling_code)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for rolling-code save: %s", esp_err_to_name(err));
+        return;
+    }
+
+    nvs_set_u32(handle, GDO_NVS_KEY_CLIENT_ID, client_id);
+    nvs_set_u32(handle, GDO_NVS_KEY_ROLLING, rolling_code);
+    esp_err_t commit_err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (commit_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to commit rolling-code save: %s", esp_err_to_name(commit_err));
+    } else {
+        ESP_LOGI(TAG, "Saved client ID %" PRIu32 ", rolling code %" PRIu32 " to NVS",
+                 client_id, rolling_code);
+    }
+}
+
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
 {
     // Any event at all (light, lock, position, obstruction, ...) means the
@@ -333,6 +422,14 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             if (s_gdo_synced_sem) {
                 xSemaphoreGive(s_gdo_synced_sem);
             }
+
+            // Persist for next boot - see gdo_save_rolling_state() comment.
+            // V2-only: client_id/rolling_code are meaningless on V1, which
+            // doesn't use this rolling-code scheme at all.
+            if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+                gdo_save_rolling_state(status->client_id, status->rolling_code);
+            }
+
             // Catch-up: a DOOR_POSITION event can legitimately arrive a
             // moment before synced flips true, and that event's own call
             // to process_door_position() would have bailed out early (it
@@ -404,6 +501,18 @@ case GDO_CB_EVENT_DOOR_POSITION: {
         // Skip inference if the last known state was Stopped/unknown/
         // already mid-transition, where direction genuinely isn't
         // knowable from this signal alone.
+        //
+        // KNOWN RISK, ACCEPTED FOR NOW: a real incident showed the door
+        // displaying "Closing" while it was actually Open, persisting for
+        // 45+ seconds - well beyond the ~25-32s the stuck-transition
+        // watchdog below should take to self-correct (measured travel
+        // time + 10s margin, checked every 5s). No log of that specific
+        // incident exists, so the exact failure mechanism in the recovery
+        // path is still unknown. Re-enabled at the user's request - they
+        // have an independent way (cameras) to verify real door state
+        // while this is being evaluated further. If this recurs, capture
+        // a log covering the incident immediately; that's what's actually
+        // needed to diagnose it properly rather than guessing again.
         if (status->motor == GDO_MOTOR_STATE_ON) {
             gdo_door_state_t motor_inferred = GDO_DOOR_STATE_MAX;
 
@@ -647,6 +756,18 @@ extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms)
 
 extern "C" void app_main(void)
 {
+    // Required before any nvs_open() call - this is the top-level entry
+    // point, nothing else runs before app_main() that would have already
+    // initialized NVS. Standard ESP-IDF boilerplate: reinit on the two
+    // recoverable error cases (partition truncated/corrupt or found from
+    // an older NVS format), otherwise fail loudly via ESP_ERROR_CHECK.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart    = true;
     gdo_conf.obst_from_status = true;
@@ -665,6 +786,13 @@ extern "C" void app_main(void)
     homekit_notif_queue_init();
 
     ESP_ERROR_CHECK(gdo_init(&gdo_conf));
+
+    // Seed any persisted rolling-code state before starting sync - must
+    // happen after gdo_init() (so g_status exists) and before gdo_start()
+    // (which internally kicks off gdo_sync() - gdo_set_rolling_code()/
+    // gdo_set_client_id() both refuse once synced is true).
+    gdo_load_persisted_rolling_state();
+
     ESP_ERROR_CHECK(gdo_start(gdo_event_handler, NULL));
 
     xTaskCreate(homekit_task_entry,
