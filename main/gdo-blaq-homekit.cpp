@@ -467,8 +467,40 @@ case GDO_CB_EVENT_DOOR_POSITION: {
 
     case GDO_CB_EVENT_OBSTRUCTION:
         if (status->obstruction != last_obstruction) {
-            last_obstruction = status->obstruction;
-            notify_homekit_obstruction(status->obstruction);
+            // Debounce "Detected" only - a single corrupted UART frame
+            // (this link logs frequent "RX data signature error" - see
+            // gdo_event_handler's RX path) can misdecode into a spurious
+            // obstruction bit. Confirmed via a real report: Home app
+            // showed Obstructed with the door fully closed and physically
+            // clear, no logging existed to see what triggered it. Require
+            // the SAME detected reading to show up on two consecutive
+            // OBSTRUCTION events before trusting it and pushing to
+            // HomeKit - a real interruption re-reports continuously, so
+            // this costs negligible real-world detection latency. Never
+            // debounce "Clear" - there's no safety cost to clearing
+            // faster, and it self-corrects a false Detected quickly.
+            static gdo_obstruction_state_t s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
+
+            if (status->obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
+                s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
+                last_obstruction = status->obstruction;
+                ESP_LOGI(TAG, "Obstruction: %s",
+                         gdo_obstruction_state_to_string(status->obstruction));
+                notify_homekit_obstruction(status->obstruction);
+            } else if (s_pending_obstruction == status->obstruction) {
+                // Second consecutive matching reading - trust it.
+                s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
+                last_obstruction = status->obstruction;
+                ESP_LOGW(TAG, "Obstruction: %s (confirmed on 2nd consecutive reading)",
+                         gdo_obstruction_state_to_string(status->obstruction));
+                notify_homekit_obstruction(status->obstruction);
+            } else {
+                // First reading of a new non-clear state - hold it, don't
+                // notify HomeKit yet.
+                s_pending_obstruction = status->obstruction;
+                ESP_LOGW(TAG, "Obstruction: %s reading received (unconfirmed - awaiting 2nd match)",
+                         gdo_obstruction_state_to_string(status->obstruction));
+            }
         }
         break;
 
