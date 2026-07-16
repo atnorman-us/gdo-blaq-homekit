@@ -121,5 +121,12 @@ void pre_close_warning_run_async(uint32_t duration_ms, void (*on_complete)(void)
     args->duration_ms = duration_ms;
     args->on_complete = on_complete;
 
-    xTaskCreate(warning_task, "pre_close_warn", 2048, args, tskIDLE_PRIORITY + 1, NULL);
+    // 2048 was too tight in practice: this task's on_complete callback can
+    // go on to call HomeKit SDK notification functions (e.g.
+    // notify_homekit_target_door_state_change() in an auto-close
+    // completion callback), which may touch encrypted-session crypto for
+    // connected HAP controllers - confirmed via a real device panic/reset
+    // instead of closing, correlated with auto-close (the only caller of
+    // this async variant) firing for the first time on real hardware.
+    xTaskCreate(warning_task, "pre_close_warn", 8192, args, tskIDLE_PRIORITY + 1, NULL);
 }

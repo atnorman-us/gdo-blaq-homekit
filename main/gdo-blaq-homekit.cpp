@@ -51,6 +51,18 @@ static const char* TAG = "test_main";
 #define GDO_DOOR_TRANSIT_FALLBACK_MS   35000
 #define GDO_DOOR_TRANSIT_MARGIN_MS     10000
 
+// If the motor turns on but raw position hasn't moved a meaningful amount
+// within this window, treat it as a refused/aborted move (e.g. opener's
+// own safety circuit vetoed the close because the beam was already broken
+// at the exact moment the command arrived) rather than a genuinely slow
+// transit. Confirmed in the field: MOTOR_ON fired once, raw stayed pinned
+// at 0 for the door's ENTIRE ~38-second wait before the old fallback
+// timeout finally caught it - a real transit changes raw within a couple
+// seconds (see successful cycles elsewhere in these logs), so 8s is
+// generous margin, not a hair-trigger.
+#define GDO_DOOR_STALL_CHECK_MS        8000
+#define GDO_DOOR_STALL_MOVEMENT_MIN    200
+
 // If we haven't seen *any* GDO event (of any kind) in this long, the UART
 // link itself is probably dead (not just "door is idle") - kick a resync.
 //
@@ -66,12 +78,61 @@ static const char* TAG = "test_main";
 
 #define GDO_WATCHDOG_PERIOD_MS         5000
 
+// If Obstructed stays confirmed this long with zero fresh readings to
+// back it up, treat it as stale and auto-clear. gdolib doesn't send a
+// steady heartbeat of OBST_1/OBST_2 frames while idle - it only reports
+// around motion/status activity - so a real obstruction event can be
+// confirmed correctly and then never followed by a "Clear" reading if
+// the door settles and traffic quiets down, leaving HomeKit permanently
+// stuck showing Obstructed. Confirmed in the field: walked through the
+// beam during a real close, door correctly auto-reversed and reopened,
+// obstruction correctly confirmed - then no further OBST_1/OBST_2
+// traffic arrived at all, and Home app never cleared on its own.
+#define GDO_OBSTRUCTION_STALE_TIMEOUT_MS  30000
+
+// If a close/open request has gone unanswered this long - status.door_target
+// disagrees with status.door, and s_door_in_transition never became true
+// because no motion was ever confirmed - treat the request as refused and
+// revert HomeKit's target back to reality. Confirmed in the field: opener
+// refused to start closing (beam broken at the exact moment the close
+// command arrived), motor never engaged, and HomeKit was left showing a
+// permanent "Closing" spinner with no self-correction, since the existing
+// stuck-transition watchdog is entirely gated on s_door_in_transition,
+// which requires motion to have started at all.
+#define GDO_MOTOR_ENGAGE_TIMEOUT_MS  8000
+
+// Auto-close: if the door has been continuously OPEN (confirmed, not
+// mid-transition) this long, close it automatically - same warning path
+// as any other close, and skipped entirely if the last known obstruction
+// reading isn't Clear. Runtime-configurable via NVS (see
+// auto_close_settings_load()/gdo_set_auto_close_timeout_ms() below) - this
+// is only the fallback used the first time the device ever boots, before
+// any value has been saved.
+#define GDO_AUTO_CLOSE_TIMEOUT_DEFAULT_MS  (60 * 60 * 1000)
+
 // Last-known states for filtering duplicate notifications
 static gdo_light_state_t       last_light       = GDO_LIGHT_STATE_MAX;
 static gdo_lock_state_t        last_lock        = GDO_LOCK_STATE_MAX;
 static gdo_door_state_t        last_door        = GDO_DOOR_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
+static esp_timer_handle_t      obstruction_stale_timer = NULL;
+
+// Auto-close tracking. s_door_open_since_ms is 0 whenever the door isn't
+// confirmed OPEN right now; set exclusively through set_last_door_state()
+// below so every place that updates last_door keeps this in sync too,
+// rather than needing six separate call sites to remember to.
+static volatile int64_t s_door_open_since_ms   = 0;
+static volatile bool    s_auto_close_triggered = false;
+static volatile uint32_t s_auto_close_timeout_ms = GDO_AUTO_CLOSE_TIMEOUT_DEFAULT_MS;
+
+// Off by default - auto-close is a real safety-relevant behavior change
+// (the door will move on its own with nobody having asked it to, right
+// now), not something that should silently start happening just because
+// firmware got updated. When first enabled with no saved timeout yet,
+// s_auto_close_timeout_ms is already sitting at its 60-minute default
+// above, so enabling it needs no extra "populate the default" logic.
+static volatile bool s_auto_close_enabled = false;
 
 // Tracks consecutive sync failures within this boot, so the rolling-code
 // retry jump can scale up instead of always adding a fixed +100. Reset to
@@ -89,9 +150,37 @@ static volatile bool             s_door_in_transition   = false;
 static volatile int64_t          s_transition_start_ms  = 0;
 static volatile gdo_door_state_t s_transition_target    = GDO_DOOR_STATE_MAX;
 
+// Tracks a commanded target (gdo_door_close()/gdo_door_open() was called,
+// so gdolib's own status.door_target no longer matches status.door) that
+// s_door_in_transition never picked up because no motion was ever
+// confirmed at all - see GDO_MOTOR_ENGAGE_TIMEOUT_MS below for why this
+// exists as a separate watchdog from the one above.
+static volatile gdo_door_state_t s_pending_target_state    = GDO_DOOR_STATE_MAX;
+static volatile int64_t          s_pending_target_start_ms = 0;
+static volatile uint32_t         s_transition_start_raw    = 0;
+
 static inline int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+// Every write to last_door goes through here instead of a bare assignment,
+// so auto-close's "how long has it been continuously OPEN" tracking stays
+// correct no matter which of the six call sites in this file changed the
+// state - a door leaving OPEN (for any reason: closing, obstruction,
+// re-sync, watchdog correction, ...) always resets the clock, and a door
+// arriving at OPEN always starts it, with no per-call-site bookkeeping to
+// remember or forget.
+static void set_last_door_state(gdo_door_state_t new_state)
+{
+    if (new_state == GDO_DOOR_STATE_OPEN && last_door != GDO_DOOR_STATE_OPEN) {
+        s_door_open_since_ms   = now_ms();
+        s_auto_close_triggered = false;
+    } else if (new_state != GDO_DOOR_STATE_OPEN && last_door == GDO_DOOR_STATE_OPEN) {
+        s_door_open_since_ms   = 0;
+        s_auto_close_triggered = false;
+    }
+    last_door = new_state;
 }
 
 // Shared by the normal GDO_CB_EVENT_DOOR_POSITION path and the sync-complete
@@ -197,6 +286,7 @@ static void process_door_position(const gdo_status_t *status)
             s_door_in_transition  = true;
             s_transition_start_ms = now_ms();
             s_transition_target   = inferred;
+            s_transition_start_raw = raw;
         }
     } else {
         // We reached a resolved state (OPEN/CLOSED/STOPPED) on our own -
@@ -227,7 +317,7 @@ static void process_door_position(const gdo_status_t *status)
             notify_homekit_current_door_state_change(GDO_DOOR_STATE_CLOSING);
         }
 
-        last_door = inferred;
+        set_last_door_state(inferred);
         notify_homekit_current_door_state_change(inferred);
 
         // Keep Target in sync whenever Current resolves to a definite
@@ -376,6 +466,129 @@ static void gdo_save_rolling_state(uint32_t client_id, uint32_t rolling_code)
     }
 }
 
+// Separate namespace from the rolling-code state above - unrelated data,
+// no reason to share a namespace or invalidate one by erasing the other.
+#define GDO_SETTINGS_NVS_NAMESPACE      "gdo_settings"
+#define GDO_SETTINGS_NVS_KEY_AUTOCLOSE  "auto_close_ms"
+#define GDO_SETTINGS_NVS_KEY_AC_ENABLED "auto_close_en"
+
+// Called once, early in app_main() - loads a previously saved auto-close
+// timeout if one exists; otherwise s_auto_close_timeout_ms stays at its
+// GDO_AUTO_CLOSE_TIMEOUT_DEFAULT_MS initializer (first boot, or NVS erased).
+static void auto_close_settings_load(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved auto-close setting (%s) - using default (%" PRIu32 " ms)",
+                 esp_err_to_name(err), (uint32_t)s_auto_close_timeout_ms);
+        return;
+    }
+
+    uint32_t saved_ms = 0;
+    if (nvs_get_u32(handle, GDO_SETTINGS_NVS_KEY_AUTOCLOSE, &saved_ms) == ESP_OK) {
+        s_auto_close_timeout_ms = saved_ms;
+        ESP_LOGI(TAG, "Loaded auto-close timeout from NVS: %" PRIu32 " ms", saved_ms);
+    }
+
+    uint8_t saved_enabled = 0;
+    if (nvs_get_u8(handle, GDO_SETTINGS_NVS_KEY_AC_ENABLED, &saved_enabled) == ESP_OK) {
+        s_auto_close_enabled = (saved_enabled != 0);
+        ESP_LOGI(TAG, "Loaded auto-close enabled state from NVS: %s",
+                 s_auto_close_enabled ? "enabled" : "disabled");
+    }
+    nvs_close(handle);
+}
+
+// Updates the in-memory timeout AND persists it, so it survives a reboot.
+// Not static, and deliberately takes/returns plain types rather than
+// anything GDO-library-specific - this is the function a future HTTP
+// config handler (e.g. in diag_webserver.cpp) should call directly to let
+// the auto-close duration be changed without a reflash. Needs a forward
+// declaration in whatever header that file includes to call it - not
+// wired up yet since diag_webserver.cpp hasn't been shared for this.
+extern "C" esp_err_t gdo_set_auto_close_timeout_ms(uint32_t timeout_ms)
+{
+    s_auto_close_timeout_ms = timeout_ms;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Auto-close timeout updated in memory (%" PRIu32
+                 " ms) but failed to open NVS to persist it: %s",
+                 timeout_ms, esp_err_to_name(err));
+        return err;
+    }
+
+    nvs_set_u32(handle, GDO_SETTINGS_NVS_KEY_AUTOCLOSE, timeout_ms);
+    esp_err_t commit_err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (commit_err == ESP_OK) {
+        ESP_LOGI(TAG, "Auto-close timeout set to %" PRIu32 " ms and saved to NVS", timeout_ms);
+    } else {
+        ESP_LOGW(TAG, "Auto-close timeout updated in memory but failed to save: %s",
+                 esp_err_to_name(commit_err));
+    }
+    return commit_err;
+}
+
+// Read-only accessor, e.g. for a future HTTP config page to show the
+// current value.
+extern "C" uint32_t gdo_get_auto_close_timeout_ms(void)
+{
+    return s_auto_close_timeout_ms;
+}
+
+// Same pattern as gdo_set_auto_close_timeout_ms() - updates in-memory
+// state and persists it. This is the toggle: auto-close is entirely
+// gated on this being true, checked first in the watchdog before it even
+// looks at door-open duration.
+extern "C" esp_err_t gdo_set_auto_close_enabled(bool enabled)
+{
+    s_auto_close_enabled = enabled;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Auto-close %s in memory but failed to open NVS to persist it: %s",
+                 enabled ? "enabled" : "disabled", esp_err_to_name(err));
+        return err;
+    }
+
+    nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_AC_ENABLED, enabled ? 1 : 0);
+    esp_err_t commit_err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (commit_err == ESP_OK) {
+        ESP_LOGI(TAG, "Auto-close %s and saved to NVS", enabled ? "enabled" : "disabled");
+    } else {
+        ESP_LOGW(TAG, "Auto-close %s in memory but failed to save: %s",
+                 enabled ? "enabled" : "disabled", esp_err_to_name(commit_err));
+    }
+    return commit_err;
+}
+
+extern "C" bool gdo_get_auto_close_enabled(void)
+{
+    return s_auto_close_enabled;
+}
+
+// Milliseconds remaining until auto-close would fire, or -1 if not
+// currently counting down at all (disabled, door isn't confirmed open, or
+// the warning/close sequence has already started for this open-cycle -
+// s_auto_close_triggered is only cleared again once the door leaves and
+// re-enters OPEN, see set_last_door_state()). For a dashboard countdown.
+extern "C" int64_t gdo_get_auto_close_remaining_ms(void)
+{
+    if (!s_auto_close_enabled || s_door_open_since_ms == 0 || s_auto_close_triggered) {
+        return -1;
+    }
+    int64_t elapsed = now_ms() - s_door_open_since_ms;
+    int64_t remaining = (int64_t)s_auto_close_timeout_ms - elapsed;
+    return remaining > 0 ? remaining : 0;
+}
+
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
 {
     // Any event at all (light, lock, position, obstruction, ...) means the
@@ -487,6 +700,7 @@ case GDO_CB_EVENT_DOOR_POSITION: {
                 ESP_LOGI(TAG, "Obstruction: %s",
                          gdo_obstruction_state_to_string(status->obstruction));
                 notify_homekit_obstruction(status->obstruction);
+                esp_timer_stop(obstruction_stale_timer); // cancel - no need to auto-clear what's already clear
             } else if (s_pending_obstruction == status->obstruction) {
                 // Second consecutive matching reading - trust it.
                 s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
@@ -494,6 +708,14 @@ case GDO_CB_EVENT_DOOR_POSITION: {
                 ESP_LOGW(TAG, "Obstruction: %s (confirmed on 2nd consecutive reading)",
                          gdo_obstruction_state_to_string(status->obstruction));
                 notify_homekit_obstruction(status->obstruction);
+
+                // Arm the staleness watchdog - if gdolib goes quiet on
+                // obstruction traffic (it doesn't heartbeat this while
+                // idle) before a real Clear ever arrives, this forces one
+                // rather than leaving HomeKit stuck on Obstructed forever.
+                esp_timer_stop(obstruction_stale_timer);
+                esp_timer_start_once(obstruction_stale_timer,
+                                      (uint64_t)GDO_OBSTRUCTION_STALE_TIMEOUT_MS * 1000);
             } else {
                 // First reading of a new non-clear state - hold it, don't
                 // notify HomeKit yet.
@@ -556,7 +778,7 @@ case GDO_CB_EVENT_DOOR_POSITION: {
             }
 
             if (motor_inferred != GDO_DOOR_STATE_MAX && motor_inferred != last_door) {
-                last_door = motor_inferred;
+                set_last_door_state(motor_inferred);
                 notify_homekit_current_door_state_change(motor_inferred);
 
                 if (motor_inferred == GDO_DOOR_STATE_OPENING) {
@@ -573,6 +795,8 @@ case GDO_CB_EVENT_DOOR_POSITION: {
                 s_door_in_transition  = true;
                 s_transition_start_ms = now_ms();
                 s_transition_target   = motor_inferred;
+                s_transition_start_raw = (uint32_t)status->door_position > 10000
+                                             ? 10000 : (uint32_t)status->door_position;
             }
         }
         break;
@@ -619,11 +843,56 @@ case GDO_CB_EVENT_DOOR_POSITION: {
 
 
 // ────────────────────────────────────────────────
+//  Obstruction staleness watchdog
+// ────────────────────────────────────────────────
+//
+// See GDO_OBSTRUCTION_STALE_TIMEOUT_MS for why this exists: a confirmed
+// Obstructed reading has no guaranteed follow-up Clear event to look
+// forward to, since gdolib only reports obstruction status around
+// motion/activity, not as a steady idle heartbeat.
+static void obstruction_stale_timeout_cb(void *arg)
+{
+    if (last_obstruction != GDO_OBSTRUCTION_STATE_CLEAR) {
+        ESP_LOGW(TAG, "Obstruction: auto-clearing after %d ms with no fresh reading "
+                 "to confirm it's still Obstructed (was stuck, not a real sensor Clear)",
+                 GDO_OBSTRUCTION_STALE_TIMEOUT_MS);
+        last_obstruction = GDO_OBSTRUCTION_STATE_CLEAR;
+        notify_homekit_obstruction(GDO_OBSTRUCTION_STATE_CLEAR);
+    }
+}
+
+// Call once at boot, before any door activity - see GDO_OBSTRUCTION_STALE_TIMEOUT_MS.
+static void obstruction_watchdog_init(void)
+{
+    const esp_timer_create_args_t timer_args = {
+        .callback = obstruction_stale_timeout_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "obst_stale_wd",
+        .skip_unhandled_events = false,
+    };
+    esp_timer_create(&timer_args, &obstruction_stale_timer);
+}
+
+
+// ────────────────────────────────────────────────
 //  Monitoring / recovery watchdog
 // ────────────────────────────────────────────────
 //
 // Runs independently of the GDO callback, so it keeps working even if the
 // serial link has gone completely silent.
+
+// Fires once the auto-close warning finishes (see pre_close_warning.h's
+// async variant) - runs on its own task, not the watchdog task, so the
+// watchdog keeps polling normally through the whole warning duration
+// instead of blocking on it.
+static void auto_close_warning_complete_cb(void)
+{
+    ESP_LOGW(TAG, "Auto-close: warning complete, closing now");
+    notify_homekit_target_door_state_change(TGT_CLOSED);
+    gdo_door_close();
+}
+
 static void gdo_watchdog_task(void *arg)
 {
     for (;;) {
@@ -658,16 +927,28 @@ static void gdo_watchdog_task(void *arg)
 
             if (err == ESP_OK) {
                 uint32_t elapsed = (uint32_t)(now - s_transition_start_ms);
+                uint32_t raw_now = (uint32_t)status.door_position;
+                if (raw_now > 10000) raw_now = 10000;
+
+                int32_t moved = (int32_t)raw_now - (int32_t)s_transition_start_raw;
+                if (moved < 0) moved = -moved;
+                bool stalled = (elapsed >= GDO_DOOR_STALL_CHECK_MS) &&
+                               ((uint32_t)moved < GDO_DOOR_STALL_MOVEMENT_MIN);
 
                 // Use the door's own measured travel time once the library
                 // has learned it; otherwise fall back to a conservative
-                // fixed ceiling.
+                // fixed ceiling. Skip both entirely if the door has plainly
+                // never moved at all since the motor turned on - that's not
+                // a slow transit, it's a refused/aborted move, and doesn't
+                // deserve the same generous ceiling.
                 uint16_t measured_ms = (s_transition_target == GDO_DOOR_STATE_OPENING)
                                            ? status.open_ms
                                            : status.close_ms;
-                uint32_t timeout_ms = measured_ms > 0
-                                           ? (uint32_t)measured_ms + GDO_DOOR_TRANSIT_MARGIN_MS
-                                           : GDO_DOOR_TRANSIT_FALLBACK_MS;
+                uint32_t timeout_ms = stalled
+                                           ? GDO_DOOR_STALL_CHECK_MS
+                                           : (measured_ms > 0
+                                                  ? (uint32_t)measured_ms + GDO_DOOR_TRANSIT_MARGIN_MS
+                                                  : GDO_DOOR_TRANSIT_FALLBACK_MS);
 
                 if (elapsed > timeout_ms) {
                     uint32_t raw = raw_now;
@@ -711,8 +992,26 @@ static void gdo_watchdog_task(void *arg)
                                  raw);
 
                         if (resolved != last_door) {
-                            last_door = resolved;
+                            set_last_door_state(resolved);
                             notify_homekit_current_door_state_change(resolved);
+                        }
+
+                        // Also fix HomeKit's target right here rather than
+                        // waiting for the separate never-engaged watchdog to
+                        // catch it on its own tail - if the motor did fire
+                        // (this branch only runs when s_door_in_transition
+                        // was true) but the door never actually reached the
+                        // commanded target, the target is stale too.
+                        gdo_door_state_t requested_target =
+                            (status.door_target == 0)     ? GDO_DOOR_STATE_OPEN :
+                            (status.door_target == 10000) ? GDO_DOOR_STATE_CLOSED :
+                                                             GDO_DOOR_STATE_MAX;
+                        if (requested_target != GDO_DOOR_STATE_MAX && requested_target != resolved) {
+                            if (resolved == GDO_DOOR_STATE_OPEN) {
+                                notify_homekit_target_door_state_change(TGT_OPEN);
+                            } else if (resolved == GDO_DOOR_STATE_CLOSED) {
+                                notify_homekit_target_door_state_change(TGT_CLOSED);
+                            }
                         }
                     } else {
                         // Position is still genuinely mid-range - either the
@@ -725,7 +1024,7 @@ static void gdo_watchdog_task(void *arg)
                                  gdo_door_state_to_string(s_transition_target), elapsed, raw);
 
                         if (last_door != GDO_DOOR_STATE_STOPPED) {
-                            last_door = GDO_DOOR_STATE_STOPPED;
+                            set_last_door_state(GDO_DOOR_STATE_STOPPED);
                             notify_homekit_current_door_state_change(GDO_DOOR_STATE_STOPPED);
                         }
                         gdo_sync();
@@ -733,6 +1032,59 @@ static void gdo_watchdog_task(void *arg)
                 }
             } else {
                 ESP_LOGW(TAG, "gdo_get_status() failed (%d) during transition watchdog check", err);
+            }
+        }
+
+        // 1b) Requested but motor never engaged at all: distinct from #1
+        //     above - #1 only arms once motion is confirmed
+        //     (s_door_in_transition == true). If the opener refuses to even
+        //     start (e.g. beam broken at the exact moment the command
+        //     arrived), s_door_in_transition never becomes true and #1 never
+        //     fires, leaving HomeKit's target permanently mismatched with
+        //     no correction. This check runs independently of #1's gate.
+        {
+            gdo_status_t status;
+            if (gdo_get_status(&status) == ESP_OK) {
+                gdo_door_state_t requested_target =
+                    (status.door_target == 0)     ? GDO_DOOR_STATE_OPEN :
+                    (status.door_target == 10000) ? GDO_DOOR_STATE_CLOSED :
+                                                     GDO_DOOR_STATE_MAX;
+
+                bool target_unreached = (requested_target != GDO_DOOR_STATE_MAX) &&
+                                         (requested_target != status.door);
+
+                if (!s_door_in_transition && target_unreached) {
+                    if (s_pending_target_state != requested_target) {
+                        // First time we've observed this particular
+                        // unreached target - start its own clock.
+                        s_pending_target_state    = requested_target;
+                        s_pending_target_start_ms = now;
+                    } else if ((uint32_t)(now - s_pending_target_start_ms) > GDO_MOTOR_ENGAGE_TIMEOUT_MS) {
+                        ESP_LOGW(TAG,
+                                 "%s requested but motor never engaged after %" PRIu32
+                                 " ms (no motion ever confirmed) - reverting HomeKit "
+                                 "target to match actual state %s",
+                                 gdo_door_state_to_string(requested_target),
+                                 (uint32_t)(now - s_pending_target_start_ms),
+                                 gdo_door_state_to_string(status.door));
+
+                        if (status.door == GDO_DOOR_STATE_OPEN) {
+                            notify_homekit_target_door_state_change(TGT_OPEN);
+                        } else if (status.door == GDO_DOOR_STATE_CLOSED) {
+                            notify_homekit_target_door_state_change(TGT_CLOSED);
+                        }
+                        if (status.door != GDO_DOOR_STATE_MAX && status.door != last_door) {
+                            set_last_door_state(status.door);
+                            notify_homekit_current_door_state_change(status.door);
+                        }
+
+                        s_pending_target_state = GDO_DOOR_STATE_MAX; // reset until the next request
+                    }
+                } else {
+                    // Either genuinely in transition now, or target matches
+                    // reality - nothing pending to watch.
+                    s_pending_target_state = GDO_DOOR_STATE_MAX;
+                }
             }
         }
 
@@ -751,6 +1103,40 @@ static void gdo_watchdog_task(void *arg)
             // Debounce: don't fire again every watchdog tick while waiting
             // for the link to recover.
             s_last_status_event_ms = now;
+        }
+
+        // 3) Auto-close: door has been continuously OPEN (confirmed, not
+        //    mid-transition - s_door_open_since_ms is only ever non-zero
+        //    while last_door == GDO_DOOR_STATE_OPEN, see
+        //    set_last_door_state()) for s_auto_close_timeout_ms (runtime-
+        //    configurable, see gdo_set_auto_close_timeout_ms()). Skipped
+        //    if the last known obstruction reading isn't Clear - err
+        //    toward not closing on ambiguous/stale obstruction info rather
+        //    than toward closing. Disabled entirely unless explicitly
+        //    turned on (see gdo_set_auto_close_enabled(), off by default).
+        uint32_t auto_close_timeout_ms = s_auto_close_timeout_ms;
+        if (s_auto_close_enabled &&
+            s_door_open_since_ms != 0 && !s_auto_close_triggered &&
+            (now - s_door_open_since_ms) > auto_close_timeout_ms) {
+
+            if (last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
+                ESP_LOGW(TAG,
+                         "Auto-close: door open for %" PRId64 " ms (limit %" PRIu32 " ms) - "
+                         "sounding warning and closing",
+                         now - s_door_open_since_ms, auto_close_timeout_ms);
+                s_auto_close_triggered = true;
+                pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
+                                             auto_close_warning_complete_cb);
+            } else {
+                ESP_LOGW(TAG,
+                         "Auto-close: door open for %" PRId64 " ms (limit %" PRIu32 " ms) but "
+                         "last obstruction reading was %s, not Clear - holding off",
+                         now - s_door_open_since_ms, auto_close_timeout_ms,
+                         gdo_obstruction_state_to_string(last_obstruction));
+                // Don't set s_auto_close_triggered - re-check next tick
+                // rather than giving up on this open-duration cycle
+                // entirely, in case obstruction clears shortly after.
+            }
         }
     }
 }
@@ -800,6 +1186,10 @@ extern "C" void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+
+    auto_close_settings_load();
+
+    obstruction_watchdog_init();
 
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart    = true;
