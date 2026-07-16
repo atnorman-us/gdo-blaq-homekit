@@ -63,13 +63,6 @@ static const char* TAG = "test_main";
 #define GDO_DOOR_STALL_CHECK_MS        8000
 #define GDO_DOOR_STALL_MOVEMENT_MIN    200
 
-// Extra time to wait for the real confirming status.door frame before ever
-// falling back to trusting door_position at an extreme value. See the note
-// at the raw_at_extreme check in the watchdog task for the field evidence
-// this is based on (raw reached its extreme ~6x faster than the door's
-// real confirmed travel time in one capture).
-#define GDO_DOOR_POS_CONFIRM_GRACE_MS  8000
-
 // If we haven't seen *any* GDO event (of any kind) in this long, the UART
 // link itself is probably dead (not just "door is idle") - kick a resync.
 //
@@ -763,20 +756,6 @@ static void gdo_watchdog_task(void *arg)
                 bool stalled = (elapsed >= GDO_DOOR_STALL_CHECK_MS) &&
                                ((uint32_t)moved < GDO_DOOR_STALL_MOVEMENT_MIN);
 
-                // door_position is NOT a reliable real-time position sensor -
-                // confirmed in the field: raw reached the fully-closed
-                // extreme (10000) in ~2.5s, while the real confirmed "Closed"
-                // STATUS frame didn't arrive until ~15s later (matching this
-                // door's normal 10-11s travel time). Whatever door_position
-                // actually is under the hood, it can race far ahead of the
-                // door's real physical position, so reaching an extreme value
-                // is NOT by itself proof of arrival - only the discrete
-                // status.door field (OPEN/CLOSED/STOPPED) is that. Give the
-                // real confirming frame a further grace window before ever
-                // falling back to trusting raw at all.
-                bool raw_at_extreme = (raw_now <= GDO_DOOR_POS_OPEN_THRESHOLD) ||
-                                       (raw_now >= GDO_DOOR_POS_CLOSED_THRESHOLD);
-
                 // Use the door's own measured travel time once the library
                 // has learned it; otherwise fall back to a conservative
                 // fixed ceiling. Skip both entirely if the door has plainly
@@ -792,25 +771,23 @@ static void gdo_watchdog_task(void *arg)
                                                   ? (uint32_t)measured_ms + GDO_DOOR_TRANSIT_MARGIN_MS
                                                   : GDO_DOOR_TRANSIT_FALLBACK_MS);
 
-                // Only the raw-at-extreme-but-unconfirmed case gets extra
-                // patience - a stalled (never-moved) transition should still
-                // resolve on the fast stall path with no added delay.
-                if (raw_at_extreme && !stalled) {
-                    timeout_ms += GDO_DOOR_POS_CONFIRM_GRACE_MS;
-                }
-
                 if (elapsed > timeout_ms) {
                     uint32_t raw = raw_now;
 
                     gdo_door_state_t resolved = GDO_DOOR_STATE_MAX;
 
-                    // status.door is the only real ground truth here - see
-                    // the note above on why raw can't be trusted as proof of
-                    // arrival by itself. By the time we get here, either
-                    // status.door is already definitive, or the grace
-                    // window has fully elapsed with still no confirmation -
-                    // at that point raw is the best information available,
-                    // used as a last resort rather than an instant trust.
+                    // status.door is authoritative whenever it's already
+                    // definitive (OPEN/CLOSED/STOPPED). Otherwise - door
+                    // still reads OPENING/CLOSING/MAX - fall back to raw
+                    // position at an extreme as the best information
+                    // available once the timeout above has already elapsed.
+                    // NOTE: raw was confirmed in the field to reach an
+                    // extreme value well before the door's real, learned
+                    // travel time (2.5s vs ~15s in one capture), so this is
+                    // a deliberate accuracy/speed tradeoff, not a
+                    // guaranteed-correct signal - see chat history around
+                    // GDO_DOOR_POS_CONFIRM_GRACE_MS if that tradeoff ever
+                    // needs revisiting.
                     if (status.door == GDO_DOOR_STATE_OPEN ||
                         status.door == GDO_DOOR_STATE_CLOSED ||
                         status.door == GDO_DOOR_STATE_STOPPED) {
