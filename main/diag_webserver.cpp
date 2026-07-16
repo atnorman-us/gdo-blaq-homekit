@@ -27,6 +27,15 @@ extern "C" void gdo_diag_get_last_states(gdo_door_state_t *door,
                                           gdo_motion_state_t *motion);
 extern "C" int homekit_get_connected_session_count(void);
 
+// Defined in gdo-blaq-homekit.cpp - see comments there for the NVS
+// persistence and defaults (disabled by default, 60-minute default once
+// enabled).
+extern "C" bool gdo_get_auto_close_enabled(void);
+extern "C" uint32_t gdo_get_auto_close_timeout_ms(void);
+extern "C" esp_err_t gdo_set_auto_close_enabled(bool enabled);
+extern "C" esp_err_t gdo_set_auto_close_timeout_ms(uint32_t timeout_ms);
+extern "C" int64_t gdo_get_auto_close_remaining_ms(void);
+
 static const char *TAG = "DIAGWEB";
 #define DIAG_WEB_PORT 8080
 #define LOG_BUFFER_CAPACITY (64 * 1024)
@@ -95,6 +104,50 @@ static esp_err_t restart_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Body: application/x-www-form-urlencoded, e.g. "enabled=1&minutes=45".
+// Neither value can contain characters needing percent-decoding (a
+// checkbox and a plain integer), so a simple substring/strtoul parse is
+// enough - no need to pull in a URL-decoding helper for this.
+static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
+{
+    char buf[64] = {0};
+    int len = req->content_len;
+    if (len <= 0 || len >= (int)sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad request body");
+        return ESP_FAIL;
+    }
+
+    int received = httpd_req_recv(req, buf, len);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+        return ESP_FAIL;
+    }
+    buf[received] = '\0';
+
+    bool enabled = (strstr(buf, "enabled=1") != nullptr);
+
+    uint32_t minutes = 60;
+    const char *m = strstr(buf, "minutes=");
+    if (m) {
+        minutes = (uint32_t)strtoul(m + strlen("minutes="), nullptr, 10);
+    }
+    if (minutes == 0) {
+        // Guard against a 0-minute timeout closing the door essentially
+        // instantly after every open - not a real use case, just a bad
+        // value to silently accept.
+        minutes = 1;
+    }
+
+    gdo_set_auto_close_enabled(enabled);
+    gdo_set_auto_close_timeout_ms(minutes * 60u * 1000u);
+
+    ESP_LOGI(TAG, "Auto-close settings updated via web: enabled=%s, minutes=%u",
+             enabled ? "true" : "false", (unsigned)minutes);
+
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t favicon_get_handler(httpd_req_t *req)
 {
     // No actual icon - just answer with an empty 204 instead of a 404 so
@@ -125,6 +178,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "</style></head><body>"
         "<h1>GDO Diagnostics</h1>"
         "<h2>Status</h2><table id='status'></table>"
+        "<h2>Auto-Close</h2>"
+        "<div style='margin-bottom:16px;'>"
+        "<label><input type='checkbox' id='acEnabled'> Enabled</label>"
+        "<label style='margin-left:16px;'>Close after "
+        "<input type='number' id='acMinutes' min='1' value='60' "
+        "style='width:60px;background:#000;color:#ddd;border:1px solid #444;"
+        "border-radius:4px;padding:2px 6px;'> minutes open</label>"
+        "<button style='margin-left:16px;' onclick='saveAutoClose()'>Save</button>"
+        "<span id='acStatus' style='margin-left:8px;color:#9aa0a6;font-size:13px;'></span>"
+        "<div id='acCountdown' style='margin-top:8px;font-size:13px;color:#8ab4f8;'></div>"
+        "</div>"
         "<h2>Log <span id='loginfo' style='color:#9aa0a6;font-weight:normal;'></span></h2>"
         "<div style='margin-bottom:8px;'>"
         "<button onclick='refresh()'>Refresh now</button>"
@@ -151,6 +215,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    document.getElementById('status').innerHTML = Object.entries(s).map(function(e){"
         "      return \"<tr><td class='k'>\"+e[0]+\"</td><td>\"+e[1]+\"</td></tr>\";"
         "    }).join('');"
+        "    if (!acLoaded) {"
+        "      document.getElementById('acEnabled').checked = !!s.auto_close_enabled;"
+        "      document.getElementById('acMinutes').value = s.auto_close_minutes;"
+        "      acLoaded = true;"
+        "    }"
+        "    acRemainingS = (typeof s.auto_close_remaining_s === 'number') ? s.auto_close_remaining_s : null;"
+        "    renderCountdown();"
         "  }catch(e){}"
         "  try{"
         "    const r = await fetch('/logs');"
@@ -161,6 +232,39 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    document.getElementById('loginfo').textContent = '(' + txt.length + ' bytes shown)';"
         "    if (wasAtBottom) pre.scrollTop = pre.scrollHeight;"
         "  }catch(e){}"
+        "}"
+        "let acLoaded = false;"
+        "let acRemainingS = null;"
+        "function renderCountdown(){"
+        "  const el = document.getElementById('acCountdown');"
+        "  if (acRemainingS === null || acRemainingS < 0) { el.textContent = ''; return; }"
+        "  const m = Math.floor(acRemainingS / 60);"
+        "  const s = acRemainingS % 60;"
+        "  el.textContent = 'Auto-closing in ' + m + ':' + String(s).padStart(2, '0');"
+        "}"
+        "setInterval(function(){"
+        "  if (acRemainingS !== null && acRemainingS > 0) {"
+        "    acRemainingS--;"
+        "    renderCountdown();"
+        "  }"
+        "}, 1000);"
+        "async function saveAutoClose(){"
+        "  const enabled = document.getElementById('acEnabled').checked ? 1 : 0;"
+        "  const minutes = parseInt(document.getElementById('acMinutes').value, 10) || 60;"
+        "  const statusEl = document.getElementById('acStatus');"
+        "  statusEl.textContent = 'Saving...';"
+        "  try{"
+        "    await fetch('/settings/auto-close', {"
+        "      method: 'POST',"
+        "      headers: {'Content-Type': 'application/x-www-form-urlencoded'},"
+        "      body: 'enabled=' + enabled + '&minutes=' + minutes"
+        "    });"
+        "    statusEl.textContent = 'Saved.';"
+        "    refresh();"
+        "    setTimeout(function(){ statusEl.textContent = ''; }, 3000);"
+        "  }catch(e){"
+        "    statusEl.textContent = 'Save failed - check connection.';"
+        "  }"
         "}"
         "refresh();"
         "setInterval(function(){ if(document.getElementById('auto').checked) refresh(); }, 3000);"
@@ -202,7 +306,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
     int rssi = wifi_ok ? ap_info.rssi : 0;
 
-    char buf[768];
+    // -1 ms / 1000 truncates to 0 in C, not -1 - compute explicitly so the
+    // "not counting down" sentinel survives the ms->s conversion intact.
+    int64_t auto_close_remaining_ms = gdo_get_auto_close_remaining_ms();
+    long long auto_close_remaining_s = (auto_close_remaining_ms < 0)
+                                            ? -1
+                                            : (long long)(auto_close_remaining_ms / 1000);
+
+    char buf[896];
     int n = snprintf(buf, sizeof(buf),
         "{"
         "\"door\":\"%s\","
@@ -220,7 +331,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"hap_sessions\":%d,"
         "\"last_reset_reason\":\"%s\","
         "\"log_buffer_used\":%u,"
-        "\"log_buffer_capacity\":%u"
+        "\"log_buffer_capacity\":%u,"
+        "\"auto_close_enabled\":%s,"
+        "\"auto_close_minutes\":%u,"
+        "\"auto_close_remaining_s\":%lld"
         "}",
         safe_str(gdo_door_state_to_string(door)),
         safe_str(gdo_light_state_to_string(light)),
@@ -237,7 +351,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         homekit_get_connected_session_count(),
         safe_str(reset_reason_to_string(esp_reset_reason())),
         (unsigned)log_ring_buffer_used(),
-        (unsigned)log_ring_buffer_capacity());
+        (unsigned)log_ring_buffer_capacity(),
+        gdo_get_auto_close_enabled() ? "true" : "false",
+        (unsigned)(gdo_get_auto_close_timeout_ms() / 60000),
+        auto_close_remaining_s);
 
     httpd_resp_set_type(req, "application/json");
     if (n > 0 && (size_t)n < sizeof(buf)) {
@@ -327,12 +444,18 @@ static void start_httpd_server(void)
     restart_uri.method = HTTP_POST;
     restart_uri.handler = restart_post_handler;
 
+    httpd_uri_t auto_close_uri = {};
+    auto_close_uri.uri = "/settings/auto-close";
+    auto_close_uri.method = HTTP_POST;
+    auto_close_uri.handler = auto_close_settings_post_handler;
+
     httpd_register_uri_handler(s_server, &root_uri);
     httpd_register_uri_handler(s_server, &status_uri);
     httpd_register_uri_handler(s_server, &logs_uri);
     httpd_register_uri_handler(s_server, &logs_dl_uri);
     httpd_register_uri_handler(s_server, &favicon_uri);
     httpd_register_uri_handler(s_server, &restart_uri);
+    httpd_register_uri_handler(s_server, &auto_close_uri);
 
     ESP_LOGI(TAG, "Diagnostics web server started on port %d", DIAG_WEB_PORT);
 }
