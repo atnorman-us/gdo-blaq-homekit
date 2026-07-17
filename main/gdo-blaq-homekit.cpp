@@ -932,7 +932,30 @@ static void gdo_watchdog_task(void *arg)
 
                 int32_t moved = (int32_t)raw_now - (int32_t)s_transition_start_raw;
                 if (moved < 0) moved = -moved;
-                bool stalled = (elapsed >= GDO_DOOR_STALL_CHECK_MS) &&
+
+                // door_position during a transition isn't live sensor data -
+                // gdolib dead-reckons it from a PREVIOUSLY LEARNED open_ms/
+                // close_ms (see the note on the V2 raw-threshold fallback
+                // above). If that direction's travel time has never been
+                // learned yet (measured_ms == 0 - early in a boot, or after
+                // certain resets), gdolib has nothing to interpolate from,
+                // so raw legitimately stays flat for the ENTIRE transition
+                // regardless of whether the door is moving completely
+                // normally. Confirmed in the field: a real ~17s close where
+                // raw sat pinned at its starting value the whole time,
+                // because this was evidently early enough in that device's
+                // learning that close_ms wasn't populated yet - the fast
+                // stall-check below would (and did, on a build without this
+                // guard) false-trigger on every single transition for that
+                // window, not just occasionally. Only trust "raw hasn't
+                // moved" as stall evidence once gdolib has proven it CAN
+                // move raw for this direction at all.
+                uint16_t measured_ms = (s_transition_target == GDO_DOOR_STATE_OPENING)
+                                           ? status.open_ms
+                                           : status.close_ms;
+
+                bool stalled = (measured_ms > 0) &&
+                               (elapsed >= GDO_DOOR_STALL_CHECK_MS) &&
                                ((uint32_t)moved < GDO_DOOR_STALL_MOVEMENT_MIN);
 
                 // Use the door's own measured travel time once the library
@@ -941,9 +964,6 @@ static void gdo_watchdog_task(void *arg)
                 // never moved at all since the motor turned on - that's not
                 // a slow transit, it's a refused/aborted move, and doesn't
                 // deserve the same generous ceiling.
-                uint16_t measured_ms = (s_transition_target == GDO_DOOR_STATE_OPENING)
-                                           ? status.open_ms
-                                           : status.close_ms;
                 uint32_t timeout_ms = stalled
                                            ? GDO_DOOR_STALL_CHECK_MS
                                            : (measured_ms > 0
