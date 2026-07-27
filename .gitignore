@@ -1,5 +1,6 @@
 build
 managed_components
+.DS_Store
 dependencies.lock
 .cache
 .aider*
