@@ -1,6 +1,6 @@
 [submodule "components/gdolib"]
 	path = components/gdolib
-	url = https://github.com/konnected-io/gdolib.git
+	url = https://github.com/atnorman-us/gdolib.git
 [submodule "components/nvs_wifi_connect"]
 	path = components/nvs_wifi_connect
 	url = https://github.com/h2zero/nvs_wifi_connect.git
