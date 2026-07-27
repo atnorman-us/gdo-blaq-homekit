@@ -20,16 +20,12 @@
 #include "homekit.h"
 #include "diag_webserver.h"
 #include "pre_close_warning.h"
+#include "gdo_settings.h"
+#include "diagnostics_counters.h"
 
 // Defined in homekit.cpp - creates the HomeKit notification queue early,
 // before gdo_start() so no GDO event can fire before it exists.
 extern "C" void homekit_notif_queue_init(void);
-
-// notify_homekit_learn is defined in homekit.cpp but isn't declared in
-// homekit.h or homekit_notify.h in this codebase - declared here as a
-// stopgap. Worth adding it to homekit.h properly alongside the other
-// notify_homekit_* declarations so future callers don't hit this too.
-void notify_homekit_learn(gdo_learn_state_t learn);
 
 static const char* TAG = "test_main";
 
@@ -41,6 +37,35 @@ static const char* TAG = "test_main";
 // may never hit the exact endpoints. Use tolerance bands instead of exact
 // equality so a door that's physically open/closed doesn't get stuck
 // reporting OPENING/CLOSING forever.
+//
+// TUNING GUIDE - how these constants relate, for future reference:
+//   GDO_DOOR_STALL_CHECK_MS (8s)      - fastest possible correction; only
+//                                       trusted once a real travel time is
+//                                       already learned (measured_ms > 0),
+//                                       and only for "motor confirmed on,
+//                                       but position genuinely never moved".
+//   GDO_MOTOR_ENGAGE_TIMEOUT_MS (8s)  - separate watchdog for "motor never
+//                                       confirmed on at all" - a stricter,
+//                                       rarer failure mode than the above.
+//   measured_ms + GDO_DOOR_TRANSIT_MARGIN_MS - the normal-case ceiling once
+//                                       a real travel time is known; this is
+//                                       what actually governs most cycles.
+//   GDO_DOOR_TRANSIT_FALLBACK_MS (35s) - used only before ANY travel time has
+//                                       ever been learned this boot (first
+//                                       transition in either direction) -
+//                                       deliberately generous since there's
+//                                       no real data yet to size it tighter.
+//   GDO_OBSTRUCTION_STALE_TIMEOUT_MS (30s) - unrelated axis entirely (not a
+//                                       transition timeout) - bounds how long
+//                                       a confirmed Obstructed can sit with
+//                                       no follow-up reading before assuming
+//                                       it's stale, not gone silent.
+//   GDO_LINK_STALE_TIMEOUT_MS (5min)  - the outermost safety net: catches a
+//                                       fully dead UART link, independent of
+//                                       whatever the door is doing.
+// If you're tuning one of these because of a false-positive/negative seen in
+// a real log, the fix usually belongs in exactly one of these buckets - check
+// which failure mode actually happened before changing a number.
 #define GDO_DOOR_POS_OPEN_THRESHOLD    200     // raw <= this  => treat as OPEN
 #define GDO_DOOR_POS_CLOSED_THRESHOLD  9800    // raw >= this  => treat as CLOSED
 
@@ -61,6 +86,12 @@ static const char* TAG = "test_main";
 // seconds (see successful cycles elsewhere in these logs), so 8s is
 // generous margin, not a hair-trigger.
 #define GDO_DOOR_STALL_CHECK_MS        8000
+
+// NOTE: this happens to equal GDO_DOOR_POS_OPEN_THRESHOLD above (200) -
+// that's coincidence, not a relationship. This one's a *movement delta*
+// (how far raw has to move to count as "not stalled"); the other is a
+// *position threshold* (how close to 0 counts as fully open). Don't
+// assume changing one should change the other.
 #define GDO_DOOR_STALL_MOVEMENT_MIN    200
 
 // If we haven't seen *any* GDO event (of any kind) in this long, the UART
@@ -158,6 +189,12 @@ static volatile gdo_door_state_t s_transition_target    = GDO_DOOR_STATE_MAX;
 static volatile gdo_door_state_t s_pending_target_state    = GDO_DOOR_STATE_MAX;
 static volatile int64_t          s_pending_target_start_ms = 0;
 static volatile uint32_t         s_transition_start_raw    = 0;
+
+// Whether the pending target above has already had one re-sent command
+// (see the GDO_MOTOR_ENGAGE_TIMEOUT_MS handler below) - a fresh target
+// always starts with this false, giving it exactly one retry before the
+// existing revert-to-reality behavior kicks in.
+static volatile bool             s_pending_target_retried  = false;
 
 static inline int64_t now_ms(void)
 {
@@ -269,12 +306,49 @@ static void process_door_position(const gdo_status_t *status)
                 inferred = GDO_DOOR_STATE_CLOSED;
         }
 
-        // Drive HomeKit target from door_target
-        if (status->door_target == 0)
+        // Drive HomeKit target. door_target only updates when gdolib
+        // decodes an explicit OPENING/CLOSING STATUS frame (see
+        // update_door_state() in gdolib) - confirmed in the field: a
+        // wall-button-initiated close where that confirming frame never
+        // arrived at all for the whole ~15s transition (RX noise or
+        // otherwise), leaving door_target stuck at its old "Open" value
+        // the entire time raw was genuinely climbing toward Closed. That
+        // kept pushing the WRONG target to HomeKit throughout a real
+        // close - reported as the Home app showing "Opening" while the
+        // door was actually closing normally. s_transition_target is
+        // tracked independently (the MOTOR_ON event handler infers it
+        // from last_door, not from door_target - see that handler) and
+        // doesn't share this dependency, so prefer it whenever a
+        // transition is actively being tracked.
+        if (s_door_in_transition) {
+            if (s_transition_target == GDO_DOOR_STATE_OPENING) {
+                notify_homekit_target_door_state_change(TGT_OPEN);
+            } else if (s_transition_target == GDO_DOOR_STATE_CLOSING) {
+                notify_homekit_target_door_state_change(TGT_CLOSED);
+            }
+        } else if (status->door_target == 0) {
             notify_homekit_target_door_state_change(TGT_OPEN);
-        else if (status->door_target == 10000)
+        } else if (status->door_target == 10000) {
             notify_homekit_target_door_state_change(TGT_CLOSED);
+        }
     }
+
+    // status->door can now lag behind raw position: gdolib's
+    // MOTOR_ON-triggered interpolation (see the gdolib patch note) runs
+    // independently of the confirming STATUS frame, so raw can be
+    // actively moving toward the opposite endpoint while the discrete
+    // field still reports a stale OPEN/CLOSED left over from before this
+    // transition began. Confirmed in the field: this falsely looked like
+    // an instant "cycle complete" moments after a real close began
+    // (raw=320 and climbing, but status->door still said Open), which
+    // both logged a bogus completion summary AND risked pushing a wrong
+    // current-state flicker straight to HomeKit. OPENING/CLOSING/STOPPED/
+    // MAX don't have this problem - only a claimed OPEN or CLOSED needs
+    // raw to actually agree before being trusted.
+    bool inferred_confirmed_by_raw =
+        (inferred != GDO_DOOR_STATE_OPEN && inferred != GDO_DOOR_STATE_CLOSED) ||
+        (inferred == GDO_DOOR_STATE_OPEN && raw <= GDO_DOOR_POS_OPEN_THRESHOLD) ||
+        (inferred == GDO_DOOR_STATE_CLOSED && raw >= GDO_DOOR_POS_CLOSED_THRESHOLD);
 
     //
     // ────────────────────────────────────────────────
@@ -287,11 +361,36 @@ static void process_door_position(const gdo_status_t *status)
             s_transition_start_ms = now_ms();
             s_transition_target   = inferred;
             s_transition_start_raw = raw;
+
+            // Discard any RX errors accumulated while idle - this cycle's
+            // count should reflect only the movement itself.
+            diag_rx_error_count_get_and_reset();
         }
     } else {
-        // We reached a resolved state (OPEN/CLOSED/STOPPED) on our own -
-        // nothing stuck here, clear the watchdog's tracking.
-        s_door_in_transition = false;
+        // We reached a resolved state (OPEN/CLOSED/STOPPED) - but don't
+        // trust an OPEN/CLOSED conclusion if raw position flatly
+        // contradicts it (see inferred_confirmed_by_raw above). Without
+        // this check, a stale status->door field falsely looked like an
+        // instant "cycle complete" a few hundred ms after a real close
+        // began, which cleared s_door_in_transition early and let the
+        // separate motor-never-engaged watchdog wrongly fire on a door
+        // that was moving completely normally the whole time.
+        if (!s_door_in_transition) {
+            // Nothing was being tracked - nothing to clear or log.
+        } else if (inferred_confirmed_by_raw) {
+            uint32_t rx_errors = diag_rx_error_count_get_and_reset();
+            ESP_LOGI(TAG, "Cycle summary: %s complete in %" PRId64 " ms, %" PRIu32
+                     " RX errors, obstruction=%s, no watchdog correction needed",
+                     gdo_door_state_to_string(s_transition_target),
+                     now_ms() - s_transition_start_ms, rx_errors,
+                     gdo_obstruction_state_to_string(last_obstruction));
+            s_door_in_transition = false;
+        } else {
+            ESP_LOGD(TAG, "Ignoring stale %s (raw=%" PRIu32 " still consistent with ongoing %s) - "
+                     "keeping transition tracking active",
+                     gdo_door_state_to_string(inferred), raw,
+                     gdo_door_state_to_string(s_transition_target));
+        }
     }
 
     //
@@ -299,7 +398,7 @@ static void process_door_position(const gdo_status_t *status)
     //  HOMEKIT UPDATE (shared)
     // ────────────────────────────────────────────────
     //
-    if (inferred != last_door) {
+    if (inferred != last_door && inferred_confirmed_by_raw) {
         // If we're jumping directly between two resolved states (Closed <->
         // Open) without ever having reported an intermediate Opening/Closing,
         // the opener likely only sent a single status frame reflecting the
@@ -393,6 +492,7 @@ static void process_door_position(const gdo_status_t *status)
 #define GDO_NVS_NAMESPACE      "gdo_rolling"
 #define GDO_NVS_KEY_CLIENT_ID  "client_id"
 #define GDO_NVS_KEY_ROLLING    "rolling_code"
+#define GDO_NVS_KEY_PROTOCOL   "protocol"
 
 // Called once, early in app_main(), before gdo_start() - seeds gdolib
 // with the last known-good values if any are saved. Safe to call even if
@@ -404,16 +504,33 @@ static void gdo_load_persisted_rolling_state(void)
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        ESP_LOGI(TAG, "No persisted rolling-code state found (%s) - using gdolib defaults",
+        ESP_LOGI(TAG, "No persisted rolling-code/protocol state found (%s) - using gdolib defaults",
                  esp_err_to_name(err));
         return;
     }
 
     uint32_t client_id = 0;
     uint32_t rolling_code = 0;
+    uint8_t protocol = 0;
     bool have_client_id = (nvs_get_u32(handle, GDO_NVS_KEY_CLIENT_ID, &client_id) == ESP_OK);
     bool have_rolling_code = (nvs_get_u32(handle, GDO_NVS_KEY_ROLLING, &rolling_code) == ESP_OK);
+    bool have_protocol = (nvs_get_u8(handle, GDO_NVS_KEY_PROTOCOL, &protocol) == ESP_OK);
     nvs_close(handle);
+
+    // Only pin the protocol gdolib uses if this exact installation has
+    // synced successfully with it before (see gdo_save_synced_protocol()
+    // for how/when that's recorded) - never force a protocol on a first
+    // boot or after an NVS erase, since gdolib's own auto-detection is the
+    // only way to discover which protocol a never-before-seen installation
+    // actually uses. Must happen before gdo_start() kicks off sync.
+    if (have_protocol && protocol > 0 && protocol < GDO_PROTOCOL_MAX) {
+        if (gdo_set_protocol((gdo_protocol_type_t)protocol) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to pin persisted protocol (%d)", protocol);
+        } else {
+            ESP_LOGI(TAG, "Pinned protocol to last confirmed value: %s",
+                     gdo_protocol_type_to_string((gdo_protocol_type_t)protocol));
+        }
+    }
 
     if (have_client_id) {
         if (gdo_set_client_id(client_id) != ESP_OK) {
@@ -463,6 +580,52 @@ static void gdo_save_rolling_state(uint32_t client_id, uint32_t rolling_code)
     } else {
         ESP_LOGI(TAG, "Saved client ID %" PRIu32 ", rolling code %" PRIu32 " to NVS",
                  client_id, rolling_code);
+    }
+}
+
+// Called after every successful sync (both V1 and V2 - see
+// GDO_CB_EVENT_SYNCED), to let the next boot pin gdolib straight to this
+// protocol instead of gambling on auto-detect (see gdo_load_persisted_
+// rolling_state()). V2's sync is a multi-stage handshake (status, openings,
+// paired devices, ...) that's hard to false-positive into; V1's is just one
+// plausible-looking packet within a 5s window - the same weak signal that
+// once falsely locked a real V2 opener into V1 for a whole session (see the
+// peek-and-validate hardening in gdolib's decode loop). So this is
+// deliberately asymmetric: a V2 sync always overwrites whatever was
+// persisted, but a V1 sync only gets persisted if nothing (or already V1)
+// is saved - it can never clobber a V2 confirmation on this same hardware.
+// Real installations don't change protocol in the field, so this costs
+// nothing for genuine V1 hardware while preventing a single noise-triggered
+// V1 false-positive from undoing a proven V2 pairing.
+static void gdo_save_synced_protocol(gdo_protocol_type_t protocol)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for protocol save: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (protocol != GDO_PROTOCOL_SEC_PLUS_V2) {
+        uint8_t persisted = 0;
+        if (nvs_get_u8(handle, GDO_NVS_KEY_PROTOCOL, &persisted) == ESP_OK &&
+            persisted == GDO_PROTOCOL_SEC_PLUS_V2) {
+            ESP_LOGW(TAG, "Sync reported protocol %s, but V2 is already confirmed for this "
+                     "device - not overwriting (likely a false V1 detection)",
+                     gdo_protocol_type_to_string(protocol));
+            nvs_close(handle);
+            return;
+        }
+    }
+
+    nvs_set_u8(handle, GDO_NVS_KEY_PROTOCOL, (uint8_t)protocol);
+    esp_err_t commit_err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (commit_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to commit protocol save: %s", esp_err_to_name(commit_err));
+    } else {
+        ESP_LOGI(TAG, "Saved confirmed protocol %s to NVS", gdo_protocol_type_to_string(protocol));
     }
 }
 
@@ -636,6 +799,11 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             if (s_gdo_synced_sem) {
                 xSemaphoreGive(s_gdo_synced_sem);
             }
+
+            // Persist the confirmed protocol so the next boot can pin it
+            // directly instead of re-running auto-detect - see
+            // gdo_save_synced_protocol() for the V2-sticky policy.
+            gdo_save_synced_protocol(status->protocol);
 
             // Persist for next boot - see gdo_save_rolling_state() comment.
             // V2-only: client_id/rolling_code are meaningless on V1, which
@@ -998,6 +1166,7 @@ static void gdo_watchdog_task(void *arg)
                     }
 
                     s_door_in_transition = false;
+                    uint32_t rx_errors = diag_rx_error_count_get_and_reset();
 
                     if (resolved != GDO_DOOR_STATE_MAX) {
                         // The door actually arrived - our own event handler
@@ -1005,9 +1174,9 @@ static void gdo_watchdog_task(void *arg)
                         bool from_protocol_state = (status.door == resolved);
                         ESP_LOGW(TAG,
                                  "%s timed out after %" PRIu32 " ms (limit %" PRIu32
-                                 " ms) - re-derived %s from %s (raw=%" PRIu32 ")",
+                                 " ms, %" PRIu32 " RX errors) - re-derived %s from %s (raw=%" PRIu32 ")",
                                  gdo_door_state_to_string(s_transition_target), elapsed,
-                                 timeout_ms, gdo_door_state_to_string(resolved),
+                                 timeout_ms, rx_errors, gdo_door_state_to_string(resolved),
                                  from_protocol_state ? "status.door" : "raw position",
                                  raw);
 
@@ -1040,8 +1209,8 @@ static void gdo_watchdog_task(void *arg)
                         // request a real resync.
                         ESP_LOGW(TAG,
                                  "%s timed out after %" PRIu32 " ms, raw=%" PRIu32
-                                 " still mid-travel - marking STOPPED, requesting resync",
-                                 gdo_door_state_to_string(s_transition_target), elapsed, raw);
+                                 " still mid-travel (%" PRIu32 " RX errors) - marking STOPPED, requesting resync",
+                                 gdo_door_state_to_string(s_transition_target), elapsed, raw, rx_errors);
 
                         if (last_door != GDO_DOOR_STATE_STOPPED) {
                             set_last_door_state(GDO_DOOR_STATE_STOPPED);
@@ -1076,34 +1245,62 @@ static void gdo_watchdog_task(void *arg)
                 if (!s_door_in_transition && target_unreached) {
                     if (s_pending_target_state != requested_target) {
                         // First time we've observed this particular
-                        // unreached target - start its own clock.
+                        // unreached target - start its own clock and give
+                        // it a fresh retry budget.
                         s_pending_target_state    = requested_target;
                         s_pending_target_start_ms = now;
+                        s_pending_target_retried  = false;
                     } else if ((uint32_t)(now - s_pending_target_start_ms) > GDO_MOTOR_ENGAGE_TIMEOUT_MS) {
-                        ESP_LOGW(TAG,
-                                 "%s requested but motor never engaged after %" PRIu32
-                                 " ms (no motion ever confirmed) - reverting HomeKit "
-                                 "target to match actual state %s",
-                                 gdo_door_state_to_string(requested_target),
-                                 (uint32_t)(now - s_pending_target_start_ms),
-                                 gdo_door_state_to_string(status.door));
+                        if (!s_pending_target_retried) {
+                            // First timeout for this target - try once more
+                            // before giving up. Confirmed in the field: a
+                            // close request went unanswered and got
+                            // reverted with no attempt to just re-send it;
+                            // a single retry is cheap and likely to recover
+                            // from a transient refusal (e.g. beam broken at
+                            // the exact moment the first command arrived).
+                            ESP_LOGW(TAG,
+                                     "%s requested but motor never engaged after %" PRIu32
+                                     " ms - retrying once before reverting",
+                                     gdo_door_state_to_string(requested_target),
+                                     (uint32_t)(now - s_pending_target_start_ms));
 
-                        if (status.door == GDO_DOOR_STATE_OPEN) {
-                            notify_homekit_target_door_state_change(TGT_OPEN);
-                        } else if (status.door == GDO_DOOR_STATE_CLOSED) {
-                            notify_homekit_target_door_state_change(TGT_CLOSED);
-                        }
-                        if (status.door != GDO_DOOR_STATE_MAX && status.door != last_door) {
-                            set_last_door_state(status.door);
-                            notify_homekit_current_door_state_change(status.door);
-                        }
+                            if (requested_target == GDO_DOOR_STATE_OPEN) {
+                                gdo_door_open();
+                            } else if (requested_target == GDO_DOOR_STATE_CLOSED) {
+                                gdo_door_close();
+                            }
 
-                        s_pending_target_state = GDO_DOOR_STATE_MAX; // reset until the next request
+                            s_pending_target_retried  = true;
+                            s_pending_target_start_ms = now;
+                        } else {
+                            ESP_LOGW(TAG,
+                                     "%s requested but motor never engaged after %" PRIu32
+                                     " ms (retry also unanswered) - reverting HomeKit "
+                                     "target to match actual state %s",
+                                     gdo_door_state_to_string(requested_target),
+                                     (uint32_t)(now - s_pending_target_start_ms),
+                                     gdo_door_state_to_string(status.door));
+
+                            if (status.door == GDO_DOOR_STATE_OPEN) {
+                                notify_homekit_target_door_state_change(TGT_OPEN);
+                            } else if (status.door == GDO_DOOR_STATE_CLOSED) {
+                                notify_homekit_target_door_state_change(TGT_CLOSED);
+                            }
+                            if (status.door != GDO_DOOR_STATE_MAX && status.door != last_door) {
+                                set_last_door_state(status.door);
+                                notify_homekit_current_door_state_change(status.door);
+                            }
+
+                            s_pending_target_state   = GDO_DOOR_STATE_MAX; // reset until the next request
+                            s_pending_target_retried = false;
+                        }
                     }
                 } else {
                     // Either genuinely in transition now, or target matches
                     // reality - nothing pending to watch.
-                    s_pending_target_state = GDO_DOOR_STATE_MAX;
+                    s_pending_target_state   = GDO_DOOR_STATE_MAX;
+                    s_pending_target_retried = false;
                 }
             }
         }
@@ -1156,6 +1353,13 @@ static void gdo_watchdog_task(void *arg)
                 // Don't set s_auto_close_triggered - re-check next tick
                 // rather than giving up on this open-duration cycle
                 // entirely, in case obstruction clears shortly after.
+                //
+                // Actively request a fresh status update rather than just
+                // passively waiting for gdolib to volunteer one on its own
+                // schedule - we're specifically waiting on obstruction to
+                // clear right now, so there's real value in asking instead
+                // of only reacting to whatever happens to arrive next.
+                gdo_refresh_status();
             }
         }
     }
@@ -1208,6 +1412,8 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(nvs_err);
 
     auto_close_settings_load();
+
+    diagnostics_counters_init();
 
     obstruction_watchdog_init();
 
