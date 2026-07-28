@@ -32,15 +32,14 @@ Log buffer, plain text (view/copy) --> `http://<device-ip>:8080/logs`
 Log buffer, forced download --> `http://<device-ip>:8080/logs/download` → saves gdo-log.txt
 
 ## On the dashboard (/):
-Status table: door / light / lock / obstruction / motion state, uptime, free heap, WiFi RSSI, connected HomeKit sessions, last reset reason, current log buffer usage, running/other OTA partition and firmware version.
+The dashboard is a card-based layout grouped by area, with door/light/lock state shown as colored status pills rather than plain text, and light/dark theme following your system setting:
 
-Auto-Close: enable/disable and set the open-duration timeout, with a live countdown once armed.
-
-Firmware: upload a new `.bin` and roll back to the previously-running image — see [Updating firmware over the air (OTA)](#updating-firmware-over-the-air-ota) below.
-
-Log pane: shows the last ~64KB of log history, refreshes every 3s by default (toggle off with the checkbox if you want to read a specific moment without it jumping).
-
-Download full log button — same as hitting /logs/download directly, gives you a .txt file
+- **Overview**: Garage Door / Light / Lock state at a glance.
+- **Sensors**: motion, obstruction, battery status, and lifetime door-opening count.
+- **System**: WiFi signal (dBm and %), IP address, free heap, connected HomeKit sessions, last reset reason, and RX error count.
+- **Auto-Close**: enable/disable and set the open-duration timeout, with a live countdown once armed.
+- **Firmware**: upload a new `.bin`, roll back to the previously-running image — see [Updating firmware over the air (OTA)](#updating-firmware-over-the-air-ota) below.
+- **Log**: shows the last ~64KB of log history, refreshes every 3s by default (toggle off with the checkbox if you want to read a specific moment without it jumping); download button saves the full buffer as a `.txt` file.
 
 ## Updating firmware over the air (OTA)
 
@@ -157,6 +156,14 @@ Grouped by area below.
 ### mDNS (new)
 - The device now advertises itself as `gdo-blaq.local` on the LAN, so the
   diagnostics dashboard no longer requires hunting down its IP address.
+
+### Diagnostics dashboard (new)
+- Redesigned as a grouped card layout with colored status pills instead of
+  a plain key/value table, following the system light/dark theme.
+- Added lifetime door-opening count, battery status, WiFi signal as a
+  percentage (alongside the existing dBm reading), and the device's IP
+  address (useful as a fallback wherever mDNS isn't available, e.g. from
+  a router's client list).
 
 ### Known issue: UART noise
 Some installs may see frequent `RX data signature error` log lines,
