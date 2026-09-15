@@ -172,6 +172,7 @@ static SemaphoreHandle_t s_control_mutex;
 static uint32_t s_close_generation;
 static uint32_t s_auto_close_generation;
 static uint32_t s_auto_close_command_id;
+static esp_timer_handle_t s_door_reaffirm_timer = nullptr;
 
 class ControlGuard {
 public:
@@ -222,6 +223,39 @@ static void set_last_door_state(gdo_door_state_t new_state)
         s_auto_close_triggered = false;
     }
     last_door = new_state;
+
+    // Guard against the esp-homekit-sdk silently dropping one push
+    // notification to whichever HAP session most recently did a GET on
+    // the door characteristic (see notify_homekit_current_door_state_resend()
+    // in homekit.cpp) - confirmed in the field: Home app left showing
+    // "Opening" after a real Closed->Open transition that resolved
+    // correctly on the device, until the app was force-refreshed. Re-arm
+    // on every state change rather than only the "final" ones - the
+    // callback re-reads last_door at fire time, not a captured value, so
+    // it always resends whatever's actually true a few seconds later.
+    if (s_door_reaffirm_timer) {
+        esp_timer_stop(s_door_reaffirm_timer);
+        esp_timer_start_once(s_door_reaffirm_timer, 3000000);
+    }
+}
+
+static void door_state_reaffirm_cb(void *arg)
+{
+    ControlGuard guard;
+    notify_homekit_current_door_state_resend(last_door);
+}
+
+// Call once at boot, before any door activity - see set_last_door_state().
+static void door_state_reaffirm_init(void)
+{
+    const esp_timer_create_args_t timer_args = {
+        .callback = door_state_reaffirm_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "door_reaffirm",
+        .skip_unhandled_events = false,
+    };
+    esp_timer_create(&timer_args, &s_door_reaffirm_timer);
 }
 
 // Shared by the normal GDO_CB_EVENT_DOOR_POSITION path and the sync-complete
@@ -1343,7 +1377,7 @@ extern "C" void app_main(void)
 
     diagnostics_counters_init();
 
-
+    door_state_reaffirm_init();
 
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart    = true;
