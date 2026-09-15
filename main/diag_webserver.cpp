@@ -43,6 +43,16 @@ static const char *TAG = "DIAGWEB";
 #define LOG_BUFFER_CAPACITY (64 * 1024)
 #define DIAG_MDNS_HOSTNAME "gdo-blaq"
 
+// How long after boot the token can be fetched unauthenticated over the
+// network (see admin_token_get_handler()) - a fallback for devices with no
+// accessible serial console. Kept short so the trust basis stays "someone
+// physically power-cycled this device and is watching for it," matching
+// what this firmware already trusts implicitly for the wall button and the
+// pre-close warning hardware, not "anyone reachable on the LAN, any time."
+// Combined with the single-shot latch in s_admin_token_claimed below, so
+// simply rebooting the device again does not reopen this a second time.
+#define ADMIN_TOKEN_REVEAL_WINDOW_MS (30 * 1000)
+
 // Persistent so diag_webserver_restart() can stop and recreate it after a
 // WiFi bounce - the underlying httpd socket doesn't reliably survive an
 // interface going down and coming back up.
@@ -91,6 +101,12 @@ static const char *reset_reason_to_string(esp_reset_reason_t reason)
 // Signature verification is a separate requirement: a stolen HTTP credential
 // must not permit installing arbitrary executable code.
 static char s_admin_token[65];
+// Latches permanently once the network fallback below has been used once -
+// persisted so it survives reboots too, not just this boot session. Without
+// this, the reveal window in ADMIN_TOKEN_REVEAL_WINDOW_MS would reopen on
+// every single power cycle, letting anyone who can trigger or wait for a
+// reboot fetch the token indefinitely instead of exactly once.
+static bool s_admin_token_claimed = false;
 
 static bool init_admin_token(void)
 {
@@ -104,6 +120,9 @@ static bool init_admin_token(void)
         err = nvs_set_blob(handle, "token", token, sizeof(token));
         if (err == ESP_OK) err = nvs_commit(handle);
     }
+    uint8_t claimed = 0;
+    nvs_get_u8(handle, "claimed", &claimed);
+    s_admin_token_claimed = claimed != 0;
     nvs_close(handle);
     if (err != ESP_OK || len != sizeof(token)) return false;
     for (size_t i = 0; i < sizeof(token); ++i)
@@ -111,6 +130,34 @@ static bool init_admin_token(void)
     // printf bypasses the ESP_LOG hook, so /logs cannot disclose the token.
     printf("\nGDO diagnostics access token (keep private): %s\n", s_admin_token);
     return true;
+}
+
+// Fallback for retrieving the token when the serial console isn't
+// available: unauthenticated, but only for a short window right after boot
+// (see ADMIN_TOKEN_REVEAL_WINDOW_MS) and only once ever (see
+// s_admin_token_claimed) - reboot the device and fetch this promptly if
+// you need it, but it only works the very first time it's used.
+static esp_err_t admin_token_get_handler(httpd_req_t *req)
+{
+    if (!s_admin_token[0] || s_admin_token_claimed ||
+        esp_timer_get_time() / 1000 > ADMIN_TOKEN_REVEAL_WINDOW_MS) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+            "Token retrieval window has closed or was already used - read it "
+            "from the serial console instead");
+        return ESP_FAIL;
+    }
+    // Latch before responding, not after: a client that disconnects mid-response
+    // must not get a second chance by simply retrying the request.
+    s_admin_token_claimed = true;
+    nvs_handle_t handle;
+    if (nvs_open("gdo_admin", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, "claimed", 1);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+    ESP_LOGW(TAG, "Diagnostics access token fetched over the network fallback endpoint");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, s_admin_token, HTTPD_RESP_USE_STRLEN);
 }
 
 static bool authorize_mutation(httpd_req_t *req, bool firmware = false)
@@ -1062,6 +1109,11 @@ static bool start_httpd_server(void)
     firmware_rollback_uri.method = HTTP_POST;
     firmware_rollback_uri.handler = firmware_rollback_post_handler;
 
+    httpd_uri_t admin_token_uri = {};
+    admin_token_uri.uri = "/admin/token";
+    admin_token_uri.method = HTTP_GET;
+    admin_token_uri.handler = admin_token_get_handler;
+
     if (httpd_register_uri_handler(s_server, &root_uri) != ESP_OK) {
         httpd_stop(s_server);
         s_server = nullptr;
@@ -1113,6 +1165,11 @@ static bool start_httpd_server(void)
         return false;
     }
     if (httpd_register_uri_handler(s_server, &firmware_rollback_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &admin_token_uri) != ESP_OK) {
         httpd_stop(s_server);
         s_server = nullptr;
         return false;
