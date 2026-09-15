@@ -18,6 +18,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,7 +55,7 @@ void pre_close_warning_run(uint32_t duration_ms);
 // invokes on_complete() when done. Use this if blocking inside the
 // HomeKit characteristic write callback causes HAP timeouts on your
 // esp-homekit-sdk version (some versions expect writes to return quickly).
-void pre_close_warning_run_async(uint32_t duration_ms, void (*on_complete)(void));
+esp_err_t pre_close_warning_run_async(uint32_t duration_ms, void (*on_complete)(void));
 
 #ifdef __cplusplus
 }

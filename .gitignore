@@ -9,3 +9,6 @@ sdkconfig
 .vscode
 .clangd
 
+
+secrets/
+__pycache__/

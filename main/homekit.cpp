@@ -22,6 +22,7 @@ static const char *TAG = "HOMEKIT";
 #include "wifi.h"
 #include "diag_webserver.h"
 #include "pre_close_warning.h"
+#include "gdo_settings.h"
 
 // Defined in gdo-blaq-homekit.cpp - blocks until real GDO sync completes.
 extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms);
@@ -455,7 +456,7 @@ void homekit_task_entry(void* ctx) {
     hap_char_t* dest = NULL;
 
     while (true) {
-        hap_val_t value;
+        hap_val_t value = {};
 
         if (xQueueReceive(gdo_notif_event_q, &e, portMAX_DELAY)) {
             switch (e.dest) {
@@ -469,11 +470,11 @@ void homekit_task_entry(void* ctx) {
                     break;
                 case HomeKitNotifDest::LockCurrentState:
                     dest = hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE);
-                    value.b = e.value.b;
+                    value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::LockTargetState:
                     dest = hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE);
-                    value.b = e.value.b;
+                    value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::Obstruction:
                     dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_OBSTRUCTION_DETECTED);
@@ -522,35 +523,15 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
             ESP_LOGI(TAG, "set door state: %" PRIu32, write->val.u);
             switch (write->val.u) {
                 case TGT_OPEN:
-                    gdo_door_open();
-                    hap_char_update_val(write->hc, &(write->val));
-                    *(write->status) = HAP_STATUS_SUCCESS;
-                    break;
                 case TGT_CLOSED: {
-
-    ESP_LOGI(TAG, "Remote close requested");
-
-    // UL-325 pre-close warning, driven locally by the GDO blaQ's own
-    // onboard buzzer (GPIO4) + LED (GPIO3) — see pre_close_warning.h.
-    //
-    // Previously this branched on Security+ protocol version: V1 got a
-    // light-flash warning (relying on the opener's smart panel to beep in
-    // response), and V2 got nothing at all, on the assumption the opener
-    // itself would handle the warning. That assumption doesn't hold for
-    // every opener - confirmed silent/no-flash on Security+ 2.0 hardware
-    // in the field - so we no longer trust the opener to do this. The
-    // local warning now runs unconditionally, for both protocols, using
-    // hardware this firmware fully controls.
-    ESP_LOGW(TAG, "UL-325 warning: sounding local buzzer/LED for %d ms before close",
-             PRE_CLOSE_WARNING_DURATION_MS);
-    pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
-
-                    // Now close the door
-                    gdo_door_close();
-
-                    hap_char_update_val(write->hc, &(write->val));
-                    *(write->status) = HAP_STATUS_SUCCESS;
-
+                    esp_err_t err = write->val.u == TGT_OPEN ? gdo_control_open() : gdo_control_close();
+                    if (err == ESP_OK) {
+                        hap_char_update_val(write->hc, &(write->val));
+                        *(write->status) = HAP_STATUS_SUCCESS;
+                    } else {
+                        *(write->status) = HAP_STATUS_COMM_ERR;
+                        ret = HAP_FAIL;
+                    }
                     break;
                 }
 
@@ -560,8 +541,6 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
                     ret = HAP_FAIL;
                     break;
             }
-            hap_char_update_val(write->hc, &(write->val));
-            *(write->status) = HAP_STATUS_SUCCESS;
 
         } else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_LOCK_TARGET_STATE)) {
             ESP_LOGI(TAG, "set lock state: %s", write->val.b ? "Locked" : "Unlocked");
@@ -728,7 +707,7 @@ void notify_homekit_current_lock(gdo_lock_state_t lock) {
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::LockCurrentState;
-    e.value.b = (lock == GDO_LOCK_STATE_UNLOCKED)
+    e.value.u = (lock == GDO_LOCK_STATE_UNLOCKED)
         ? HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED
         : HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_SECURED;
 

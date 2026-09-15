@@ -14,6 +14,8 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "mdns.h"
+#include "nvs.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -85,6 +87,55 @@ static const char *reset_reason_to_string(esp_reset_reason_t reason)
     }
 }
 
+// A random per-device credential, never placed in the HTTP logs or responses.
+// Signature verification is a separate requirement: a stolen HTTP credential
+// must not permit installing arbitrary executable code.
+static char s_admin_token[65];
+
+static bool init_admin_token(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gdo_admin", NVS_READWRITE, &handle) != ESP_OK) return false;
+    uint8_t token[32];
+    size_t len = sizeof(token);
+    esp_err_t err = nvs_get_blob(handle, "token", token, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        esp_fill_random(token, sizeof(token));
+        err = nvs_set_blob(handle, "token", token, sizeof(token));
+        if (err == ESP_OK) err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK || len != sizeof(token)) return false;
+    for (size_t i = 0; i < sizeof(token); ++i)
+        snprintf(s_admin_token + 2 * i, 3, "%02x", token[i]);
+    // printf bypasses the ESP_LOG hook, so /logs cannot disclose the token.
+    printf("\nGDO diagnostics access token (keep private): %s\n", s_admin_token);
+    return true;
+}
+
+static bool authorize_mutation(httpd_req_t *req, bool firmware = false)
+{
+    if (firmware) {
+#if !defined(CONFIG_GDO_WEB_OTA) || !defined(CONFIG_SECURE_SIGNED_ON_UPDATE)
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Web OTA disabled: signed firmware configuration required");
+        return false;
+#endif
+    }
+    char supplied[sizeof(s_admin_token)] = {};
+    if (!s_admin_token[0] || httpd_req_get_hdr_value_len(req, "X-GDO-Token") != 64 ||
+        httpd_req_get_hdr_value_str(req, "X-GDO-Token", supplied, sizeof(supplied)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Diagnostics access token required");
+        return false;
+    }
+    unsigned difference = 0;
+    for (size_t i = 0; i < 64; ++i) difference |= (unsigned char)s_admin_token[i] ^ (unsigned char)supplied[i];
+    if (difference) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Invalid diagnostics access token");
+        return false;
+    }
+    return true;
+}
+
 static void delayed_restart_task(void *arg)
 {
     // Give the HTTP response time to actually flush over the socket before
@@ -95,6 +146,7 @@ static void delayed_restart_task(void *arg)
 
 static esp_err_t restart_post_handler(httpd_req_t *req)
 {
+    if (!authorize_mutation(req, false)) return ESP_FAIL;
     ESP_LOGW(TAG, "Restart requested via diagnostics web server");
 
     httpd_resp_set_type(req, "text/plain");
@@ -133,6 +185,7 @@ static void ota_clear_pending(void)
 
 static esp_err_t firmware_update_post_handler(httpd_req_t *req)
 {
+    if (!authorize_mutation(req, true)) return ESP_FAIL;
     if (req->content_len <= 0) {
         httpd_resp_send_err(req, HTTPD_411_LENGTH_REQUIRED, "Content-Length required");
         return ESP_FAIL;
@@ -241,6 +294,7 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
 
 static esp_err_t firmware_confirm_post_handler(httpd_req_t *req)
 {
+    if (!authorize_mutation(req, true)) return ESP_FAIL;
     if (!s_ota_pending_partition) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No pending upload to confirm");
         return ESP_FAIL;
@@ -276,6 +330,7 @@ static esp_err_t firmware_confirm_post_handler(httpd_req_t *req)
 
 static esp_err_t firmware_cancel_post_handler(httpd_req_t *req)
 {
+    if (!authorize_mutation(req, true)) return ESP_FAIL;
     // Best-effort: the uploaded image is left in place on flash (it'll just
     // get overwritten by the next upload) - this only clears the
     // server-side "waiting to be confirmed" state so a stray/late confirm
@@ -287,6 +342,7 @@ static esp_err_t firmware_cancel_post_handler(httpd_req_t *req)
 
 static esp_err_t firmware_rollback_post_handler(httpd_req_t *req)
 {
+    if (!authorize_mutation(req, true)) return ESP_FAIL;
     if (s_ota_upload_in_progress) {
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "text/plain");
@@ -326,6 +382,7 @@ static esp_err_t firmware_rollback_post_handler(httpd_req_t *req)
 // enough - no need to pull in a URL-decoding helper for this.
 static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
 {
+    if (!authorize_mutation(req, false)) return ESP_FAIL;
     char buf[64] = {0};
     int len = req->content_len;
     if (len <= 0 || len >= (int)sizeof(buf)) {
@@ -333,10 +390,14 @@ static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    int received = httpd_req_recv(req, buf, len);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
-        return ESP_FAIL;
+    int received = 0;
+    while (received < len) {
+        int n = httpd_req_recv(req, buf + received, len - received);
+        if (n <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+            return ESP_FAIL;
+        }
+        received += n;
     }
     buf[received] = '\0';
 
@@ -347,15 +408,16 @@ static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
     if (m) {
         minutes = (uint32_t)strtoul(m + strlen("minutes="), nullptr, 10);
     }
-    if (minutes == 0) {
-        // Guard against a 0-minute timeout closing the door essentially
-        // instantly after every open - not a real use case, just a bad
-        // value to silently accept.
-        minutes = 1;
+    if (minutes == 0 || minutes > 1440) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Minutes must be between 1 and 1440");
+        return ESP_FAIL;
     }
 
-    gdo_set_auto_close_enabled(enabled);
-    gdo_set_auto_close_timeout_ms(minutes * 60u * 1000u);
+    if (gdo_set_auto_close_timeout_ms(minutes * 60000u) != ESP_OK ||
+        gdo_set_auto_close_enabled(enabled) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "Auto-close settings updated via web: enabled=%s, minutes=%u",
              enabled ? "true" : "false", (unsigned)minutes);
@@ -511,6 +573,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  </div>"
         "  <div class=\"card\">"
         "    <h2>Firmware</h2>"
+#if !defined(CONFIG_GDO_WEB_OTA)
+        "    <p>Web updates are disabled in this build. Install a signed OTA-enabled build over USB to enable them.</p>"
+#endif
         "    <div class=\"row\"><div class=\"label\"><span class=\"ic\">&#9989;</span>Running</div><span class=\"value mono\"><span id=\"fwPartition\">?</span> &middot; <span id=\"fwVersion\">?</span></span></div>"
         "    <div class=\"row\"><div class=\"label\"><span class=\"ic\">&#8635;</span>Other slot</div><span class=\"value mono\"><span id=\"fwOtherPartition\">?</span> &middot; <span id=\"fwOtherVersion\">?</span></span></div>"
         "    <div class=\"divider\"></div>"
@@ -542,6 +607,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  </div>"
         "</div>"
         "<script>"
+        "let adminToken = '';"
+        "function authHeaders(){"
+        "  if(!adminToken) adminToken = prompt('Enter the diagnostics access token from the device serial console:') || '';"
+        "  return {'X-GDO-Token':adminToken};"
+        "}"
         "function pill(el, text, cls){ el.textContent = text; el.className = 'pill ' + cls; }"
         "function doorCls(s){ if(s==='Closed') return 'good'; if(s==='Open') return 'neutral'; if(s==='Opening'||s==='Closing') return 'warn'; if(s==='Stopped') return 'bad'; return 'off'; }"
         "function lightCls(s){ return s==='On' ? 'neutral' : 'off'; }"
@@ -559,12 +629,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "async function restartDevice(){"
         "  if(!confirm('Restart the device now? HomeKit and the door link will be briefly unavailable.')) return;"
         "  try{"
-        "    await fetch('/restart', {method:'POST'});"
+        "    const r = await fetch('/restart', {method:'POST',headers:authHeaders()});"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
         "    document.getElementById('log').textContent = 'Restarting... page will reload automatically in a few seconds.';"
         "    document.getElementById('auto').checked = false;"
         "    setTimeout(()=>{ location.reload(); }, 8000);"
         "  }catch(e){"
-        "    document.getElementById('log').textContent = 'Restarting... (connection dropped, as expected). Reload the page in a few seconds.';"
+        "    document.getElementById('log').textContent = 'Restart failed: ' + e.message + '';"
         "  }"
         "}"
         "async function refresh(){"
@@ -642,16 +713,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  const statusEl = document.getElementById('acStatus');"
         "  statusEl.textContent = 'Saving...';"
         "  try{"
-        "    await fetch('/settings/auto-close', {"
+        "    const r = await fetch('/settings/auto-close', {"
         "      method: 'POST',"
-        "      headers: {'Content-Type': 'application/x-www-form-urlencoded'},"
+        "      headers: {...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded'},"
         "      body: 'enabled=' + enabled + '&minutes=' + minutes"
         "    });"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
         "    statusEl.textContent = 'Saved.';"
         "    refresh();"
         "    setTimeout(function(){ statusEl.textContent = ''; }, 3000);"
         "  }catch(e){"
-        "    statusEl.textContent = 'Save failed - check connection.';"
+        "    statusEl.textContent = 'Save failed: ' + e.message + '';"
         "  }"
         "}"
         "function uploadFirmware(){"
@@ -682,6 +754,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "        + ' on partition ' + (info.partition || '?') + '. Review before rebooting.';"
         "      document.getElementById('fwConfirmRow').style.display = 'flex';"
         "    }else{"
+        "      if(xhr.status===401) adminToken='';"
         "      statusEl.textContent = 'Upload failed (' + xhr.status + '): ' + xhr.responseText;"
         "      document.getElementById('fwUploadRow').style.display = 'flex';"
         "      wrap.style.display = 'none';"
@@ -692,6 +765,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    document.getElementById('fwUploadRow').style.display = 'flex';"
         "    wrap.style.display = 'none';"
         "  };"
+        "  xhr.setRequestHeader('X-GDO-Token', authHeaders()['X-GDO-Token']);"
         "  xhr.send(file);"
         "}"
         "async function confirmFirmware(){"
@@ -699,17 +773,18 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  if(!confirm('Reboot into the uploaded firmware now? HomeKit and the door link will be briefly unavailable.')) return;"
         "  document.getElementById('fwConfirmRow').style.display = 'none';"
         "  try{"
-        "    await fetch('/firmware/confirm', {method:'POST'});"
+        "    const r = await fetch('/firmware/confirm', {method:'POST',headers:authHeaders()});"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
         "    statusEl.textContent = 'Rebooting... page will reload automatically in a few seconds.';"
         "    document.getElementById('auto').checked = false;"
         "    setTimeout(function(){ location.reload(); }, 8000);"
         "  }catch(e){"
-        "    statusEl.textContent = 'Confirm failed - check connection.';"
+        "    statusEl.textContent = 'Confirm failed: ' + e.message; document.getElementById('fwConfirmRow').style.display = 'flex';"
         "  }"
         "}"
         "async function cancelFirmware(){"
         "  const statusEl = document.getElementById('fwStatus');"
-        "  try{ await fetch('/firmware/cancel', {method:'POST'}); }catch(e){}"
+        "  try{ const r=await fetch('/firmware/cancel', {method:'POST',headers:authHeaders()}); if(!r.ok){if(r.status===401) adminToken=''; throw new Error(await r.text());} }catch(e){statusEl.textContent='Cancel failed: '+e.message; return;}"
         "  document.getElementById('fwConfirmRow').style.display = 'none';"
         "  document.getElementById('fwUploadRow').style.display = 'flex';"
         "  document.getElementById('fwProgressWrap').style.display = 'none';"
@@ -722,12 +797,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  if(otherVer === 'none' || otherVer === '?'){ statusEl.textContent = 'No valid image on the other slot.'; return; }"
         "  if(!confirm('Roll back to ' + other + ' (' + otherVer + ') and reboot now? HomeKit and the door link will be briefly unavailable.')) return;"
         "  try{"
-        "    const r = await fetch('/firmware/rollback', {method:'POST'});"
+        "    const r = await fetch('/firmware/rollback', {method:'POST',headers:authHeaders()});"
         "    if(r.ok){"
         "      statusEl.textContent = 'Rolling back and rebooting... page will reload automatically in a few seconds.';"
         "      document.getElementById('auto').checked = false;"
         "      setTimeout(function(){ location.reload(); }, 8000);"
         "    }else{"
+        "      if(r.status===401) adminToken='';"
         "      statusEl.textContent = 'Rollback failed (' + r.status + '): ' + await r.text();"
         "    }"
         "  }catch(e){"
@@ -913,7 +989,7 @@ static esp_err_t logs_download_get_handler(httpd_req_t *req)
     return send_log_buffer(req, true);
 }
 
-static void start_httpd_server(void)
+static bool start_httpd_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = DIAG_WEB_PORT;
@@ -928,7 +1004,7 @@ static void start_httpd_server(void)
     if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start diagnostics web server on port %d", DIAG_WEB_PORT);
         s_server = nullptr;
-        return;
+        return false;
     }
 
     httpd_uri_t root_uri = {};
@@ -986,19 +1062,64 @@ static void start_httpd_server(void)
     firmware_rollback_uri.method = HTTP_POST;
     firmware_rollback_uri.handler = firmware_rollback_post_handler;
 
-    httpd_register_uri_handler(s_server, &root_uri);
-    httpd_register_uri_handler(s_server, &status_uri);
-    httpd_register_uri_handler(s_server, &logs_uri);
-    httpd_register_uri_handler(s_server, &logs_dl_uri);
-    httpd_register_uri_handler(s_server, &favicon_uri);
-    httpd_register_uri_handler(s_server, &restart_uri);
-    httpd_register_uri_handler(s_server, &auto_close_uri);
-    httpd_register_uri_handler(s_server, &firmware_update_uri);
-    httpd_register_uri_handler(s_server, &firmware_confirm_uri);
-    httpd_register_uri_handler(s_server, &firmware_cancel_uri);
-    httpd_register_uri_handler(s_server, &firmware_rollback_uri);
+    if (httpd_register_uri_handler(s_server, &root_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &status_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &logs_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &logs_dl_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &favicon_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &restart_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &auto_close_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &firmware_update_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &firmware_confirm_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &firmware_cancel_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &firmware_rollback_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
 
     ESP_LOGI(TAG, "Diagnostics web server started on port %d", DIAG_WEB_PORT);
+    return true;
 }
 
 // httpd_start() needs LWIP's core TCP/IP task already running, which
@@ -1044,7 +1165,10 @@ static void wait_for_network_and_start_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Network ready, starting diagnostics web server...");
-    start_httpd_server();
+    while (!init_admin_token() || !start_httpd_server()) {
+        // Do not accept an OTA image before its recovery interface works.
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 
     // Advertise http://gdo-blaq.local:8080/ so the diagnostics page doesn't
     // require hunting for the device's IP. mdns_init() is safe to call even

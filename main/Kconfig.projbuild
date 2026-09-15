@@ -1,0 +1,11 @@
+menu "GDO diagnostics"
+    config GDO_WEB_OTA
+        bool "Enable authenticated, signed web firmware updates"
+        depends on SECURE_SIGNED_ON_UPDATE
+        default n
+        help
+            Requires ESP-IDF app signature verification. All firmware operations
+            also require the device's diagnostics token, printed on the local
+            serial console after Wi-Fi connects. No eFuse changes are required
+            when using 'Require signed app images' without hardware Secure Boot.
+endmenu

@@ -22,6 +22,7 @@
 #include "pre_close_warning.h"
 #include "gdo_settings.h"
 #include "diagnostics_counters.h"
+#include "retry_budget.h"
 
 // Defined in homekit.cpp - creates the HomeKit notification queue early,
 // before gdo_start() so no GDO event can fire before it exists.
@@ -55,11 +56,6 @@ static const char* TAG = "test_main";
 //                                       transition in either direction) -
 //                                       deliberately generous since there's
 //                                       no real data yet to size it tighter.
-//   GDO_OBSTRUCTION_STALE_TIMEOUT_MS (30s) - unrelated axis entirely (not a
-//                                       transition timeout) - bounds how long
-//                                       a confirmed Obstructed can sit with
-//                                       no follow-up reading before assuming
-//                                       it's stale, not gone silent.
 //   GDO_LINK_STALE_TIMEOUT_MS (5min)  - the outermost safety net: catches a
 //                                       fully dead UART link, independent of
 //                                       whatever the door is doing.
@@ -109,17 +105,7 @@ static const char* TAG = "test_main";
 
 #define GDO_WATCHDOG_PERIOD_MS         5000
 
-// If Obstructed stays confirmed this long with zero fresh readings to
-// back it up, treat it as stale and auto-clear. gdolib doesn't send a
-// steady heartbeat of OBST_1/OBST_2 frames while idle - it only reports
-// around motion/status activity - so a real obstruction event can be
-// confirmed correctly and then never followed by a "Clear" reading if
-// the door settles and traffic quiets down, leaving HomeKit permanently
-// stuck showing Obstructed. Confirmed in the field: walked through the
-// beam during a real close, door correctly auto-reversed and reopened,
-// obstruction correctly confirmed - then no further OBST_1/OBST_2
-// traffic arrived at all, and Home app never cleared on its own.
-#define GDO_OBSTRUCTION_STALE_TIMEOUT_MS  30000
+// Obstruction is change-driven: only a real CLEAR event clears a detection.
 
 // If a close/open request has gone unanswered this long - status.door_target
 // disagrees with status.door, and s_door_in_transition never became true
@@ -147,7 +133,7 @@ static gdo_lock_state_t        last_lock        = GDO_LOCK_STATE_MAX;
 static gdo_door_state_t        last_door        = GDO_DOOR_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
-static esp_timer_handle_t      obstruction_stale_timer = NULL;
+
 
 // Auto-close tracking. s_door_open_since_ms is 0 whenever the door isn't
 // confirmed OPEN right now; set exclusively through set_last_door_state()
@@ -181,20 +167,36 @@ static volatile bool             s_door_in_transition   = false;
 static volatile int64_t          s_transition_start_ms  = 0;
 static volatile gdo_door_state_t s_transition_target    = GDO_DOOR_STATE_MAX;
 
-// Tracks a commanded target (gdo_door_close()/gdo_door_open() was called,
-// so gdolib's own status.door_target no longer matches status.door) that
-// s_door_in_transition never picked up because no motion was ever
-// confirmed at all - see GDO_MOTOR_ENGAGE_TIMEOUT_MS below for why this
-// exists as a separate watchdog from the one above.
-static volatile gdo_door_state_t s_pending_target_state    = GDO_DOOR_STATE_MAX;
-static volatile int64_t          s_pending_target_start_ms = 0;
-static volatile uint32_t         s_transition_start_raw    = 0;
+static volatile uint32_t s_transition_start_raw = 0;
+static SemaphoreHandle_t s_control_mutex;
+static uint32_t s_close_generation;
+static uint32_t s_auto_close_generation;
+static uint32_t s_auto_close_command_id;
 
-// Whether the pending target above has already had one re-sent command
-// (see the GDO_MOTOR_ENGAGE_TIMEOUT_MS handler below) - a fresh target
-// always starts with this false, giving it exactly one retry before the
-// existing revert-to-reality behavior kicks in.
-static volatile bool             s_pending_target_retried  = false;
+class ControlGuard {
+public:
+    ControlGuard() { xSemaphoreTakeRecursive(s_control_mutex, portMAX_DELAY); }
+    ~ControlGuard() { xSemaphoreGiveRecursive(s_control_mutex); }
+};
+
+// User commands cancel a warning that was already pending. Warnings run
+// outside this lock so settings and newer commands can cancel them.
+extern "C" esp_err_t gdo_control_open(void) {
+    ControlGuard guard;
+    ++s_close_generation;
+    return gdo_door_open();
+}
+extern "C" esp_err_t gdo_control_close(void) {
+    uint32_t generation;
+    {
+        ControlGuard guard;
+        generation = ++s_close_generation;
+    }
+    pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
+    ControlGuard guard;
+    if (generation != s_close_generation) return ESP_ERR_INVALID_STATE;
+    return gdo_door_close();
+}
 
 static inline int64_t now_ms(void)
 {
@@ -210,6 +212,8 @@ static inline int64_t now_ms(void)
 // remember or forget.
 static void set_last_door_state(gdo_door_state_t new_state)
 {
+    ControlGuard guard;
+    if (new_state != last_door) ++s_close_generation;
     if (new_state == GDO_DOOR_STATE_OPEN && last_door != GDO_DOOR_STATE_OPEN) {
         s_door_open_since_ms   = now_ms();
         s_auto_close_triggered = false;
@@ -672,7 +676,12 @@ static void auto_close_settings_load(void)
 // wired up yet since diag_webserver.cpp hasn't been shared for this.
 extern "C" esp_err_t gdo_set_auto_close_timeout_ms(uint32_t timeout_ms)
 {
-    s_auto_close_timeout_ms = timeout_ms;
+    if (timeout_ms < 60000 || timeout_ms > 86400000) return ESP_ERR_INVALID_ARG;
+    {
+        ControlGuard guard;
+        ++s_close_generation;
+        s_auto_close_timeout_ms = timeout_ms;
+    }
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -709,7 +718,11 @@ extern "C" uint32_t gdo_get_auto_close_timeout_ms(void)
 // looks at door-open duration.
 extern "C" esp_err_t gdo_set_auto_close_enabled(bool enabled)
 {
-    s_auto_close_enabled = enabled;
+    {
+        ControlGuard guard;
+        ++s_close_generation;
+        s_auto_close_enabled = enabled;
+    }
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -846,53 +859,18 @@ case GDO_CB_EVENT_DOOR_POSITION: {
     break;
 }
 
-    case GDO_CB_EVENT_OBSTRUCTION:
+    case GDO_CB_EVENT_OBSTRUCTION: {
+        // gdolib already emits state changes, not repeated raw samples.
+        // Accept detections immediately and never manufacture Clear on a timer.
+        ControlGuard guard;
         if (status->obstruction != last_obstruction) {
-            // Debounce "Detected" only - a single corrupted UART frame
-            // (this link logs frequent "RX data signature error" - see
-            // gdo_event_handler's RX path) can misdecode into a spurious
-            // obstruction bit. Confirmed via a real report: Home app
-            // showed Obstructed with the door fully closed and physically
-            // clear, no logging existed to see what triggered it. Require
-            // the SAME detected reading to show up on two consecutive
-            // OBSTRUCTION events before trusting it and pushing to
-            // HomeKit - a real interruption re-reports continuously, so
-            // this costs negligible real-world detection latency. Never
-            // debounce "Clear" - there's no safety cost to clearing
-            // faster, and it self-corrects a false Detected quickly.
-            static gdo_obstruction_state_t s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
-
-            if (status->obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
-                s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
-                last_obstruction = status->obstruction;
-                ESP_LOGI(TAG, "Obstruction: %s",
-                         gdo_obstruction_state_to_string(status->obstruction));
-                notify_homekit_obstruction(status->obstruction);
-                esp_timer_stop(obstruction_stale_timer); // cancel - no need to auto-clear what's already clear
-            } else if (s_pending_obstruction == status->obstruction) {
-                // Second consecutive matching reading - trust it.
-                s_pending_obstruction = GDO_OBSTRUCTION_STATE_MAX;
-                last_obstruction = status->obstruction;
-                ESP_LOGW(TAG, "Obstruction: %s (confirmed on 2nd consecutive reading)",
-                         gdo_obstruction_state_to_string(status->obstruction));
-                notify_homekit_obstruction(status->obstruction);
-
-                // Arm the staleness watchdog - if gdolib goes quiet on
-                // obstruction traffic (it doesn't heartbeat this while
-                // idle) before a real Clear ever arrives, this forces one
-                // rather than leaving HomeKit stuck on Obstructed forever.
-                esp_timer_stop(obstruction_stale_timer);
-                esp_timer_start_once(obstruction_stale_timer,
-                                      (uint64_t)GDO_OBSTRUCTION_STALE_TIMEOUT_MS * 1000);
-            } else {
-                // First reading of a new non-clear state - hold it, don't
-                // notify HomeKit yet.
-                s_pending_obstruction = status->obstruction;
-                ESP_LOGW(TAG, "Obstruction: %s reading received (unconfirmed - awaiting 2nd match)",
-                         gdo_obstruction_state_to_string(status->obstruction));
-            }
+            ++s_close_generation;
+            last_obstruction = status->obstruction;
+            ESP_LOGI(TAG, "Obstruction: %s", gdo_obstruction_state_to_string(last_obstruction));
+            notify_homekit_obstruction(last_obstruction);
         }
         break;
+    }
 
     case GDO_CB_EVENT_MOTION:
         if (status->motion != last_motion) {
@@ -907,6 +885,10 @@ case GDO_CB_EVENT_DOOR_POSITION: {
         break;
 
     case GDO_CB_EVENT_BUTTON:
+        if (status->button == GDO_BUTTON_STATE_PRESSED) {
+            ControlGuard guard;
+            ++s_close_generation;
+        }
         ESP_LOGI(TAG, "Button: %s", gdo_button_state_to_string(status->button));
         break;
 
@@ -1011,39 +993,6 @@ case GDO_CB_EVENT_DOOR_POSITION: {
 
 
 // ────────────────────────────────────────────────
-//  Obstruction staleness watchdog
-// ────────────────────────────────────────────────
-//
-// See GDO_OBSTRUCTION_STALE_TIMEOUT_MS for why this exists: a confirmed
-// Obstructed reading has no guaranteed follow-up Clear event to look
-// forward to, since gdolib only reports obstruction status around
-// motion/activity, not as a steady idle heartbeat.
-static void obstruction_stale_timeout_cb(void *arg)
-{
-    if (last_obstruction != GDO_OBSTRUCTION_STATE_CLEAR) {
-        ESP_LOGW(TAG, "Obstruction: auto-clearing after %d ms with no fresh reading "
-                 "to confirm it's still Obstructed (was stuck, not a real sensor Clear)",
-                 GDO_OBSTRUCTION_STALE_TIMEOUT_MS);
-        last_obstruction = GDO_OBSTRUCTION_STATE_CLEAR;
-        notify_homekit_obstruction(GDO_OBSTRUCTION_STATE_CLEAR);
-    }
-}
-
-// Call once at boot, before any door activity - see GDO_OBSTRUCTION_STALE_TIMEOUT_MS.
-static void obstruction_watchdog_init(void)
-{
-    const esp_timer_create_args_t timer_args = {
-        .callback = obstruction_stale_timeout_cb,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "obst_stale_wd",
-        .skip_unhandled_events = false,
-    };
-    esp_timer_create(&timer_args, &obstruction_stale_timer);
-}
-
-
-// ────────────────────────────────────────────────
 //  Monitoring / recovery watchdog
 // ────────────────────────────────────────────────
 //
@@ -1056,13 +1005,30 @@ static void obstruction_watchdog_init(void)
 // instead of blocking on it.
 static void auto_close_warning_complete_cb(void)
 {
-    ESP_LOGW(TAG, "Auto-close: warning complete, closing now");
-    notify_homekit_target_door_state_change(TGT_CLOSED);
-    gdo_door_close();
+    ControlGuard guard;
+    gdo_status_t status;
+    bool valid = gdo_get_status(&status) == ESP_OK && status.synced &&
+        status.door == GDO_DOOR_STATE_OPEN && status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR &&
+        last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR && s_auto_close_enabled &&
+        s_auto_close_generation == s_close_generation &&
+        s_auto_close_command_id == status.door_command_id;
+    if (!valid) {
+        ESP_LOGI(TAG, "Auto-close cancelled during warning");
+        s_auto_close_triggered = false;
+        // Require a full fresh timeout after cancellation.
+        if (last_door == GDO_DOOR_STATE_OPEN) s_door_open_since_ms = now_ms();
+        return;
+    }
+    if (gdo_door_close() == ESP_OK) notify_homekit_target_door_state_change(TGT_CLOSED);
+    else {
+        s_auto_close_triggered = false;
+        s_door_open_since_ms = now_ms();
+    }
 }
 
 static void gdo_watchdog_task(void *arg)
 {
+    retry_budget_t retry_budget = {};
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(GDO_WATCHDOG_PERIOD_MS));
         int64_t now = now_ms();
@@ -1224,83 +1190,31 @@ static void gdo_watchdog_task(void *arg)
             }
         }
 
-        // 1b) Requested but motor never engaged at all: distinct from #1
-        //     above - #1 only arms once motion is confirmed
-        //     (s_door_in_transition == true). If the opener refuses to even
-        //     start (e.g. beam broken at the exact moment the command
-        //     arrived), s_door_in_transition never becomes true and #1 never
-        //     fires, leaving HomeKit's target permanently mismatched with
-        //     no correction. This check runs independently of #1's gate.
+        // A request that never starts gets one retry. Never infer a new
+        // request merely because a stale target still differs from current.
         {
             gdo_status_t status;
             if (gdo_get_status(&status) == ESP_OK) {
-                gdo_door_state_t requested_target =
-                    (status.door_target == 0)     ? GDO_DOOR_STATE_OPEN :
-                    (status.door_target == 10000) ? GDO_DOOR_STATE_CLOSED :
-                                                     GDO_DOOR_STATE_MAX;
-
-                bool target_unreached = (requested_target != GDO_DOOR_STATE_MAX) &&
-                                         (requested_target != status.door);
-
-                if (!s_door_in_transition && target_unreached) {
-                    if (s_pending_target_state != requested_target) {
-                        // First time we've observed this particular
-                        // unreached target - start its own clock and give
-                        // it a fresh retry budget.
-                        s_pending_target_state    = requested_target;
-                        s_pending_target_start_ms = now;
-                        s_pending_target_retried  = false;
-                    } else if ((uint32_t)(now - s_pending_target_start_ms) > GDO_MOTOR_ENGAGE_TIMEOUT_MS) {
-                        if (!s_pending_target_retried) {
-                            // First timeout for this target - try once more
-                            // before giving up. Confirmed in the field: a
-                            // close request went unanswered and got
-                            // reverted with no attempt to just re-send it;
-                            // a single retry is cheap and likely to recover
-                            // from a transient refusal (e.g. beam broken at
-                            // the exact moment the first command arrived).
-                            ESP_LOGW(TAG,
-                                     "%s requested but motor never engaged after %" PRIu32
-                                     " ms - retrying once before reverting",
-                                     gdo_door_state_to_string(requested_target),
-                                     (uint32_t)(now - s_pending_target_start_ms));
-
-                            if (requested_target == GDO_DOOR_STATE_OPEN) {
-                                gdo_door_open();
-                            } else if (requested_target == GDO_DOOR_STATE_CLOSED) {
-                                gdo_door_close();
-                            }
-
-                            s_pending_target_retried  = true;
-                            s_pending_target_start_ms = now;
-                        } else {
-                            ESP_LOGW(TAG,
-                                     "%s requested but motor never engaged after %" PRIu32
-                                     " ms (retry also unanswered) - reverting HomeKit "
-                                     "target to match actual state %s",
-                                     gdo_door_state_to_string(requested_target),
-                                     (uint32_t)(now - s_pending_target_start_ms),
-                                     gdo_door_state_to_string(status.door));
-
-                            if (status.door == GDO_DOOR_STATE_OPEN) {
-                                notify_homekit_target_door_state_change(TGT_OPEN);
-                            } else if (status.door == GDO_DOOR_STATE_CLOSED) {
-                                notify_homekit_target_door_state_change(TGT_CLOSED);
-                            }
-                            if (status.door != GDO_DOOR_STATE_MAX && status.door != last_door) {
-                                set_last_door_state(status.door);
-                                notify_homekit_current_door_state_change(status.door);
-                            }
-
-                            s_pending_target_state   = GDO_DOOR_STATE_MAX; // reset until the next request
-                            s_pending_target_retried = false;
-                        }
+                bool pending = status.synced && !s_door_in_transition &&
+                    ((status.door_target == 0 && status.door == GDO_DOOR_STATE_CLOSED) ||
+                     (status.door_target == 10000 && status.door == GDO_DOOR_STATE_OPEN));
+                retry_action_t action = retry_budget_step(&retry_budget, status.door_command_id,
+                                                          pending, now, GDO_MOTOR_ENGAGE_TIMEOUT_MS);
+                if (action == RETRY_SEND) {
+                    uint32_t generation;
+                    { ControlGuard guard; generation = s_close_generation; }
+                    if (status.door_target == 10000)
+                        pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
+                    ControlGuard guard;
+                    gdo_status_t fresh;
+                    if (generation == s_close_generation && gdo_get_status(&fresh) == ESP_OK &&
+                        fresh.door == status.door && fresh.door_target == status.door_target &&
+                        (fresh.door_target != 10000 || fresh.obstruction == GDO_OBSTRUCTION_STATE_CLEAR)) {
+                        gdo_retry_door_command(status.door_command_id);
                     }
-                } else {
-                    // Either genuinely in transition now, or target matches
-                    // reality - nothing pending to watch.
-                    s_pending_target_state   = GDO_DOOR_STATE_MAX;
-                    s_pending_target_retried = false;
+                } else if (action == RETRY_REVERT) {
+                    notify_homekit_target_door_state_change(status.door == GDO_DOOR_STATE_OPEN ? TGT_OPEN : TGT_CLOSED);
+                    ESP_LOGW(TAG, "Door request exhausted its single retry");
                 }
             }
         }
@@ -1341,9 +1255,21 @@ static void gdo_watchdog_task(void *arg)
                          "Auto-close: door open for %" PRId64 " ms (limit %" PRIu32 " ms) - "
                          "sounding warning and closing",
                          now - s_door_open_since_ms, auto_close_timeout_ms);
+                ControlGuard guard;
+                gdo_status_t current;
+                if (gdo_get_status(&current) != ESP_OK || !current.synced ||
+                    current.door != GDO_DOOR_STATE_OPEN || !s_auto_close_enabled ||
+                    s_auto_close_triggered || gdo_get_auto_close_remaining_ms() != 0 ||
+                    current.obstruction != GDO_OBSTRUCTION_STATE_CLEAR) continue;
+                s_auto_close_generation = s_close_generation;
+                s_auto_close_command_id = current.door_command_id;
                 s_auto_close_triggered = true;
-                pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
-                                             auto_close_warning_complete_cb);
+                if (pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
+                                                 auto_close_warning_complete_cb) != ESP_OK) {
+                    s_auto_close_triggered = false;
+                    s_door_open_since_ms = now_ms();
+                    ESP_LOGE(TAG, "Auto-close cancelled: warning could not start");
+                }
             } else {
                 ESP_LOGW(TAG,
                          "Auto-close: door open for %" PRId64 " ms (limit %" PRIu32 " ms) but "
@@ -1411,11 +1337,13 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_err);
 
+    s_control_mutex = xSemaphoreCreateRecursiveMutex();
+    configASSERT(s_control_mutex);
     auto_close_settings_load();
 
     diagnostics_counters_init();
 
-    obstruction_watchdog_init();
+
 
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart    = true;
