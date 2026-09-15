@@ -15,6 +15,9 @@
 extern "C" {
 #endif
 
+esp_err_t gdo_control_open(void);
+esp_err_t gdo_control_close(void);
+
 bool     gdo_get_auto_close_enabled(void);
 esp_err_t gdo_set_auto_close_enabled(bool enabled);
 

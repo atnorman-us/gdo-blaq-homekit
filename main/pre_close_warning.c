@@ -110,13 +110,12 @@ static void warning_task(void *pvArgs)
     vTaskDelete(NULL);
 }
 
-void pre_close_warning_run_async(uint32_t duration_ms, void (*on_complete)(void))
+esp_err_t pre_close_warning_run_async(uint32_t duration_ms, void (*on_complete)(void))
 {
     warning_task_args_t *args = pvPortMalloc(sizeof(warning_task_args_t));
     if (!args) {
         ESP_LOGE(TAG, "failed to allocate warning task args");
-        if (on_complete) on_complete();
-        return;
+        return ESP_ERR_NO_MEM;
     }
     args->duration_ms = duration_ms;
     args->on_complete = on_complete;
@@ -128,5 +127,9 @@ void pre_close_warning_run_async(uint32_t duration_ms, void (*on_complete)(void)
     // connected HAP controllers - confirmed via a real device panic/reset
     // instead of closing, correlated with auto-close (the only caller of
     // this async variant) firing for the first time on real hardware.
-    xTaskCreate(warning_task, "pre_close_warn", 8192, args, tskIDLE_PRIORITY + 1, NULL);
+    if (xTaskCreate(warning_task, "pre_close_warn", 8192, args, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        vPortFree(args);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }

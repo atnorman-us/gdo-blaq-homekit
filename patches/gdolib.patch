@@ -1,0 +1,135 @@
+diff --git a/gdo.c b/gdo.c
+index 1f28d1d..a48befc 100755
+--- a/gdo.c
++++ b/gdo.c
+@@ -395,7 +395,7 @@ esp_err_t gdo_sync(void) {
+  * @brief Opens the door.
+  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+ */
+-esp_err_t gdo_door_open(void) {
++static esp_err_t door_open_impl(void) {
+     g_status.door_target = 0;
+ 
+     if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_OPEN) {
+@@ -432,7 +432,7 @@ esp_err_t gdo_door_open(void) {
+  * @brief Closes the door.
+  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+ */
+-esp_err_t gdo_door_close(void) {
++static esp_err_t door_close_impl(void) {
+     g_status.door_target = 10000;
+ 
+     if (g_status.door == GDO_DOOR_STATE_CLOSING || g_status.door == GDO_DOOR_STATE_CLOSED) {
+@@ -446,6 +446,24 @@ esp_err_t gdo_door_close(void) {
+     return send_door_action(GDO_DOOR_ACTION_CLOSE);
+ }
+ 
++esp_err_t gdo_door_open(void) {
++    ++g_status.door_command_id;
++    return door_open_impl();
++}
++
++esp_err_t gdo_door_close(void) {
++    ++g_status.door_command_id;
++    return door_close_impl();
++}
++
++esp_err_t gdo_retry_door_command(uint32_t command_id) {
++    if (!command_id || command_id != g_status.door_command_id || !g_status.synced)
++        return ESP_ERR_INVALID_STATE;
++    if (g_status.door_target == 0) return door_open_impl();
++    if (g_status.door_target == 10000) return door_close_impl();
++    return ESP_ERR_INVALID_STATE;
++}
++
+ /**
+  * @brief Stops the door.
+  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+@@ -2099,54 +2117,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
+         g_status.motor = motor_state;
+         queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
+ 
+-        // Also arm door_position interpolation here, not only on an
+-        // explicit OPENING/CLOSING STATUS frame (see the matching block
+-        // in decode_packet()/wherever door_state is processed). MOTOR_ON
+-        // is a short, simple frame - confirmed in the field to survive a
+-        // noise burst that ate several consecutive STATUS frames right
+-        // after it, including the one confirming the transition
+-        // direction. Without this, door_position stayed frozen at its
+-        // pre-transition value for an entire real, successful ~16s close,
+-        // even though the door was moving completely normally the whole
+-        // time - callers watching door_position (including watchdogs
+-        // built on top of this library) had no way to distinguish that
+-        // from a genuinely stalled motor. door_target is already valid
+-        // here regardless of which frame arrives first - gdo_door_open()/
+-        // gdo_door_close() set it immediately when called, well before
+-        // the command is even transmitted, so it doesn't depend on this
+-        // motor-state update racing against a STATUS frame either.
+-        if (motor_state == GDO_MOTOR_STATE_ON && g_status.door_position >= 0) {
+-            // Same fix as the explicit-STATUS-frame trigger above: only
+-            // the relevant direction's travel time needs to be known, not
+-            // both. door_target (0 = opening, 10000 = closing) is already
+-            // valid here regardless of which frame arrives first, so it's
+-            // used to pick which duration is actually relevant, exactly
+-            // like the STATUS-frame path uses door_state for the same
+-            // purpose.
+-            uint16_t relevant_ms = (g_status.door_target == 0) ? g_status.open_ms : g_status.close_ms;
+-            if (relevant_ms > 0) {
+-                // door_position_sync_timer_cb() picks its interpolation
+-                // direction from g_status.door (OPENING vs anything else),
+-                // not from door_target - so it must be set here too, not
+-                // just used to pick relevant_ms above. Confirmed in the
+-                // field: when the explicit OPENING STATUS frame that
+-                // normally sets this got lost to RX noise right after
+-                // MOTOR_ON, g_status.door stayed at its stale pre-transition
+-                // value (Closed) for the whole callback's lifetime - the
+-                // timer then interpolated position in the WRONG direction
+-                // (toward Closed instead of Open), and every
+-                // GDO_EVENT_DOOR_POSITION_UPDATE it queued carried that
+-                // stale Closed state straight out to callers, who forwarded
+-                // it directly (this library documents status->door as
+-                // authoritative). Set it optimistically from door_target -
+-                // the real STATUS frame, if it arrives, just reconfirms the
+-                // same value.
+-                g_status.door = (g_status.door_target == 0) ? GDO_DOOR_STATE_OPENING : GDO_DOOR_STATE_CLOSING;
+-                g_door_start_moving_ms = (uint32_t)(esp_timer_get_time() / 1000);
+-                if (esp_timer_start_periodic(door_position_sync_timer, 500 * 1000) != ESP_OK) {
+-                    ESP_LOGD(TAG, "door position sync timer already running or failed to start");
+-                }
+-            }
++        // MOTOR_ON carries no direction. At a settled endpoint the only
++        // possible departure is toward the other endpoint, including wall
++        // controls which never update our locally commanded target.
++        gdo_door_state_t direction = g_status.door;
++        if (direction == GDO_DOOR_STATE_CLOSED) direction = GDO_DOOR_STATE_OPENING;
++        else if (direction == GDO_DOOR_STATE_OPEN) direction = GDO_DOOR_STATE_CLOSING;
++        if (motor_state == GDO_MOTOR_STATE_ON && g_status.door_position >= 0 &&
++            (direction == GDO_DOOR_STATE_OPENING || direction == GDO_DOOR_STATE_CLOSING)) {
++            // Go through normal state tracking so target and last direction
++            // agree, and an unknown travel duration can still be measured.
++            update_door_state(direction);
+         }
+     }
+ }
+diff --git a/include/gdo.h b/include/gdo.h
+index dda04f0..57a2da7 100755
+--- a/include/gdo.h
++++ b/include/gdo.h
+@@ -146,6 +146,7 @@ typedef struct {
+     uint16_t close_ms; // Time door takes to close from fully open in milliseconds
+     int32_t door_position; // Door position in percentage (0-10000) [OPEN-CLOSED]
+     int32_t door_target; // Door target position in percentage (0-10000) [OPEN-CLOSED]
++    uint32_t door_command_id; // Monotonic application request identifier (retry does not increment)
+     uint32_t client_id; // Client ID
+     uint32_t rolling_code; // Rolling code
+     bool toggle_only; // Used when the door opener only supports the toggle command.
+@@ -227,6 +228,9 @@ esp_err_t gdo_door_open(void);
+ */
+ esp_err_t gdo_door_close(void);
+ 
++/** Retry an unchanged pending request without granting another retry budget. */
++esp_err_t gdo_retry_door_command(uint32_t command_id);
++
+ /**
+  * @brief Stops the door.
+  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
