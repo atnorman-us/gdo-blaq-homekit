@@ -100,6 +100,8 @@ Older firmware without a compatible two-slot OTA partition layout needs a USB in
 
 ## USB installation
 
+A browser-based installer is also available at [espweb.terazone.com](https://espweb.terazone.com/) as an alternative to the manual `esptool`/USB steps below; see [`espweb/README.md`](espweb/README.md) for details on that site.
+
 For a source build, connect the device by USB and run:
 
 ```sh
