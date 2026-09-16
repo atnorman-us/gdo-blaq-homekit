@@ -173,6 +173,16 @@ static uint32_t s_close_generation;
 static uint32_t s_auto_close_generation;
 static uint32_t s_auto_close_command_id;
 static bool s_user_close_pending;
+// Which generation s_user_close_pending was armed for. gdo_control_close()
+// only treats "pending" as still blocking a new request when this still
+// matches the current generation - anything that cancels the pending close
+// (a later Open, a state change, a settings change - anywhere that bumps
+// s_close_generation) makes it stale automatically, without needing to
+// touch every one of those call sites individually. Without this, opening
+// right after closing left s_user_close_pending stuck true for the rest of
+// that ~5s warning window (the original task hadn't woken up yet to clear
+// it), spuriously rejecting a legitimate re-close attempted in that gap.
+static uint32_t s_user_close_pending_generation;
 
 class ControlGuard {
 public:
@@ -196,7 +206,14 @@ static void user_close_task(void *arg)
     pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
     {
         ControlGuard guard;
-        s_user_close_pending = false;
+        // Only release the pending-close slot if it's still ours to
+        // release - a superseded task (this one) waking up after a NEWER
+        // close was already armed (its own generation recorded in
+        // s_user_close_pending_generation) must not clear the flag out
+        // from under that newer, still-genuinely-pending task.
+        if (s_user_close_pending_generation == generation) {
+            s_user_close_pending = false;
+        }
         if (generation == s_close_generation) {
             gdo_status_t status;
             esp_err_t err = gdo_get_status(&status);
@@ -222,11 +239,14 @@ static void user_close_task(void *arg)
 
 extern "C" esp_err_t gdo_control_close(void) {
     ControlGuard guard;
-    if (s_user_close_pending) return ESP_ERR_INVALID_STATE;
+    if (s_user_close_pending && s_user_close_pending_generation == s_close_generation) {
+        return ESP_ERR_INVALID_STATE;
+    }
     auto *generation = static_cast<uint32_t *>(pvPortMalloc(sizeof(uint32_t)));
     if (!generation) return ESP_ERR_NO_MEM;
     *generation = ++s_close_generation;
     s_user_close_pending = true;
+    s_user_close_pending_generation = *generation;
     if (xTaskCreate(user_close_task, "user_close", 8192, generation,
                     tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
         s_user_close_pending = false;
