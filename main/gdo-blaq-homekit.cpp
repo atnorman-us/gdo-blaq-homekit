@@ -155,6 +155,30 @@ static volatile bool s_auto_close_enabled = false;
 // retry jump can scale up instead of always adding a fixed +100. Reset to
 // 0 on a successful sync.
 static uint32_t s_sync_retry_count = 0;
+
+// When the current failure streak started (0 if not currently failing).
+// Used to detect "genuinely never syncing," not just "taking a while" -
+// see GDO_PAIRING_FAULT_TIMEOUT_MS.
+static int64_t s_sync_first_failure_ms = 0;
+
+// This device's "authorization" to talk to the opener lives entirely in
+// the opener's own paired-device table (this firmware emulates a paired
+// wall station over the wired Security+ connection) and can be silently
+// revoked - the paired-device list gets cleared, the max paired-device
+// count gets exceeded by something else pairing, or an opener firmware
+// update resets it. When that happens, sync retries forever with no
+// visible difference from ordinary transient RX noise, and (since every
+// GDO event, including a failed sync attempt, refreshes
+// s_last_status_event_ms) the link-staleness watchdog never trips either -
+// the device looks perpetually "about to sync any second" instead of
+// "stuck." Set once retrying has gone on far longer than any real
+// transient condition should take; surfaced via gdo_diag_get_pairing_fault()
+// for the diagnostics dashboard. Purely informational - doesn't change
+// retry behavior, since retrying is harmless and costs nothing if pairing
+// is later restored.
+static volatile bool s_gdo_pairing_fault = false;
+#define GDO_PAIRING_FAULT_TIMEOUT_MS (15 * 60 * 1000)
+
 static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 
 // Signaled once GDO sync genuinely completes. Lets other code (e.g.
@@ -867,6 +891,9 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             // fewer rounds while still starting conservative (+100) for
             // the common case of a small drift. Capped at +1600 to avoid
             // a wild overshoot on a single retry.
+            if (s_sync_retry_count == 0) {
+                s_sync_first_failure_ms = now_ms();
+            }
             s_sync_retry_count++;
             uint32_t shift = (s_sync_retry_count > 4) ? 4 : (s_sync_retry_count - 1);
             uint32_t jump = 100u << shift;
@@ -878,8 +905,24 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
                          status->rolling_code, jump, s_sync_retry_count);
                 gdo_sync();
             }
+
+            if (!s_gdo_pairing_fault &&
+                (now_ms() - s_sync_first_failure_ms) > GDO_PAIRING_FAULT_TIMEOUT_MS) {
+                s_gdo_pairing_fault = true;
+                ESP_LOGE(TAG, "GDO has not synced in over %" PRId64
+                         " minutes despite %" PRIu32 " attempts - this device may have "
+                         "lost its pairing with the opener (paired-device list cleared, "
+                         "max paired devices exceeded, or an opener firmware update). "
+                         "Check the opener's paired device list, or re-run Learn.",
+                         (int64_t)(GDO_PAIRING_FAULT_TIMEOUT_MS / 60000), s_sync_retry_count);
+            }
         } else {
             s_sync_retry_count = 0;
+            s_sync_first_failure_ms = 0;
+            if (s_gdo_pairing_fault) {
+                s_gdo_pairing_fault = false;
+                ESP_LOGI(TAG, "GDO sync recovered after a prior pairing fault");
+            }
             if (s_gdo_synced_sem) {
                 xSemaphoreGive(s_gdo_synced_sem);
             }
@@ -1380,6 +1423,13 @@ extern "C" void gdo_diag_get_last_states(gdo_door_state_t *door,
     if (lock)        *lock = last_lock;
     if (obstruction) *obstruction = last_obstruction;
     if (motion)      *motion = last_motion;
+}
+
+// See s_gdo_pairing_fault above for what this means and why it's tracked
+// separately from ordinary sync-in-progress state.
+extern "C" bool gdo_diag_get_pairing_fault(void)
+{
+    return s_gdo_pairing_fault;
 }
 
 // Blocks until GDO sync completes or timeout_ms elapses, whichever is

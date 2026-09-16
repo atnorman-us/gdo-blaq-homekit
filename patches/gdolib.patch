@@ -1,5 +1,5 @@
 diff --git a/gdo.c b/gdo.c
-index 1f28d1d..d680efc 100755
+index 1f28d1d..636e7b4 100755
 --- a/gdo.c
 +++ b/gdo.c
 @@ -395,7 +395,7 @@ esp_err_t gdo_sync(void) {
@@ -45,30 +45,73 @@ index 1f28d1d..d680efc 100755
  /**
   * @brief Stops the door.
   * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
-@@ -1432,7 +1450,10 @@ static void decode_packet(uint8_t *packet) {
+@@ -1423,6 +1441,21 @@ static void decode_v1_packet(uint8_t *packet) {
+  * @brief Decodes a packet received from the GDO and updates the status.
+  * @param packet The packet received from the GDO.
+ */
++// Dumps a rejected V2 packet's raw bytes at WARN (print_buffer() above logs
++// at DEBUG, which this project compiles out entirely - see
++// CONFIG_LOG_MAXIMUM_LEVEL - so it produces nothing in a release build).
++// This protocol is reverse-engineered, not documented, so a raw capture of
++// whatever actually triggered a rejection is the only way to diagnose an
++// edge case seen in the field rather than guessing at it blind.
++static void log_rejected_packet(const char *reason, uint8_t *packet) {
++    ESP_LOGW(TAG, "%s: "
++             "[%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X]",
++             reason,
++             packet[0], packet[1], packet[2], packet[3], packet[4], packet[5], packet[6],
++             packet[7], packet[8], packet[9], packet[10], packet[11], packet[12], packet[13],
++             packet[14], packet[15], packet[16], packet[17], packet[18]);
++}
++
+ static void decode_packet(uint8_t *packet) {
+     uint32_t rolling = 0;
+     uint64_t fixed = 0;
+@@ -1432,7 +1465,10 @@ static void decode_packet(uint8_t *packet) {
      static uint32_t last_obstruction_time = 0;
      static bool obst_clear_from_status = false;
  
 -    decode_wireline(packet, &rolling, &fixed, &data);
 +    if (decode_wireline(packet, &rolling, &fixed, &data) != 0) {
-+        ESP_LOGW(TAG, "Ignoring invalid wireline packet");
++        log_rejected_packet("Ignoring invalid wireline packet", packet);
 +        return;
 +    }
  
      data &= ~0xf000;
  
-@@ -1451,6 +1472,10 @@ static void decode_packet(uint8_t *packet) {
+@@ -1451,6 +1487,10 @@ static void decode_packet(uint8_t *packet) {
      ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
  
      if (cmd == GDO_CMD_STATUS) {
 +        if (nibble <= GDO_DOOR_STATE_UNKNOWN || nibble >= GDO_DOOR_STATE_MAX) {
-+            ESP_LOGW(TAG, "Ignoring invalid door status: %u", nibble);
++            log_rejected_packet("Ignoring invalid door status", packet);
 +            return;
 +        }
          update_door_state((gdo_door_state_t)nibble);
          update_light_state((gdo_light_state_t)((byte2 >> 1) & 1));
          update_lock_state((gdo_lock_state_t)(byte2 & 1));
-@@ -1828,8 +1853,13 @@ static void gdo_main_task(void* arg) {
+@@ -1476,9 +1516,18 @@ static void decode_packet(uint8_t *packet) {
+     } else if (cmd == GDO_CMD_SET_TTC) {
+         update_ttc((byte1 << 8) | byte2);
+     } else if (cmd == GDO_CMD_PAIRED_DEVICES) {
+-        update_paired_devices(nibble, byte2);
++        if (nibble >= GDO_PAIRED_DEVICE_TYPE_MAX) {
++            log_rejected_packet("Ignoring invalid paired device type", packet);
++            return;
++        }
++        update_paired_devices((gdo_paired_device_type_t)nibble, byte2);
+     } else if (cmd == GDO_CMD_BATTERY_STATUS) {
+-        update_battery_state(byte1);
++        if (byte1 != GDO_BATT_STATE_UNKNOWN && byte1 != GDO_BATT_STATE_CHARGING &&
++            byte1 != GDO_BATT_STATE_FULL) {
++            log_rejected_packet("Ignoring invalid battery status", packet);
++            return;
++        }
++        update_battery_state((gdo_battery_state_t)byte1);
+     } else if (cmd == GDO_CMD_OBST_1) {
+         if (g_status.door == GDO_DOOR_STATE_OPEN || g_status.door == GDO_DOOR_STATE_CLOSING) {
+             g_status.door = GDO_DOOR_STATE_OPEN; // if the obstruction sensor tripped the door will go back to open state.
+@@ -1828,8 +1877,13 @@ static void gdo_main_task(void* arg) {
  /******************************* STATUS FUNCTIONS ************************************/
  
  static void update_door_state(const gdo_door_state_t door_state) {
@@ -84,7 +127,7 @@ index 1f28d1d..d680efc 100755
  
      if (door_state == g_status.door) {
          return;
-@@ -1841,12 +1871,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1841,12 +1895,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
              start_opening = esp_timer_get_time();
          }
@@ -100,7 +143,7 @@ index 1f28d1d..d680efc 100755
              start_opening = -1;
          }
      }
-@@ -1855,12 +1886,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1855,12 +1910,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door == GDO_DOOR_STATE_OPEN) {
              start_closing = esp_timer_get_time();
          }
@@ -115,7 +158,7 @@ index 1f28d1d..d680efc 100755
              start_closing = -1;
          }
      }
-@@ -2099,54 +2130,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
+@@ -2099,54 +2154,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
          g_status.motor = motor_state;
          queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
  
@@ -181,6 +224,39 @@ index 1f28d1d..d680efc 100755
          }
      }
  }
+@@ -2259,7 +2277,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
+  * @param battery_state The new battery state to update to.
+ */
+ inline static void update_battery_state(gdo_battery_state_t battery_state) {
+-    ESP_LOGD(TAG, "Battery state: %s", gdo_battery_state_str[battery_state]);
++    ESP_LOGD(TAG, "Battery state: %s", gdo_battery_state_to_string(battery_state));
+     if (battery_state != g_status.battery) {
+         g_status.battery = battery_state;
+         queue_event((gdo_event_t){GDO_EVENT_BATTERY_UPDATE});
+diff --git a/gdo_utils.c b/gdo_utils.c
+index 9935c6e..a9f4f03 100644
+--- a/gdo_utils.c
++++ b/gdo_utils.c
+@@ -242,7 +242,18 @@ const char* gdo_button_state_to_string(gdo_button_state_t state) {
+ }
+ 
+ const char* gdo_battery_state_to_string(gdo_battery_state_t state) {
+-    return gdo_battery_state_str[state];
++    // Unlike the other *_to_string() helpers here, this enum is
++    // deliberately sparse (0, 0x6, 0x8, 0xff - real wire values, not
++    // sequential indices - see include/gdo.h), so it can't be used to
++    // index gdo_battery_state_str[] directly. A raw wire byte cast
++    // straight into this enum (see update_battery_state()) could be any
++    // of 256 values; only these three are ever assigned meaning.
++    switch (state) {
++        case GDO_BATT_STATE_UNKNOWN:  return gdo_battery_state_str[0];
++        case GDO_BATT_STATE_CHARGING: return gdo_battery_state_str[1];
++        case GDO_BATT_STATE_FULL:     return gdo_battery_state_str[2];
++        default:                      return "Unknown";
++    }
+ }
+ 
+ const char* gdo_learn_state_to_string(gdo_learn_state_t state) {
 diff --git a/include/gdo.h b/include/gdo.h
 index dda04f0..57a2da7 100755
 --- a/include/gdo.h
