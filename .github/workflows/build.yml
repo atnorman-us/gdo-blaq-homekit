@@ -78,6 +78,11 @@ jobs:
         name: konnected-gdo-blaq-homekit
         path: release-combined
 
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
     - name: Publish release firmware
       env:
         GH_TOKEN: ${{ github.token }}
@@ -89,3 +94,20 @@ jobs:
         cp release-combined/konnected-gdo-blaq-homekit.bin "release-assets/konnected-gdo-blaq-homekit-${RELEASE_TAG}.bin"
         (cd release-assets && sha256sum *.bin > SHA256SUMS.txt)
         gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+    - name: Publish firmware to Cloudflare R2
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+      run: |
+        FIRMWARE_FILE="konnected-gdo-blaq-homekit-${RELEASE_TAG}.bin"
+        npx --yes wrangler@4 r2 object put "gdo-blaq-firmware/${FIRMWARE_FILE}" \
+          --file "release-assets/${FIRMWARE_FILE}" \
+          --content-type application/octet-stream \
+          --remote
+        echo "{\"version\":\"${RELEASE_TAG}\",\"file\":\"${FIRMWARE_FILE}\"}" > /tmp/current.json
+        npx --yes wrangler@4 r2 object put "gdo-blaq-firmware/current.json" \
+          --file /tmp/current.json \
+          --content-type application/json \
+          --remote
