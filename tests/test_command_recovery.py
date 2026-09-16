@@ -12,6 +12,8 @@ class CommandRecoveryTests(unittest.TestCase):
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
+#include <utility>
 #define ESP_OK 0
 #define ESP_ERR_NO_MEM 1
 #define ESP_ERR_INVALID_STATE 2
@@ -28,10 +30,10 @@ using esp_err_t = int;
 struct ControlGuard {};
 struct gdo_status_t { bool synced; int obstruction; int door; } current={true,0,1};
 static uint32_t s_close_generation;
+static uint32_t s_user_close_pending_generation;
 static int warnings, closes, opens, allocation_failure, task_failure, allocated;
 static bool s_user_close_pending;
-static void (*pending_task)(void*);
-static void *pending_arg;
+static std::vector<std::pair<void(*)(void*), void*>> pending_tasks;
 static int gdo_get_status(gdo_status_t *p) {*p=current;return ESP_OK;}
 static int gdo_door_close() {++closes;return ESP_OK;}
 static int gdo_door_open() {++opens;return ESP_OK;}
@@ -41,18 +43,42 @@ static void *pvPortMalloc(size_t n) {if(allocation_failure)return nullptr;++allo
 static void vPortFree(void *p) {--allocated;free(p);}
 static void vTaskDelete(void*) {}
 static int xTaskCreate(void (*fn)(void*),const char*,int,void *arg,int,void*) {
- if(task_failure)return 0; pending_task=fn;pending_arg=arg;return pdPASS;
+ if(task_failure)return 0; pending_tasks.push_back({fn,arg}); return pdPASS;
+}
+// Runs the OLDEST still-unrun task - the one that would wake up first in
+// real FreeRTOS scheduling, since it was spawned first.
+static void run_oldest_pending_task() {
+ auto task = pending_tasks.front(); pending_tasks.erase(pending_tasks.begin());
+ task.first(task.second);
 }
 ''' + task + opening + close + r'''
 int main() {
  assert(gdo_control_close()==ESP_OK); assert(warnings==0 && closes==0);
- assert(gdo_control_open()==ESP_OK); pending_task(pending_arg);
+ assert(gdo_control_open()==ESP_OK); run_oldest_pending_task();
  assert(closes==0 && allocated==0);
- assert(gdo_control_close()==ESP_OK); pending_task(pending_arg); assert(closes==1);
- assert(gdo_control_close()==ESP_OK); current.obstruction=1;pending_task(pending_arg);assert(closes==1);
+ assert(gdo_control_close()==ESP_OK); run_oldest_pending_task(); assert(closes==1);
+ assert(gdo_control_close()==ESP_OK); current.obstruction=1;run_oldest_pending_task();assert(closes==1);
  current.obstruction=0;
  allocation_failure=1;assert(gdo_control_close()==ESP_ERR_NO_MEM);assert(closes==1);
  allocation_failure=0;task_failure=1;assert(gdo_control_close()==ESP_ERR_NO_MEM);assert(allocated==0);
+ task_failure=0;
+
+ // The race this guards against: close, then open cancels it - but the
+ // original close's warning task hasn't woken up yet (still "pending" in
+ // real FreeRTOS terms). A close attempted right now, in that gap, must
+ // not be spuriously rejected just because the stale task hasn't gotten
+ // around to clearing s_user_close_pending for itself yet.
+ assert(gdo_control_close()==ESP_OK);           // task A armed, generation G1
+ assert(gdo_control_open()==ESP_OK);             // cancels A (generation -> G2)
+ assert(gdo_control_close()==ESP_OK);            // must succeed immediately, task B armed (generation G3)
+ assert(pending_tasks.size()==2);
+ int closes_before = closes;
+ run_oldest_pending_task();                      // task A wakes: superseded, must not close and must not
+                                                   // clear the pending slot out from under task B
+ assert(closes==closes_before);
+ assert(gdo_control_close()==ESP_ERR_INVALID_STATE); // task B is still genuinely pending - correctly rejected
+ run_oldest_pending_task();                      // task B wakes: its generation is current, actually closes
+ assert(closes==closes_before+1);
 }
 ''', cpp=True)
 
