@@ -44,11 +44,12 @@ def extract_log_calls(source):
 
 
 class LogSecurityTests(unittest.TestCase):
-    def test_log_routes_require_valid_token_before_reading_buffer(self):
+    def test_log_routes_require_valid_password_before_reading_buffer(self):
         source = r'''
 #include <cstring>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #define ESP_OK 0
 #define ESP_FAIL -1
 #define HTTPD_403_FORBIDDEN 403
@@ -57,11 +58,16 @@ class LogSecurityTests(unittest.TestCase):
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
 #define ESP_LOGW(...) ((void)0)
+#define ADMIN_PASSWORD_MAX_LEN 64
 typedef int esp_err_t;
 struct httpd_req_t { const char *token; int status; bool attachment; bool no_store; };
-static char s_admin_token[65], scratch[64];
+static char scratch[64];
 static char *s_log_scratch = scratch;
 static int s_log_scratch_mutex = 1, reads, sends;
+static uint8_t s_admin_pw_salt[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+static uint8_t s_admin_pw_hash[32];
+static uint32_t s_admin_pw_iterations = 4096;
+static bool s_admin_password_set = true;
 static size_t httpd_req_get_hdr_value_len(httpd_req_t*r,const char*) {return strlen(r->token);}
 static int httpd_req_get_hdr_value_str(httpd_req_t*r,const char*,char*b,size_t n) {strncpy(b,r->token,n);return 0;}
 static void httpd_resp_send_err(httpd_req_t*r,int s,const char*) {r->status=s;}
@@ -76,20 +82,26 @@ static size_t log_ring_buffer_capacity() {return sizeof(scratch);}
 static size_t log_ring_buffer_read(char*b,size_t) {++reads;strcpy(b,"private log");return 11;}
 static int xSemaphoreTake(int,int) {return 1;}
 static void xSemaphoreGive(int) {}
+// Fake but deterministic stand-in for the real PBKDF2-HMAC-SHA256 - see test_controls.py.
+static void hash_admin_password(const char *password, size_t len, const uint8_t *salt, uint32_t iterations, uint8_t *out_hash) {
+ memset(out_hash, 0, 32);
+ for (size_t i = 0; i < len && i < 32; ++i) out_hash[i] = (uint8_t)password[i] ^ salt[i % 16] ^ (uint8_t)iterations;
+}
 '''
         for signature in ('static bool authorize_mutation(', 'static esp_err_t send_log_buffer(',
                           'static esp_err_t logs_get_handler(', 'static esp_err_t logs_download_get_handler('):
             source += function('main/diag_webserver.cpp', signature) + '\n'
         run_c(source + r'''
 int main() {
- memset(s_admin_token,'a',64);
+ const char *admin_password = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 64 chars
+ hash_admin_password(admin_password, strlen(admin_password), s_admin_pw_salt, s_admin_pw_iterations, s_admin_pw_hash);
  char wrong[65]; memset(wrong,'b',64);wrong[64]=0;
  for(auto handler : {logs_get_handler, logs_download_get_handler}) {
   for(const char* token : {"", "short", (const char*)wrong}) {
    httpd_req_t req={token,0,false,false}; reads=sends=0;
    handler(&req); assert(req.status==401);assert(reads==0 && sends==0);
   }
-  httpd_req_t req={s_admin_token,0,false,false};reads=sends=0;
+  httpd_req_t req={admin_password,0,false,false};reads=sends=0;
   handler(&req);assert(reads==1 && sends==1);assert(req.no_store);
   assert(req.attachment==(handler==logs_download_get_handler));
  }
