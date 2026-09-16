@@ -594,6 +594,9 @@ void notify_homekit_target_door_state_change(uint8_t tgt) {
 
 // this function is called when the current state of the door changes in the world (i.e. we wish to
 // update the representation in homekit)
+// The SDK emits readable-characteristic events only when the value changes.
+// Repeating the same value cannot force delivery of a missed notification;
+// do not fabricate an intermediate door state to bypass that rule.
 void notify_homekit_current_door_state_change(gdo_door_state_t door) {
     if (door == last_door) return;
 
@@ -615,32 +618,6 @@ void notify_homekit_current_door_state_change(gdo_door_state_t door) {
         ESP_LOGE(TAG, "could not queue homekit notif of door current state (queue full)");
     }
 }
-
-// Unconditionally re-queues the current door state, bypassing the dedup in
-// notify_homekit_current_door_state_change() above. The esp-homekit-sdk
-// silently skips exactly one event notification to whichever HAP session
-// most recently did a GET on a characteristic (see owner_ctrl handling in
-// esp_hap_ip_services.c) - the assumption being that controller already
-// has the value it just read. That optimization eats a real push if the
-// Home app happens to poll the door characteristic between two rapid
-// state changes (e.g. the synthetic Opening->Open jump in
-// gdo-blaq-homekit.cpp): the value in the characteristic ends up correct
-// but the app never hears about it until it reads again. A follow-up
-// resend a few seconds later - after owner_ctrl has had a chance to
-// clear - recovers it. Called from a one-shot timer, not the door-state
-// change path itself, so it always reflects the true settled state.
-void notify_homekit_current_door_state_resend(gdo_door_state_t door) {
-    GDOEvent e;
-    e.dest = HomeKitNotifDest::DoorCurrentState;
-    e.value.u = map_gdo_to_homekit_state(door);
-    if (gdo_notif_event_q &&
-        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
-        last_door = door;
-    } else {
-        ESP_LOGE(TAG, "could not queue homekit door state reaffirm (queue full)");
-    }
-}
-
 
 // this function is called by HomeKit when the value of a characteristic changes (i.e. has been set
 // by the user) for the light service. It effectuates the value of the characteristic.
