@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GDO blaQ HomeKit — Web Installer</title>
+<meta name="description" content="Flash the native HomeKit firmware to your Konnected GDO blaQ directly from Chrome or Edge, no software install required.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="vendor/esp-web-tools/install-button.js"></script>
+</head>
+<body>
+<main class="page">
+  <header class="hero">
+    <img class="hero-logo" src="assets/logo.svg" alt="GDO blaQ HomeKit" width="220" height="48">
+    <h1>Web Installer</h1>
+    <p class="hero-sub">Flash the native HomeKit firmware to your Konnected GDO blaQ straight from your browser — no software to install.</p>
+  </header>
+
+  <section class="card firmware-card">
+    <div class="firmware-card-badges">
+      <span class="pill pill-beta">BETA</span>
+      <span class="apple-home-badge">
+        <svg viewBox="0 0 22 22" class="apple-home-badge-icon" aria-hidden="true">
+          <path d="M3 10.5 L11 3 L19 10.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M5 9 V19 H17 V9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="9.5" y="13" width="3" height="6" fill="currentColor"/>
+        </svg>
+        <span class="apple-home-badge-text"><small>Works with</small><strong>Apple Home</strong></span>
+      </span>
+    </div>
+
+    <h2>GDO blaQ HomeKit firmware</h2>
+    <p class="firmware-version" id="firmware-version">Checking latest version…</p>
+
+    <ul class="caveats">
+      <li>Not certified by Apple.</li>
+      <li>Requires an Apple Home hub (HomePod or Apple TV) running the latest software.</li>
+      <li>Replaces the device's current firmware entirely, including a stock ESPHome build.</li>
+    </ul>
+
+    <div class="install-row">
+      <esp-web-install-button id="install-button" manifest="/firmware/manifest.json">
+        <span slot="unsupported" class="unsupported-note">
+          <strong>Unsupported browser.</strong> Use <a href="https://www.google.com/chrome/" target="_blank" rel="noopener">Google Chrome</a> or <a href="https://www.microsoft.com/edge" target="_blank" rel="noopener">Microsoft Edge</a> to flash over USB.
+        </span>
+        <span slot="not-allowed" class="unsupported-note">
+          <strong>Web Serial is blocked.</strong> This page needs to be loaded over HTTPS with Web Serial permitted.
+        </span>
+      </esp-web-install-button>
+      <p id="firmware-error" class="firmware-error" hidden>
+        Firmware is temporarily unavailable here. Flash manually from the
+        <a href="https://github.com/atnorman-us/gdo-blaq-homekit/releases" target="_blank" rel="noopener">GitHub Releases page</a> instead.
+      </p>
+    </div>
+  </section>
+
+  <section class="card steps-card">
+    <h2>After flashing: provision WiFi and add to HomeKit</h2>
+    <ol>
+      <li>Connect to the device's <code>konnected-blaq-hk</code> WiFi access point.</li>
+      <li>Open <code>http://192.168.4.1</code>, enter your WiFi credentials, and select <strong>Write and Reboot</strong>.</li>
+      <li>Once the device joins your network, open Apple's Home app, select <strong>Add Accessory</strong>, then <strong>More Options</strong>.</li>
+      <li>Select the accessory and enter setup code <code>251-02-023</code>.</li>
+    </ol>
+  </section>
+
+  <section class="faq">
+    <h2>Troubleshooting / FAQ</h2>
+    <div class="faq-item">
+      <button class="faq-question" aria-expanded="false">Which browsers are supported?</button>
+      <div class="faq-answer" hidden>
+        <p>Use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong>. Safari and Firefox don't support the Web Serial API this tool needs.</p>
+      </div>
+    </div>
+    <div class="faq-item">
+      <button class="faq-question" aria-expanded="false">Do I need to install USB drivers?</button>
+      <div class="faq-answer" hidden>
+        <p>No. The GDO blaQ's ESP32-S3 uses native USB and needs no drivers on Windows, Mac, or Linux.</p>
+      </div>
+    </div>
+    <div class="faq-item">
+      <button class="faq-question" aria-expanded="false">My device isn't detected when I click Connect</button>
+      <div class="faq-answer" hidden>
+        <p>Make sure you're using a data-quality USB-C cable — some cables are charging-only and don't carry data. Try a different cable or port if the device doesn't appear in the port list.</p>
+      </div>
+    </div>
+    <div class="faq-item">
+      <button class="faq-question" aria-expanded="false">Which serial port should I select?</button>
+      <div class="faq-answer" hidden>
+        <p><strong>Windows:</strong> look for a COM port (e.g. COM3, COM4).<br>
+        <strong>Mac:</strong> look for a port containing "usbserial" or "usbmodem" in its name.</p>
+      </div>
+    </div>
+    <div class="faq-item">
+      <button class="faq-question" aria-expanded="false">Where do I get more help?</button>
+      <div class="faq-answer" hidden>
+        <p>Open an issue on the <a href="https://github.com/atnorman-us/gdo-blaq-homekit" target="_blank" rel="noopener">GitHub repository</a>, or read the full <a href="https://github.com/atnorman-us/gdo-blaq-homekit#readme" target="_blank" rel="noopener">README</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <p>
+      <a href="https://github.com/atnorman-us/gdo-blaq-homekit" target="_blank" rel="noopener">GDO blaQ HomeKit firmware</a>
+      is free software, licensed under the
+      <a href="https://github.com/atnorman-us/gdo-blaq-homekit/blob/main/LICENSE" target="_blank" rel="noopener">GNU GPLv3</a>.
+    </p>
+    <p><a href="https://esphome.github.io/esp-web-tools/" target="_blank" rel="noopener">Powered by ESP Web Tools</a></p>
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
