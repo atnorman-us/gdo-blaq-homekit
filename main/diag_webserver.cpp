@@ -644,8 +644,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    <div class=\"logbar\">"
         "      <h2 style=\"margin:0;\">Log <span id=\"loginfo\" class=\"hint\" style=\"margin:0;\"></span></h2>"
         "      <div class=\"btnrow\">"
-        "        <button onclick=\"refresh()\">Refresh now</button>"
-        "        <a class=\"link\" href=\"/logs/download\">Download full log</a>"
+        "        <button onclick=\"refresh(true)\">Refresh now</button>"
+        "        <button onclick=\"downloadLogs()\">Download full log</button>"
         "        <button class=\"ghost-danger\" onclick=\"restartDevice()\">Restart device</button>"
         "        <label class=\"chk\"><input type=\"checkbox\" id=\"auto\" checked> auto-refresh</label>"
         "      </div>"
@@ -685,7 +685,18 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    document.getElementById('log').textContent = 'Restart failed: ' + e.message + '';"
         "  }"
         "}"
-        "async function refresh(){"
+        "async function downloadLogs(){"
+        "  try{"
+        "    const headers = authHeaders(); if(!adminToken) return;"
+        "    const r = await fetch('/logs/download', {headers});"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
+        "    const url = URL.createObjectURL(await r.blob());"
+        "    const a = document.createElement('a'); a.href=url; a.download='gdo-log.txt';"
+        "    document.body.appendChild(a); a.click(); a.remove();"
+        "    setTimeout(()=>URL.revokeObjectURL(url), 1000);"
+        "  }catch(e){ document.getElementById('log').textContent = 'Log download failed: ' + e.message; }"
+        "}"
+        "async function refresh(requestToken=false){"
         "  try{"
         "    const s = await (await fetch('/status')).json();"
         "    pill(document.getElementById('pillDoor'), s.door || '?', doorCls(s.door));"
@@ -717,14 +728,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    document.getElementById('fwOtherVersion').textContent = s.other_fw_version || '?';"
         "  }catch(e){}"
         "  try{"
-        "    const r = await fetch('/logs');"
+        "    if(requestToken) authHeaders();"
+        "    if(!adminToken){ document.getElementById('log').textContent='Select Refresh now to enter your diagnostics access token and view logs.'; return; }"
+        "    const r = await fetch('/logs', {headers:{'X-GDO-Token':adminToken}});"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
         "    const txt = await r.text();"
         "    const pre = document.getElementById('log');"
         "    const wasAtBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;"
         "    pre.textContent = txt;"
         "    document.getElementById('loginfo').textContent = '(' + txt.length + ' bytes shown)';"
         "    if (wasAtBottom) pre.scrollTop = pre.scrollHeight;"
-        "  }catch(e){}"
+        "  }catch(e){ document.getElementById('log').textContent='Log fetch failed: ' + e.message; }"
         "}"
         "let acLoaded = false;"
         "async function refreshAutoCloseFields(){"
@@ -1002,6 +1016,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 // headers differ (Content-Disposition on the download variant).
 static esp_err_t send_log_buffer(httpd_req_t *req, bool as_attachment)
 {
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     size_t capacity = log_ring_buffer_capacity();
     if (capacity == 0 || !s_log_scratch || !s_log_scratch_mutex) {
         httpd_resp_set_type(req, "text/plain");

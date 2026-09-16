@@ -172,7 +172,7 @@ static SemaphoreHandle_t s_control_mutex;
 static uint32_t s_close_generation;
 static uint32_t s_auto_close_generation;
 static uint32_t s_auto_close_command_id;
-static esp_timer_handle_t s_door_reaffirm_timer = nullptr;
+static bool s_user_close_pending;
 
 class ControlGuard {
 public:
@@ -187,16 +187,65 @@ extern "C" esp_err_t gdo_control_open(void) {
     ++s_close_generation;
     return gdo_door_open();
 }
-extern "C" esp_err_t gdo_control_close(void) {
-    uint32_t generation;
+// Keep the HAP request thread available while the warning runs. Each task
+// owns its generation so a later Open or a state change cancels this close.
+static void user_close_task(void *arg)
+{
+    uint32_t generation = *static_cast<uint32_t *>(arg);
+    vPortFree(arg);
+    pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
     {
         ControlGuard guard;
-        generation = ++s_close_generation;
+        s_user_close_pending = false;
+        if (generation == s_close_generation) {
+            gdo_status_t status;
+            esp_err_t err = gdo_get_status(&status);
+            if (err == ESP_OK && status.synced &&
+                status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
+                err = gdo_door_close();
+            } else {
+                err = ESP_ERR_INVALID_STATE;
+            }
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Pending close cancelled or failed (%d)", err);
+                if (gdo_get_status(&status) == ESP_OK) {
+                    if (status.door == GDO_DOOR_STATE_OPEN)
+                        notify_homekit_target_door_state_change(TGT_OPEN);
+                    else if (status.door == GDO_DOOR_STATE_CLOSED)
+                        notify_homekit_target_door_state_change(TGT_CLOSED);
+                }
+            }
+        }
     }
-    pre_close_warning_run(PRE_CLOSE_WARNING_DURATION_MS);
+    vTaskDelete(NULL);
+}
+
+extern "C" esp_err_t gdo_control_close(void) {
     ControlGuard guard;
-    if (generation != s_close_generation) return ESP_ERR_INVALID_STATE;
-    return gdo_door_close();
+    if (s_user_close_pending) return ESP_ERR_INVALID_STATE;
+    auto *generation = static_cast<uint32_t *>(pvPortMalloc(sizeof(uint32_t)));
+    if (!generation) return ESP_ERR_NO_MEM;
+    *generation = ++s_close_generation;
+    s_user_close_pending = true;
+    if (xTaskCreate(user_close_task, "user_close", 8192, generation,
+                    tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        s_user_close_pending = false;
+        vPortFree(generation);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+// A synced driver rejects gdo_sync(). Refresh its status instead; only an
+// unsynced driver needs the initial synchronization task.
+static esp_err_t request_gdo_status_recovery(void)
+{
+    gdo_status_t status;
+    esp_err_t err = gdo_get_status(&status);
+    if (err != ESP_OK) return err;
+    err = status.synced ? gdo_refresh_status() : gdo_sync();
+    if (err != ESP_OK) ESP_LOGW(TAG, "GDO status recovery request failed (%d)", err);
+    return err;
 }
 
 static inline int64_t now_ms(void)
@@ -224,38 +273,6 @@ static void set_last_door_state(gdo_door_state_t new_state)
     }
     last_door = new_state;
 
-    // Guard against the esp-homekit-sdk silently dropping one push
-    // notification to whichever HAP session most recently did a GET on
-    // the door characteristic (see notify_homekit_current_door_state_resend()
-    // in homekit.cpp) - confirmed in the field: Home app left showing
-    // "Opening" after a real Closed->Open transition that resolved
-    // correctly on the device, until the app was force-refreshed. Re-arm
-    // on every state change rather than only the "final" ones - the
-    // callback re-reads last_door at fire time, not a captured value, so
-    // it always resends whatever's actually true a few seconds later.
-    if (s_door_reaffirm_timer) {
-        esp_timer_stop(s_door_reaffirm_timer);
-        esp_timer_start_once(s_door_reaffirm_timer, 3000000);
-    }
-}
-
-static void door_state_reaffirm_cb(void *arg)
-{
-    ControlGuard guard;
-    notify_homekit_current_door_state_resend(last_door);
-}
-
-// Call once at boot, before any door activity - see set_last_door_state().
-static void door_state_reaffirm_init(void)
-{
-    const esp_timer_create_args_t timer_args = {
-        .callback = door_state_reaffirm_cb,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "door_reaffirm",
-        .skip_unhandled_events = false,
-    };
-    esp_timer_create(&timer_args, &s_door_reaffirm_timer);
 }
 
 // Shared by the normal GDO_CB_EVENT_DOOR_POSITION path and the sync-complete
@@ -1206,17 +1223,17 @@ static void gdo_watchdog_task(void *arg)
                         // Position is still genuinely mid-range - either the
                         // door is mechanically stuck or the link has stalled.
                         // Don't guess OPEN/CLOSED; report STOPPED honestly and
-                        // request a real resync.
+                        // request fresh status or synchronization as appropriate.
                         ESP_LOGW(TAG,
                                  "%s timed out after %" PRIu32 " ms, raw=%" PRIu32
-                                 " still mid-travel (%" PRIu32 " RX errors) - marking STOPPED, requesting resync",
+                                 " still mid-travel (%" PRIu32 " RX errors) - marking STOPPED, requesting status recovery",
                                  gdo_door_state_to_string(s_transition_target), elapsed, raw, rx_errors);
 
                         if (last_door != GDO_DOOR_STATE_STOPPED) {
                             set_last_door_state(GDO_DOOR_STATE_STOPPED);
                             notify_homekit_current_door_state_change(GDO_DOOR_STATE_STOPPED);
                         }
-                        gdo_sync();
+                        request_gdo_status_recovery();
                     }
                 }
             } else {
@@ -1260,10 +1277,10 @@ static void gdo_watchdog_task(void *arg)
             (now - s_last_status_event_ms) > GDO_LINK_STALE_TIMEOUT_MS) {
 
             ESP_LOGW(TAG,
-                     "No GDO status events in %" PRId64 " ms - requesting resync",
+                     "No GDO status events in %" PRId64 " ms - requesting status recovery",
                      now - s_last_status_event_ms);
 
-            gdo_sync();
+            request_gdo_status_recovery();
 
             // Debounce: don't fire again every watchdog tick while waiting
             // for the link to recover.
@@ -1377,7 +1394,6 @@ extern "C" void app_main(void)
 
     diagnostics_counters_init();
 
-    door_state_reaffirm_init();
 
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart    = true;

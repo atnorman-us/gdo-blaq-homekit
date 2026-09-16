@@ -1,5 +1,54 @@
+diff --git a/source/nvs_wifi_connect.c b/source/nvs_wifi_connect.c
+index d59140f..5907e72 100644
+--- a/source/nvs_wifi_connect.c
++++ b/source/nvs_wifi_connect.c
+@@ -103,8 +103,7 @@ static void init_softap(char *ap_ssid, char *ap_pass)
+     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+     ESP_ERROR_CHECK(esp_wifi_start());
+ 
+-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s",
+-             ap_ssid, ap_pass);
++    ESP_LOGI(TAG, "wifi_init_softap finished.");
+ }
+ 
+ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
+@@ -162,14 +161,12 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
+      * happened. */
+     if (bits & WIFI_CONNECTED_BIT)
+     {
+-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+-                 sta_ssid, sta_pass);
++        ESP_LOGI(TAG, "Connected to configured AP");
+         err = ESP_OK;
+     }
+     else if (bits & WIFI_FAIL_BIT)
+     {
+-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+-                 sta_ssid, sta_pass);
++        ESP_LOGI(TAG, "Failed to connect to configured AP");
+         err = ESP_FAIL;
+     }
+     else
+@@ -235,7 +232,7 @@ esp_err_t nvs_wifi_connect(void)
+                     return ESP_OK;
+                 }
+             }
+-            ESP_LOGE(TAG, "STA ERR ssid=%s pass=%s", nvs_ssid, nvs_password);
++            ESP_LOGE(TAG, "STA configuration or connection failed");
+             err = ESP_ERR_INVALID_ARG;
+         }
+         if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid) || nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password) == ESP_OK)
+@@ -244,7 +241,7 @@ esp_err_t nvs_wifi_connect(void)
+             return err;
+         }
+     }
+-    ESP_LOGE(TAG, "AP ERR ssid=%s pass=%s Start default AP", nvs_ssid, nvs_password);
++    ESP_LOGE(TAG, "AP configuration unavailable; starting default AP");
+     init_softap(CONFIG_DEFAULT_AP_ESP_WIFI_SSID, CONFIG_DEFAULT_AP_ESP_WIFI_PASS);
+ 
+     return ESP_ERR_INVALID_ARG;
 diff --git a/source/nvs_wifi_connect_http_server.c b/source/nvs_wifi_connect_http_server.c
-index b45134e..bc9fb53 100644
+index b45134e..d34f4c4 100644
 --- a/source/nvs_wifi_connect_http_server.c
 +++ b/source/nvs_wifi_connect_http_server.c
 @@ -24,29 +24,27 @@ static int srv_restart = 0;
@@ -65,6 +114,15 @@ index b45134e..bc9fb53 100644
      }
      else
      {
+@@ -107,7 +106,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+         {
+             if (nvs_set_str(nvs_handle, key, value)) // write key/value to nvs
+             {
+-                ESP_LOGE(TAG, "ERR WRITE key %s value %s", key, value);
++                ESP_LOGE(TAG, "Failed to write provisioning setting");
+             }
+             nvs_commit(nvs_handle);
+             nvs_close(nvs_handle);
 @@ -150,6 +149,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
          ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
          return ret;
