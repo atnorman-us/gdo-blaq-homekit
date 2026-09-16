@@ -75,6 +75,7 @@ body {
 
 .install-row { text-align: center; }
 esp-web-install-button { display: inline-block; }
+esp-web-install-button[hidden] { display: none; }
 
 .unsupported-note, .firmware-error {
   display: block;
