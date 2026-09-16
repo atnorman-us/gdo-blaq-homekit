@@ -145,27 +145,42 @@ int main(void) {
         script = script.replace('refresh();setInterval(', 'setInterval(')
         result = subprocess.run(['node', '-e', r'''
 const assert = require('assert');
+const realSetImmediate = setImmediate;
 const elements = new Map();
-let calls=[], prompts=0, clicked=false;
-global.prompt=()=>{prompts++;return 'secret-token';};
+let calls=[], clicked=false;
 global.setInterval=()=>{};
 global.setTimeout=(f)=>f();
-global.document={getElementById(id){if(!elements.has(id)) elements.set(id,{textContent:'',checked:false,style:{}});return elements.get(id);},
- createElement(){return {click(){clicked=true;},remove(){}};},body:{appendChild(){}}};
+global.document={getElementById(id){if(!elements.has(id)) elements.set(id,{textContent:'',checked:false,style:{},value:'',focus(){}});return elements.get(id);},
+ createElement(){return {click(){clicked=true;},remove(){}};},body:{appendChild(){}},
+ addEventListener(){}};
 global.URL={createObjectURL(){return 'blob:log';},revokeObjectURL(){}};
 global.fetch=async (url,options)=>{
  if(url==='/status') throw Error('status not needed for this test');
  calls.push({url,options});return {ok:true,status:200,text:async()=>'log data',blob:async()=>({})};
 };
+// The admin password prompt is a masked in-page modal now, not a native
+// prompt() - simulate a user typing into it and clicking OK by waiting
+// for the page's own askPassword() to register its resolver, then
+// driving the same pwPromptInput/pwPromptSubmit() a real click would.
+async function answerPasswordPrompt(value){
+ for(let i=0;i<50 && !pwPromptResolve;i++){ await new Promise(r=>realSetImmediate(r)); }
+ assert(pwPromptResolve, 'password prompt was not shown');
+ document.getElementById('pwPromptInput').value = value;
+ pwPromptSubmit();
+}
 ''' + script + r'''
 (async()=>{
- await refresh(true);
+ const p = refresh(true);
+ await answerPasswordPrompt('secret-token');
+ await p;
  assert(calls.some(c=>c.url==='/logs' && c.options?.headers['X-GDO-Token']==='secret-token'));
  calls=[];await downloadLogs();
  assert(calls.some(c=>c.url==='/logs/download' && c.options?.headers['X-GDO-Token']==='secret-token'));
  assert(clicked);
- adminToken='';calls=[];prompts=0;await refresh();
- assert.equal(prompts,0);assert.equal(calls.length,0);
+ // Without requestToken, a missing password must not prompt or fetch at all.
+ adminToken='';calls=[];await refresh();
+ assert.equal(calls.length,0);
+ assert.notEqual(document.getElementById('pwPromptOverlay').style.display, 'flex');
 })().catch(e=>{console.error(e);process.exit(1);});
 '''], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
