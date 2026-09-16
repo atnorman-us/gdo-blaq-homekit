@@ -84,6 +84,7 @@ esp-web-install-button[hidden] { display: none; }
   color: var(--color-text-muted);
 }
 .firmware-error { color: #b3261e; }
+.firmware-error[hidden] { display: none; }
 
 .steps-card ol { padding-left: 20px; line-height: 1.7; }
 .steps-card code {
