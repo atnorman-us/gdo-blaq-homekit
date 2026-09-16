@@ -23,4 +23,5 @@ idf_component_register(
         driver
         app_update
         mdns
+        mbedtls
 )

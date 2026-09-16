@@ -39,27 +39,42 @@ int main() {
 }
 ''', cpp=True)
 
-    def test_web_authorization_requires_valid_token(self):
+    def test_web_authorization_requires_valid_password(self):
         fn = function('main/diag_webserver.cpp', 'static bool authorize_mutation(')
         prefix = r'''
 #include <cstring>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #define ESP_OK 0
 #define HTTPD_401_UNAUTHORIZED 401
+#define HTTPD_403_FORBIDDEN 403
+#define ADMIN_PASSWORD_MAX_LEN 64
 struct httpd_req_t { const char *token; int status; };
-static char s_admin_token[65];
+static uint8_t s_admin_pw_salt[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+static uint8_t s_admin_pw_hash[32];
+static uint32_t s_admin_pw_iterations = 4096;
+static bool s_admin_password_set = false;
 static void httpd_resp_send_err(httpd_req_t *r,int s,const char*) {r->status=s;}
 static size_t httpd_req_get_hdr_value_len(httpd_req_t*r,const char*) {return strlen(r->token);}
 static int httpd_req_get_hdr_value_str(httpd_req_t*r,const char*,char*b,size_t n) {strncpy(b,r->token,n);return 0;}
+// Fake but deterministic stand-in for the real PBKDF2-HMAC-SHA256 - these
+// tests cover the auth flow (unset/missing/wrong/right password), not the
+// KDF itself, which is a well-tested standard primitive.
+static void hash_admin_password(const char *password, size_t len, const uint8_t *salt, uint32_t iterations, uint8_t *out_hash) {
+ memset(out_hash, 0, 32);
+ for (size_t i = 0; i < len && i < 32; ++i) out_hash[i] = (uint8_t)password[i] ^ salt[i % 16] ^ (uint8_t)iterations;
+}
 '''
         main = r'''
 int main() {
- memset(s_admin_token,'a',64);
- httpd_req_t req={"",0}; assert(!authorize_mutation(&req)); assert(req.status==401);
- char wrong[65]; memset(wrong,'b',64); wrong[64]=0;
- req.token=wrong; assert(!authorize_mutation(&req));
- req.token=s_admin_token; assert(authorize_mutation(&req));
+ httpd_req_t req={"correct-horse",0};
+ assert(!authorize_mutation(&req)); assert(req.status==403); // no password set yet
+ s_admin_password_set = true;
+ hash_admin_password("correct-horse", 13, s_admin_pw_salt, s_admin_pw_iterations, s_admin_pw_hash);
+ req.token=""; assert(!authorize_mutation(&req)); assert(req.status==401);
+ req.token="wrong-password"; assert(!authorize_mutation(&req)); assert(req.status==401);
+ req.token="correct-horse"; assert(authorize_mutation(&req));
 }
 '''
         run_c(prefix+fn+main, cpp=True)

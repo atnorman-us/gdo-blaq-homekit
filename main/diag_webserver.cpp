@@ -16,6 +16,8 @@
 #include "mdns.h"
 #include "nvs.h"
 #include "esp_random.h"
+#include "mbedtls/pkcs5.h"
+#include "mbedtls/md.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -42,16 +44,6 @@ static const char *TAG = "DIAGWEB";
 #define DIAG_WEB_PORT 8080
 #define LOG_BUFFER_CAPACITY (64 * 1024)
 #define DIAG_MDNS_HOSTNAME "gdo-blaq"
-
-// How long after boot the token can be fetched unauthenticated over the
-// network (see admin_token_get_handler()) - a fallback for devices with no
-// accessible serial console. Kept short so the trust basis stays "someone
-// physically power-cycled this device and is watching for it," matching
-// what this firmware already trusts implicitly for the wall button and the
-// pre-close warning hardware, not "anyone reachable on the LAN, any time."
-// Combined with the single-shot latch in s_admin_token_claimed below, so
-// simply rebooting the device again does not reopen this a second time.
-#define ADMIN_TOKEN_REVEAL_WINDOW_MS (30 * 1000)
 
 // Persistent so diag_webserver_restart() can stop and recreate it after a
 // WiFi bounce - the underlying httpd socket doesn't reliably survive an
@@ -97,81 +89,147 @@ static const char *reset_reason_to_string(esp_reset_reason_t reason)
     }
 }
 
-// A random per-device credential, never placed in the HTTP logs or responses.
-// Signature verification is a separate requirement: a stolen HTTP credential
-// must not permit installing arbitrary executable code.
-static char s_admin_token[65];
-// Latches permanently once the network fallback below has been used once -
-// persisted so it survives reboots too, not just this boot session. Without
-// this, the reveal window in ADMIN_TOKEN_REVEAL_WINDOW_MS would reopen on
-// every single power cycle, letting anyone who can trigger or wait for a
-// reboot fetch the token indefinitely instead of exactly once.
-static bool s_admin_token_claimed = false;
+// A user-chosen admin password, set once via the diagnostics page on first
+// use (see admin_set_password_post_handler()) and required for every
+// mutating action from then on, including firmware install. Stored as a
+// salted SHA-256 hash, never the password itself - a copy of NVS/flash
+// contents shouldn't hand over a password the user may have reused
+// elsewhere. Signature verification is a separate requirement from this
+// password entirely; this firmware doesn't do that - see the "signed
+// firmware" discussion in git history for that tradeoff.
+static uint8_t s_admin_pw_salt[16];
+static uint8_t s_admin_pw_hash[32];
+static uint32_t s_admin_pw_iterations;
+static bool s_admin_password_set = false;
 
-static bool init_admin_token(void)
+#define ADMIN_PASSWORD_MIN_LEN 8
+#define ADMIN_PASSWORD_MAX_LEN 64
+
+// Iteration count used for every NEWLY set password - stored alongside the
+// salt/hash (not assumed at verify time) so it can be raised in a future
+// firmware update without invalidating passwords set under the old count.
+// Deliberately modest compared to a typical web service's login-only
+// PBKDF2 (which might reasonably use 100k+ iterations, ~100-250ms): this
+// check runs on every mutating request to this device, not once at login
+// (there's no session concept here) - including the dashboard's periodic
+// log auto-refresh. A cost that's fine to pay once per login becomes a
+// continuous tax on a real-time-ish embedded controller if paid every few
+// seconds. 4096 - the same iteration count WPA2's PSK derivation uses, for
+// comparison, a working precedent on similar-class embedded WiFi hardware
+// - meaningfully raises the cost of brute-forcing a stolen NVS/flash dump
+// over a single SHA-256 round, without adding perceptible per-request
+// latency given this chip's hardware SHA acceleration
+// (CONFIG_MBEDTLS_HARDWARE_SHA).
+#define ADMIN_PASSWORD_PBKDF2_ITERATIONS 4096
+
+static void hash_admin_password(const char *password, size_t len, const uint8_t *salt,
+                                 uint32_t iterations, uint8_t *out_hash)
+{
+    mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256,
+                                   (const unsigned char *)password, len,
+                                   salt, sizeof(s_admin_pw_salt),
+                                   iterations, sizeof(s_admin_pw_hash), out_hash);
+}
+
+// Loads a previously-set password's salt+hash+iteration count, if any.
+// Returns false only on genuine NVS access failure (used to retry boot,
+// same as before) - "no password set yet" is a normal, expected state on a
+// fresh device, not a failure, and simply leaves s_admin_password_set false.
+static bool init_admin_credentials(void)
 {
     nvs_handle_t handle;
     if (nvs_open("gdo_admin", NVS_READWRITE, &handle) != ESP_OK) return false;
-    uint8_t token[32];
-    size_t len = sizeof(token);
-    esp_err_t err = nvs_get_blob(handle, "token", token, &len);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        esp_fill_random(token, sizeof(token));
-        err = nvs_set_blob(handle, "token", token, sizeof(token));
-        if (err == ESP_OK) err = nvs_commit(handle);
-    }
-    uint8_t claimed = 0;
-    nvs_get_u8(handle, "claimed", &claimed);
-    s_admin_token_claimed = claimed != 0;
+    size_t salt_len = sizeof(s_admin_pw_salt), hash_len = sizeof(s_admin_pw_hash);
+    bool have_salt = nvs_get_blob(handle, "pw_salt", s_admin_pw_salt, &salt_len) == ESP_OK &&
+                      salt_len == sizeof(s_admin_pw_salt);
+    bool have_hash = nvs_get_blob(handle, "pw_hash", s_admin_pw_hash, &hash_len) == ESP_OK &&
+                      hash_len == sizeof(s_admin_pw_hash);
+    bool have_iter = nvs_get_u32(handle, "pw_iter", &s_admin_pw_iterations) == ESP_OK;
     nvs_close(handle);
-    if (err != ESP_OK || len != sizeof(token)) return false;
-    for (size_t i = 0; i < sizeof(token); ++i)
-        snprintf(s_admin_token + 2 * i, 3, "%02x", token[i]);
-    // printf bypasses the ESP_LOG hook, so /logs cannot disclose the token.
-    printf("\nGDO diagnostics access token (keep private): %s\n", s_admin_token);
+    s_admin_password_set = have_salt && have_hash && have_iter;
+    if (!s_admin_password_set) {
+        ESP_LOGW(TAG, "No admin password set yet - open the diagnostics page to set one before using any controls");
+    }
     return true;
 }
 
-// Fallback for retrieving the token when the serial console isn't
-// available: unauthenticated, but only for a short window right after boot
-// (see ADMIN_TOKEN_REVEAL_WINDOW_MS) and only once ever (see
-// s_admin_token_claimed) - reboot the device and fetch this promptly if
-// you need it, but it only works the very first time it's used.
-static esp_err_t admin_token_get_handler(httpd_req_t *req)
+// Only usable before any password has ever been set - once one exists, this
+// always refuses, same trust basis as every other mutating endpoint here
+// (nothing unauthenticated may change what's required to authenticate).
+// There's deliberately no "forgot password" recovery beyond erasing NVS
+// entirely (which also wipes WiFi/HomeKit/rolling-code state) - the same
+// tradeoff most consumer routers and IoT devices make for their admin
+// password.
+static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
 {
-    if (!s_admin_token[0] || s_admin_token_claimed ||
-        esp_timer_get_time() / 1000 > ADMIN_TOKEN_REVEAL_WINDOW_MS) {
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
-            "Token retrieval window has closed or was already used - read it "
-            "from the serial console instead");
+    if (s_admin_password_set) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Admin password already set");
         return ESP_FAIL;
     }
-    // Latch before responding, not after: a client that disconnects mid-response
-    // must not get a second chance by simply retrying the request.
-    s_admin_token_claimed = true;
+    if (req->content_len < ADMIN_PASSWORD_MIN_LEN || req->content_len > ADMIN_PASSWORD_MAX_LEN) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be 8-64 characters");
+        return ESP_FAIL;
+    }
+    char password[ADMIN_PASSWORD_MAX_LEN + 1] = {};
+    int received = 0;
+    while (received < req->content_len) {
+        int n = httpd_req_recv(req, password + received, req->content_len - received);
+        if (n <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+            return ESP_FAIL;
+        }
+        received += n;
+    }
+    password[received] = '\0';
+
+    uint8_t salt[sizeof(s_admin_pw_salt)];
+    esp_fill_random(salt, sizeof(salt));
+    uint8_t hash[sizeof(s_admin_pw_hash)];
+    hash_admin_password(password, (size_t)received, salt, ADMIN_PASSWORD_PBKDF2_ITERATIONS, hash);
+    // Done with the plaintext - don't let it linger in memory any longer than needed.
+    memset(password, 0, sizeof(password));
+
     nvs_handle_t handle;
-    if (nvs_open("gdo_admin", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_u8(handle, "claimed", 1);
-        nvs_commit(handle);
+    esp_err_t err = nvs_open("gdo_admin", NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        nvs_set_blob(handle, "pw_salt", salt, sizeof(salt));
+        nvs_set_blob(handle, "pw_hash", hash, sizeof(hash));
+        nvs_set_u32(handle, "pw_iter", ADMIN_PASSWORD_PBKDF2_ITERATIONS);
+        err = nvs_commit(handle);
         nvs_close(handle);
     }
-    ESP_LOGW(TAG, "Diagnostics access token fetched over the network fallback endpoint");
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    memcpy(s_admin_pw_salt, salt, sizeof(salt));
+    memcpy(s_admin_pw_hash, hash, sizeof(hash));
+    s_admin_pw_iterations = ADMIN_PASSWORD_PBKDF2_ITERATIONS;
+    s_admin_password_set = true;
+    ESP_LOGI(TAG, "Admin password set via diagnostics page");
     httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, s_admin_token, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, "ok", 2);
 }
 
 static bool authorize_mutation(httpd_req_t *req)
 {
-    char supplied[sizeof(s_admin_token)] = {};
-    if (!s_admin_token[0] || httpd_req_get_hdr_value_len(req, "X-GDO-Token") != 64 ||
-        httpd_req_get_hdr_value_str(req, "X-GDO-Token", supplied, sizeof(supplied)) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Diagnostics access token required");
+    if (!s_admin_password_set) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "No admin password set - open the diagnostics page to set one first");
         return false;
     }
+    char supplied[ADMIN_PASSWORD_MAX_LEN + 1] = {};
+    size_t len = httpd_req_get_hdr_value_len(req, "X-GDO-Token");
+    if (len == 0 || len > ADMIN_PASSWORD_MAX_LEN ||
+        httpd_req_get_hdr_value_str(req, "X-GDO-Token", supplied, sizeof(supplied)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Admin password required");
+        return false;
+    }
+    uint8_t candidate[sizeof(s_admin_pw_hash)];
+    hash_admin_password(supplied, strlen(supplied), s_admin_pw_salt, s_admin_pw_iterations, candidate);
     unsigned difference = 0;
-    for (size_t i = 0; i < 64; ++i) difference |= (unsigned char)s_admin_token[i] ^ (unsigned char)supplied[i];
+    for (size_t i = 0; i < sizeof(candidate); ++i) difference |= candidate[i] ^ s_admin_pw_hash[i];
     if (difference) {
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Invalid diagnostics access token");
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Invalid admin password");
         return false;
     }
     return true;
@@ -569,6 +627,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    <div class=\"mono\" id=\"hdrVersion\">&nbsp;</div>"
         "  </div>"
         "</header>"
+        "<div id=\"pwSetupBanner\" class=\"card full\" style=\"display:none\">"
+        "  <h2>Set Admin Password</h2>"
+        "  <p>No admin password is set yet. Set one to enable device controls, firmware updates, and log access.</p>"
+        "  <button onclick=\"setupAdminPassword()\">Set Admin Password</button>"
+        "</div>"
         "<div class=\"grid\">"
         "  <div class=\"card full\">"
         "    <h2>Overview</h2>"
@@ -647,8 +710,21 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<script>"
         "let adminToken = '';"
         "function authHeaders(){"
-        "  if(!adminToken) adminToken = prompt('Enter the diagnostics access token from the device serial console:') || '';"
+        "  if(!adminToken) adminToken = prompt('Enter the admin password:') || '';"
         "  return {'X-GDO-Token':adminToken};"
+        "}"
+        "async function setupAdminPassword(){"
+        "  const pw1 = prompt('Set an admin password for this device (min 8 characters):');"
+        "  if(!pw1) return;"
+        "  if(pw1.length < 8){ alert('Password must be at least 8 characters.'); return; }"
+        "  if(pw1 !== prompt('Confirm the admin password:')){ alert('Passwords did not match.'); return; }"
+        "  try{"
+        "    const r = await fetch('/admin/set-password', {method:'POST', body:pw1});"
+        "    if(!r.ok) throw new Error(await r.text());"
+        "    adminToken = pw1;"
+        "    alert('Admin password set. Keep it safe - there is no way to recover or reset it short of erasing the device.');"
+        "    refresh();"
+        "  }catch(e){ alert('Failed to set password: ' + e.message); }"
         "}"
         "function pill(el, text, cls){ el.textContent = text; el.className = 'pill ' + cls; }"
         "function doorCls(s){ if(s==='Closed') return 'good'; if(s==='Open') return 'neutral'; if(s==='Opening'||s==='Closing') return 'warn'; if(s==='Stopped') return 'bad'; return 'off'; }"
@@ -690,6 +766,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "async function refresh(requestToken=false){"
         "  try{"
         "    const s = await (await fetch('/status')).json();"
+        "    document.getElementById('pwSetupBanner').style.display = s.password_set ? 'none' : 'block';"
         "    pill(document.getElementById('pillDoor'), s.door || '?', doorCls(s.door));"
         "    pill(document.getElementById('pillLight'), s.light || '?', lightCls(s.light));"
         "    pill(document.getElementById('pillLock'), s.lock || '?', lockCls(s.lock));"
@@ -964,7 +1041,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"running_partition\":\"%s\","
         "\"fw_version\":\"%s\","
         "\"other_partition\":\"%s\","
-        "\"other_fw_version\":\"%s\""
+        "\"other_fw_version\":\"%s\","
+        "\"password_set\":%s"
         "}",
         safe_str(gdo_door_state_to_string(door)),
         safe_str(gdo_light_state_to_string(light)),
@@ -994,7 +1072,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         running_partition ? running_partition->label : "unknown",
         app_desc ? app_desc->version : "unknown",
         have_other_version ? other_partition->label : "none",
-        have_other_version ? other_app_desc.version : "none");
+        have_other_version ? other_app_desc.version : "none",
+        s_admin_password_set ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     if (n > 0 && (size_t)n < sizeof(buf)) {
@@ -1116,10 +1195,10 @@ static bool start_httpd_server(void)
     firmware_rollback_uri.method = HTTP_POST;
     firmware_rollback_uri.handler = firmware_rollback_post_handler;
 
-    httpd_uri_t admin_token_uri = {};
-    admin_token_uri.uri = "/admin/token";
-    admin_token_uri.method = HTTP_GET;
-    admin_token_uri.handler = admin_token_get_handler;
+    httpd_uri_t admin_set_password_uri = {};
+    admin_set_password_uri.uri = "/admin/set-password";
+    admin_set_password_uri.method = HTTP_POST;
+    admin_set_password_uri.handler = admin_set_password_post_handler;
 
     if (httpd_register_uri_handler(s_server, &root_uri) != ESP_OK) {
         httpd_stop(s_server);
@@ -1176,7 +1255,7 @@ static bool start_httpd_server(void)
         s_server = nullptr;
         return false;
     }
-    if (httpd_register_uri_handler(s_server, &admin_token_uri) != ESP_OK) {
+    if (httpd_register_uri_handler(s_server, &admin_set_password_uri) != ESP_OK) {
         httpd_stop(s_server);
         s_server = nullptr;
         return false;
@@ -1229,7 +1308,7 @@ static void wait_for_network_and_start_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Network ready, starting diagnostics web server...");
-    while (!init_admin_token() || !start_httpd_server()) {
+    while (!init_admin_credentials() || !start_httpd_server()) {
         // Do not accept an OTA image before its recovery interface works.
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
