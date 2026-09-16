@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gdo-blaq-espweb",
+  "pages_build_output_dir": "site",
+  "compatibility_date": "2026-09-16",
+  "r2_buckets": [
+    { "binding": "FIRMWARE", "bucket_name": "gdo-blaq-firmware" },
+  ],
+}
