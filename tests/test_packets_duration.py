@@ -45,7 +45,8 @@ class PacketDurationTests(unittest.TestCase):
         return harness() + '\n#include "' + str(ROOT / 'components/gdolib/secplus.c') + '"\n' + stubs + r'''
 static void update_openings(int a,int b) {updates++;}
 static void update_paired_devices(int a,int b) {updates++;}
-''' + function('components/gdolib/gdo.c', 'static void decode_packet(uint8_t *packet) {')
+''' + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
+    + function('components/gdolib/gdo.c', 'static void decode_packet(uint8_t *packet) {')
 
     def test_bad_parity_cannot_mutate_status_or_emit_events(self):
         run_c(self.packet_source() + r'''
@@ -73,6 +74,38 @@ int main(void) {
  update_door_state(GDO_DOOR_STATE_MAX);
  assert(events==0);
 }''')
+
+    def test_battery_state_string_lookup_never_reads_out_of_bounds(self):
+        fn = function('components/gdolib/gdo_utils.c', 'const char* gdo_battery_state_to_string(')
+        run_c(r'''
+#include <stdint.h>
+#include <assert.h>
+#include <string.h>
+#include <stddef.h>
+typedef enum {
+ GDO_BATT_STATE_UNKNOWN = 0,
+ GDO_BATT_STATE_CHARGING = 0x6,
+ GDO_BATT_STATE_FULL = 0x8,
+ GDO_BATT_STATE_MAX = 0xff,
+} gdo_battery_state_t;
+static const char *gdo_battery_state_str[] = {"Unknown", "Charging", "Full"};
+''' + fn + r'''
+int main(void) {
+ assert(!strcmp(gdo_battery_state_to_string(GDO_BATT_STATE_UNKNOWN), "Unknown"));
+ assert(!strcmp(gdo_battery_state_to_string(GDO_BATT_STATE_CHARGING), "Charging"));
+ assert(!strcmp(gdo_battery_state_to_string(GDO_BATT_STATE_FULL), "Full"));
+ // This enum's real wire values (0, 6, 8, 0xff) are sparse, not sequential
+ // indices, so it can never be used to index gdo_battery_state_str[]
+ // directly (only 3 entries) - every other raw byte a corrupted or
+ // not-yet-understood frame could produce must resolve safely instead of
+ // reading past the array. Confirmed under ASan across the full range a
+ // raw wire byte can actually take.
+ for (int b = 0; b < 256; ++b) {
+  if (b == GDO_BATT_STATE_UNKNOWN || b == GDO_BATT_STATE_CHARGING || b == GDO_BATT_STATE_FULL) continue;
+  assert(gdo_battery_state_to_string((gdo_battery_state_t)b) != NULL);
+ }
+}
+''')
 
     def test_interrupted_and_reversed_trips_are_not_calibrated(self):
         for opening in (True, False):

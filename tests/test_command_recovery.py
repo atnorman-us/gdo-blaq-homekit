@@ -82,6 +82,64 @@ int main() {
 }
 ''', cpp=True)
 
+    def test_pairing_fault_after_sustained_sync_failure(self):
+        path = 'main/gdo-blaq-homekit.cpp'
+        source = (ROOT / path).read_text()
+        start_label = source.index('case GDO_CB_EVENT_SYNCED:')
+        body_start = source.index('\n', start_label) + 1
+        body_end = source.index('        break;', body_start)
+        block = source[body_start:body_end]
+        run_c(r'''
+#include <cstdint>
+#include <cassert>
+#include <cinttypes>
+#define ESP_OK 0
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+#define ESP_LOGE(...) ((void)0)
+#define TAG "test"
+#define GDO_PROTOCOL_SEC_PLUS_V2 1
+#define GDO_PAIRING_FAULT_TIMEOUT_MS (15 * 60 * 1000)
+struct gdo_status_t { bool synced; int protocol; uint32_t client_id, rolling_code; };
+static uint32_t s_sync_retry_count = 0;
+static int64_t s_sync_first_failure_ms = 0;
+static bool s_gdo_pairing_fault = false;
+static void *s_gdo_synced_sem = nullptr;
+static int64_t now_val;
+static int64_t now_ms() { return now_val; }
+static int gdo_set_rolling_code(uint32_t) { return ESP_OK; }
+static int gdo_sync() { return ESP_OK; }
+static const char *gdo_protocol_type_to_string(int) { return "Security+ 2.0"; }
+static void xSemaphoreGive(void*) {}
+static void gdo_save_synced_protocol(int) {}
+static void gdo_save_rolling_state(uint32_t, uint32_t) {}
+static void process_door_position(const gdo_status_t*) {}
+static void handle_synced(const gdo_status_t *status) {
+''' + block + r'''
+}
+int main() {
+ // A device that has genuinely lost its pairing with the opener (paired-
+ // device list cleared, opener firmware update, ...) retries sync forever
+ // with no visible difference from ordinary transient noise - this should
+ // surface as a distinct fault after sustained failure, without needing
+ // to change the retry behavior itself.
+ gdo_status_t status = {false, GDO_PROTOCOL_SEC_PLUS_V2, 1, 100};
+ now_val = 0;
+ handle_synced(&status);
+ assert(!s_gdo_pairing_fault);
+ now_val = GDO_PAIRING_FAULT_TIMEOUT_MS - 1;
+ handle_synced(&status);
+ assert(!s_gdo_pairing_fault);
+ now_val = GDO_PAIRING_FAULT_TIMEOUT_MS + 1;
+ handle_synced(&status);
+ assert(s_gdo_pairing_fault);
+ // A real sync recovers it and resets the failure streak.
+ status.synced = true;
+ handle_synced(&status);
+ assert(!s_gdo_pairing_fault && s_sync_retry_count == 0 && s_sync_first_failure_ms == 0);
+}
+''', cpp=True)
+
     def test_stale_link_requests_status_when_already_synced(self):
         path='main/gdo-blaq-homekit.cpp'
         source=(ROOT/path).read_text()

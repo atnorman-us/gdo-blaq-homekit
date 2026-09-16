@@ -34,6 +34,7 @@ extern "C" void gdo_diag_get_last_states(gdo_door_state_t *door,
                                           gdo_lock_state_t *lock,
                                           gdo_obstruction_state_t *obstruction,
                                           gdo_motion_state_t *motion);
+extern "C" bool gdo_diag_get_pairing_fault(void);
 extern "C" int homekit_get_connected_session_count(void);
 
 // Auto-close accessors now come from gdo_settings.h above, instead of a
@@ -632,6 +633,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  <p>No admin password is set yet. Set one to enable device controls, firmware updates, and log access.</p>"
         "  <button onclick=\"setupAdminPassword()\">Set Admin Password</button>"
         "</div>"
+        "<div id=\"pairingFaultBanner\" class=\"card full\" style=\"display:none\">"
+        "  <h2>&#9888; Opener Not Syncing</h2>"
+        "  <p>This device has not been able to sync with the garage door opener for a long time. "
+        "It may have lost its pairing - check the opener's paired device list, or re-run Learn "
+        "to pair this device again.</p>"
+        "</div>"
         "<div class=\"grid\">"
         "  <div class=\"card full\">"
         "    <h2>Overview</h2>"
@@ -767,6 +774,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  try{"
         "    const s = await (await fetch('/status')).json();"
         "    document.getElementById('pwSetupBanner').style.display = s.password_set ? 'none' : 'block';"
+        "    document.getElementById('pairingFaultBanner').style.display = s.pairing_fault ? 'block' : 'none';"
         "    pill(document.getElementById('pillDoor'), s.door || '?', doorCls(s.door));"
         "    pill(document.getElementById('pillLight'), s.light || '?', lightCls(s.light));"
         "    pill(document.getElementById('pillLock'), s.lock || '?', lockCls(s.lock));"
@@ -1042,7 +1050,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"fw_version\":\"%s\","
         "\"other_partition\":\"%s\","
         "\"other_fw_version\":\"%s\","
-        "\"password_set\":%s"
+        "\"password_set\":%s,"
+        "\"pairing_fault\":%s"
         "}",
         safe_str(gdo_door_state_to_string(door)),
         safe_str(gdo_light_state_to_string(light)),
@@ -1073,7 +1082,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         app_desc ? app_desc->version : "unknown",
         have_other_version ? other_partition->label : "none",
         have_other_version ? other_app_desc.version : "none",
-        s_admin_password_set ? "true" : "false");
+        s_admin_password_set ? "true" : "false",
+        gdo_diag_get_pairing_fault() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     if (n > 0 && (size_t)n < sizeof(buf)) {
