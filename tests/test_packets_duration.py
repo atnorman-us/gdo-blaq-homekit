@@ -24,20 +24,20 @@ def harness():
 typedef struct {int event;} gdo_event_t;
 static struct {int door,door_target,door_position,motor,protocol,last_move_direction,obstruction;uint16_t open_ms,close_ms;uint32_t client_id;} g_status;
 static struct {bool obst_from_status;} g_config;
-static int events, measurements, updates, g_door_start_moving_ms, door_position_sync_timer, gdo_sync_task_handle;
+static int events, measurements, updates, status_requests, g_door_start_moving_ms, door_position_sync_timer, gdo_sync_task_handle;
 static int64_t now;
 static int64_t esp_timer_get_time(void) { return now; }
 static int esp_timer_start_periodic(int t,int d) {return 0;}
 static void esp_timer_stop(int t) {}
 static void xTaskNotifyGive(int t) {}
-static void get_status(void) {}
+static void get_status(void) { ++status_requests; }
 static void get_openings(void) {}
 static void queue_event(gdo_event_t e) {events++; if(e.event==GDO_EVENT_DOOR_OPEN_DURATION_MEASUREMENT || e.event==GDO_EVENT_DOOR_CLOSE_DURATION_MEASUREMENT) measurements++;}
 ''' + function('components/gdolib/gdo.c', 'static void update_door_state(const gdo_door_state_t door_state) {')
 
 
 class PacketDurationTests(unittest.TestCase):
-    def packet_source(self):
+    def packet_source(self, extra_stubs=''):
         stubs = '\n'.join('static void %s(int a) {updates++;}' % name for name in (
             'update_light_state', 'update_lock_state', 'update_learn_state',
             'update_obstruction_state', 'handle_light_action', 'update_motor_state',
@@ -45,7 +45,7 @@ class PacketDurationTests(unittest.TestCase):
         return harness() + '\n#include "' + str(ROOT / 'components/gdolib/secplus.c') + '"\n' + stubs + r'''
 static void update_openings(int a,int b) {updates++;}
 static void update_paired_devices(int a,int b) {updates++;}
-''' + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
+''' + extra_stubs + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
     + function('components/gdolib/gdo.c', 'static void decode_packet(uint8_t *packet) {')
 
     def test_bad_parity_cannot_mutate_status_or_emit_events(self):
@@ -74,6 +74,33 @@ int main(void) {
  update_door_state(GDO_DOOR_STATE_MAX);
  assert(events==0);
 }''')
+
+    def test_first_obstruction_event_after_boot_requests_status_not_toggle(self):
+        run_c(self.packet_source() + r'''
+int main(void) {
+ uint8_t packet[19];
+ g_config.obst_from_status = true;
+ // At boot, obstruction starts unknown (GDO_OBSTRUCTION_STATE_MAX), not
+ // Clear. Confirmed in the field: an OBST_1/OBST_2 pair the opener sends
+ // unprompted right at boot (unrelated to any real obstruction - possibly
+ // its own power-on self-test of the photo-eye pair) toggled straight
+ // from "unknown" to "Obstructed" with the door closed and clear the
+ // whole time, since a bare toggle can't distinguish "was clear" from
+ // "never established." It should request a real status frame instead.
+ g_status.obstruction = GDO_OBSTRUCTION_STATE_MAX;
+ now = 2000000;
+ assert(encode_wireline(123, 0x123456, 0x084, packet) == 0);
+ decode_packet(packet);
+ assert(status_requests == 1 && updates == 0);
+ assert(g_status.obstruction == GDO_OBSTRUCTION_STATE_MAX);
+ // Once a real baseline is known, OBST_1 toggles exactly as before.
+ g_status.obstruction = GDO_OBSTRUCTION_STATE_CLEAR;
+ now = 4000000; // clear the 1s debounce window
+ assert(encode_wireline(124, 0x123456, 0x084, packet) == 0);
+ decode_packet(packet);
+ assert(updates == 1 && status_requests == 1);
+}
+''')
 
     def test_battery_state_string_lookup_never_reads_out_of_bounds(self):
         fn = function('components/gdolib/gdo_utils.c', 'const char* gdo_battery_state_to_string(')
