@@ -17,7 +17,12 @@ export async function onRequestGet(context) {
 }
 
 async function readCurrent(env) {
-  const pointer = await env.FIRMWARE.get("current.json");
+  let pointer;
+  try {
+    pointer = await env.FIRMWARE.get("current.json");
+  } catch {
+    return null;
+  }
   if (!pointer) return null;
   try {
     return JSON.parse(await pointer.text());
