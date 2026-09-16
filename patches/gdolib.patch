@@ -1,5 +1,5 @@
 diff --git a/gdo.c b/gdo.c
-index 1f28d1d..636e7b4 100755
+index 1f28d1d..0c12a61 100755
 --- a/gdo.c
 +++ b/gdo.c
 @@ -395,7 +395,7 @@ esp_err_t gdo_sync(void) {
@@ -111,7 +111,28 @@ index 1f28d1d..636e7b4 100755
      } else if (cmd == GDO_CMD_OBST_1) {
          if (g_status.door == GDO_DOOR_STATE_OPEN || g_status.door == GDO_DOOR_STATE_CLOSING) {
              g_status.door = GDO_DOOR_STATE_OPEN; // if the obstruction sensor tripped the door will go back to open state.
-@@ -1828,8 +1877,13 @@ static void gdo_main_task(void* arg) {
+@@ -1495,7 +1544,19 @@ static void decode_packet(uint8_t *packet) {
+          * avoids an incorrect state being reported.
+          */
+         if (g_config.obst_from_status && time_now - last_obstruction_time > 1000) {
+-            if (obst_clear_from_status) {
++            // A toggle is only meaningful once a real baseline is known. At
++            // boot g_status.obstruction starts at GDO_OBSTRUCTION_STATE_MAX
++            // (not GDO_OBSTRUCTION_STATE_CLEAR) - confirmed in the field: an
++            // OBST_1/OBST_2 pair the opener sends unprompted right at boot
++            // (unrelated to any real obstruction - possibly its own power-on
++            // self-test of the photo-eye pair) toggled straight from
++            // "unknown" to "Obstructed" with the door sitting closed and
++            // clear the whole time, since MAX != OBSTRUCTED made the ternary
++            // below pick the "was clear, now obstruct" branch. Request a
++            // real status frame instead of guessing a baseline that was
++            // never established; the STATUS handler above already knows how
++            // to set obstruction from that frame when it's still MAX.
++            if (obst_clear_from_status || g_status.obstruction == GDO_OBSTRUCTION_STATE_MAX) {
+                 get_status();
+             } else {
+                 update_obstruction_state(g_status.obstruction == GDO_OBSTRUCTION_STATE_OBSTRUCTED ? GDO_OBSTRUCTION_STATE_CLEAR : GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+@@ -1828,8 +1889,13 @@ static void gdo_main_task(void* arg) {
  /******************************* STATUS FUNCTIONS ************************************/
  
  static void update_door_state(const gdo_door_state_t door_state) {
@@ -127,7 +148,7 @@ index 1f28d1d..636e7b4 100755
  
      if (door_state == g_status.door) {
          return;
-@@ -1841,12 +1895,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1841,12 +1907,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
              start_opening = esp_timer_get_time();
          }
@@ -143,7 +164,7 @@ index 1f28d1d..636e7b4 100755
              start_opening = -1;
          }
      }
-@@ -1855,12 +1910,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1855,12 +1922,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door == GDO_DOOR_STATE_OPEN) {
              start_closing = esp_timer_get_time();
          }
@@ -158,7 +179,7 @@ index 1f28d1d..636e7b4 100755
              start_closing = -1;
          }
      }
-@@ -2099,54 +2154,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
+@@ -2099,54 +2166,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
          g_status.motor = motor_state;
          queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
  
@@ -224,7 +245,7 @@ index 1f28d1d..636e7b4 100755
          }
      }
  }
-@@ -2259,7 +2277,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
+@@ -2259,7 +2289,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
   * @param battery_state The new battery state to update to.
  */
  inline static void update_battery_state(gdo_battery_state_t battery_state) {
