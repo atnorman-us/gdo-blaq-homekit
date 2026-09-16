@@ -160,14 +160,8 @@ static esp_err_t admin_token_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, s_admin_token, HTTPD_RESP_USE_STRLEN);
 }
 
-static bool authorize_mutation(httpd_req_t *req, bool firmware = false)
+static bool authorize_mutation(httpd_req_t *req)
 {
-    if (firmware) {
-#if !defined(CONFIG_GDO_WEB_OTA) || !defined(CONFIG_SECURE_SIGNED_ON_UPDATE)
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Web OTA disabled: signed firmware configuration required");
-        return false;
-#endif
-    }
     char supplied[sizeof(s_admin_token)] = {};
     if (!s_admin_token[0] || httpd_req_get_hdr_value_len(req, "X-GDO-Token") != 64 ||
         httpd_req_get_hdr_value_str(req, "X-GDO-Token", supplied, sizeof(supplied)) != ESP_OK) {
@@ -193,7 +187,7 @@ static void delayed_restart_task(void *arg)
 
 static esp_err_t restart_post_handler(httpd_req_t *req)
 {
-    if (!authorize_mutation(req, false)) return ESP_FAIL;
+    if (!authorize_mutation(req)) return ESP_FAIL;
     ESP_LOGW(TAG, "Restart requested via diagnostics web server");
 
     httpd_resp_set_type(req, "text/plain");
@@ -232,7 +226,7 @@ static void ota_clear_pending(void)
 
 static esp_err_t firmware_update_post_handler(httpd_req_t *req)
 {
-    if (!authorize_mutation(req, true)) return ESP_FAIL;
+    if (!authorize_mutation(req)) return ESP_FAIL;
     if (req->content_len <= 0) {
         httpd_resp_send_err(req, HTTPD_411_LENGTH_REQUIRED, "Content-Length required");
         return ESP_FAIL;
@@ -341,7 +335,7 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
 
 static esp_err_t firmware_confirm_post_handler(httpd_req_t *req)
 {
-    if (!authorize_mutation(req, true)) return ESP_FAIL;
+    if (!authorize_mutation(req)) return ESP_FAIL;
     if (!s_ota_pending_partition) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No pending upload to confirm");
         return ESP_FAIL;
@@ -377,7 +371,7 @@ static esp_err_t firmware_confirm_post_handler(httpd_req_t *req)
 
 static esp_err_t firmware_cancel_post_handler(httpd_req_t *req)
 {
-    if (!authorize_mutation(req, true)) return ESP_FAIL;
+    if (!authorize_mutation(req)) return ESP_FAIL;
     // Best-effort: the uploaded image is left in place on flash (it'll just
     // get overwritten by the next upload) - this only clears the
     // server-side "waiting to be confirmed" state so a stray/late confirm
@@ -389,7 +383,7 @@ static esp_err_t firmware_cancel_post_handler(httpd_req_t *req)
 
 static esp_err_t firmware_rollback_post_handler(httpd_req_t *req)
 {
-    if (!authorize_mutation(req, true)) return ESP_FAIL;
+    if (!authorize_mutation(req)) return ESP_FAIL;
     if (s_ota_upload_in_progress) {
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "text/plain");
@@ -429,7 +423,7 @@ static esp_err_t firmware_rollback_post_handler(httpd_req_t *req)
 // enough - no need to pull in a URL-decoding helper for this.
 static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
 {
-    if (!authorize_mutation(req, false)) return ESP_FAIL;
+    if (!authorize_mutation(req)) return ESP_FAIL;
     char buf[64] = {0};
     int len = req->content_len;
     if (len <= 0 || len >= (int)sizeof(buf)) {
@@ -620,9 +614,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  </div>"
         "  <div class=\"card\">"
         "    <h2>Firmware</h2>"
-#if !defined(CONFIG_GDO_WEB_OTA)
-        "    <p>Web updates are disabled in this build. Install a signed OTA-enabled build over USB to enable them.</p>"
-#endif
         "    <div class=\"row\"><div class=\"label\"><span class=\"ic\">&#9989;</span>Running</div><span class=\"value mono\"><span id=\"fwPartition\">?</span> &middot; <span id=\"fwVersion\">?</span></span></div>"
         "    <div class=\"row\"><div class=\"label\"><span class=\"ic\">&#8635;</span>Other slot</div><span class=\"value mono\"><span id=\"fwOtherPartition\">?</span> &middot; <span id=\"fwOtherVersion\">?</span></span></div>"
         "    <div class=\"divider\"></div>"

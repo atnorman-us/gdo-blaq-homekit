@@ -39,14 +39,13 @@ int main() {
 }
 ''', cpp=True)
 
-    def test_web_authorization_and_unsigned_build_gate(self):
+    def test_web_authorization_requires_valid_token(self):
         fn = function('main/diag_webserver.cpp', 'static bool authorize_mutation(')
         prefix = r'''
 #include <cstring>
 #include <cassert>
 #include <cstddef>
 #define ESP_OK 0
-#define HTTPD_403_FORBIDDEN 403
 #define HTTPD_401_UNAUTHORIZED 401
 struct httpd_req_t { const char *token; int status; };
 static char s_admin_token[65];
@@ -61,12 +60,6 @@ int main() {
  char wrong[65]; memset(wrong,'b',64); wrong[64]=0;
  req.token=wrong; assert(!authorize_mutation(&req));
  req.token=s_admin_token; assert(authorize_mutation(&req));
-#if defined(CONFIG_GDO_WEB_OTA) && defined(CONFIG_SECURE_SIGNED_ON_UPDATE)
- assert(authorize_mutation(&req,true));
-#else
- assert(!authorize_mutation(&req,true)); assert(req.status==403);
-#endif
 }
 '''
-        for flags in ['', '#define CONFIG_GDO_WEB_OTA 1\n', '#define CONFIG_GDO_WEB_OTA 1\n#define CONFIG_SECURE_SIGNED_ON_UPDATE 1\n']:
-            run_c(flags+prefix+fn+main, cpp=True)
+        run_c(prefix+fn+main, cpp=True)
