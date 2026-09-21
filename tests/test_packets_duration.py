@@ -102,6 +102,45 @@ int main(void) {
 }
 ''')
 
+    def test_status_reconciles_obstruction_after_toggle(self):
+        source = self.packet_source().replace(
+            'static void update_obstruction_state(int a) {updates++;}',
+            function('components/gdolib/gdo.c', 'inline static void update_obstruction_state('))
+        run_c(source + r'''
+int main(void) {
+ uint8_t packet[19];
+ g_config.obst_from_status=true;
+ g_status.door=GDO_DOOR_STATE_OPEN;
+ g_status.obstruction=GDO_OBSTRUCTION_STATE_CLEAR;
+ now=2000000;
+ assert(encode_wireline(123,0x123456,0x84,packet)==0);
+ decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+ // From the field log: STATUS 0x46600181 follows OBST_1.
+ assert(encode_wireline(124,0x123456,0x46600181,packet)==0);
+ int before=events;
+ decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_CLEAR);
+ assert(events==before+1); // The clear must reach the application/HomeKit.
+ before=events; decode_packet(packet);
+ assert(events==before); // Repeated status does not produce duplicate events.
+ // A genuine blocked status must still assert obstruction immediately.
+ assert(encode_wireline(125,0x123456,0x46200181,packet)==0);
+ decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+ // Invalid packets cannot clear an obstruction.
+ assert(encode_wireline(126,0x123456,0x42600281,packet)==0);
+ packet[17]^=1; decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+ packet[17]^=1; decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_CLEAR);
+ // Do not override the separate GPIO obstruction source.
+ g_config.obst_from_status=false;
+ g_status.obstruction=GDO_OBSTRUCTION_STATE_OBSTRUCTED;
+ decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+}''')
+
     def test_battery_state_string_lookup_never_reads_out_of_bounds(self):
         fn = function('components/gdolib/gdo_utils.c', 'const char* gdo_battery_state_to_string(')
         run_c(r'''
