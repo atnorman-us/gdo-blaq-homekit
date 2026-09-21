@@ -96,7 +96,7 @@ jobs:
         gh release upload "$RELEASE_TAG" release-assets/* --clobber
 
     - name: Publish firmware to Cloudflare R2
-      if: ${{ !github.event.release.prerelease && secrets.CLOUDFLARE_API_TOKEN != '' }}
+      if: ${{ !github.event.release.prerelease }}
       continue-on-error: true
       env:
         CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
