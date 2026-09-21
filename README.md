@@ -2,21 +2,11 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.1.9](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.1.9)**
+**Current release: [1.3.1.10](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.1.10)**
 
-## What's changed in 1.3.1.9
+## What's changed in 1.3.1.10
 
-- Reject invalid Security+ 2.0 packets before they can change device state. Validate door, battery, and paired-device fields, and log rejected frames for diagnosis.
-- Correct battery-state string handling and travel-time learning after a stopped or reversed movement.
-- Infer wall-control movement from the last settled door position, and limit a command that never starts to one retry.
-- Run the five-second close warning outside the HomeKit request thread. A later Open command can cancel a pending close; a new Close can be accepted after cancellation. Recheck synchronization and obstruction before closing.
-- Revalidate automatic closes after their warning, including changes to settings and newer commands.
-- Apply obstruction changes immediately, without requiring duplicate events or clearing a real obstruction on a timer. When the initial obstruction state is unknown, request status instead of guessing from a toggle event.
-- Request fresh status when the driver is already synchronized; start synchronization when it is not.
-- Remove the ineffective delayed HomeKit resend: the SDK suppresses notifications for unchanged values.
-- Require an admin password for settings, restart, firmware operations, and logs. Mask password entry, remove WiFi credentials from logs, and reject oversized provisioning input.
-- Show a pairing-fault indication after sustained synchronization failure. This signals a condition to investigate; it does not prove that the opener has forgotten the controller.
-- Build combined firmware using ESP-IDF's actual flash offsets, including OTA metadata. Apply dependency fixes automatically during configuration.
+- Reconcile obstruction state from every validated status frame, not only when the baseline is unknown or right after a toggle event. An obstruction toggle event can go stale if its matching event frame is lost to RX noise; the following status frame's obstruction bit now corrects it instead of leaving the stale reading in place.
 
 ## Build from source
 

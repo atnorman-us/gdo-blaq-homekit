@@ -1,5 +1,5 @@
 diff --git a/gdo.c b/gdo.c
-index 1f28d1d..0c12a61 100755
+index 1f28d1d..94bbc82 100755
 --- a/gdo.c
 +++ b/gdo.c
 @@ -395,7 +395,7 @@ esp_err_t gdo_sync(void) {
@@ -79,7 +79,7 @@ index 1f28d1d..0c12a61 100755
  
      data &= ~0xf000;
  
-@@ -1451,6 +1487,10 @@ static void decode_packet(uint8_t *packet) {
+@@ -1451,12 +1487,17 @@ static void decode_packet(uint8_t *packet) {
      ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
  
      if (cmd == GDO_CMD_STATUS) {
@@ -90,7 +90,16 @@ index 1f28d1d..0c12a61 100755
          update_door_state((gdo_door_state_t)nibble);
          update_light_state((gdo_light_state_t)((byte2 >> 1) & 1));
          update_lock_state((gdo_lock_state_t)(byte2 & 1));
-@@ -1476,9 +1516,18 @@ static void decode_packet(uint8_t *packet) {
+         update_learn_state((gdo_learn_state_t)((byte2 >> 5) & 1));
+-        if (g_config.obst_from_status &&
+-            (g_status.obstruction == GDO_OBSTRUCTION_STATE_MAX || obst_clear_from_status)) {
++        // Reconcile every validated status: an event toggle can become stale
++        // if its matching event is missed. The status bit is the current state.
++        if (g_config.obst_from_status) {
+             update_obstruction_state((gdo_obstruction_state_t)((byte1 >> 6) & 1));
+             if (g_status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
+                 obst_clear_from_status = false;
+@@ -1476,9 +1517,18 @@ static void decode_packet(uint8_t *packet) {
      } else if (cmd == GDO_CMD_SET_TTC) {
          update_ttc((byte1 << 8) | byte2);
      } else if (cmd == GDO_CMD_PAIRED_DEVICES) {
@@ -111,7 +120,7 @@ index 1f28d1d..0c12a61 100755
      } else if (cmd == GDO_CMD_OBST_1) {
          if (g_status.door == GDO_DOOR_STATE_OPEN || g_status.door == GDO_DOOR_STATE_CLOSING) {
              g_status.door = GDO_DOOR_STATE_OPEN; // if the obstruction sensor tripped the door will go back to open state.
-@@ -1495,7 +1544,19 @@ static void decode_packet(uint8_t *packet) {
+@@ -1495,7 +1545,19 @@ static void decode_packet(uint8_t *packet) {
           * avoids an incorrect state being reported.
           */
          if (g_config.obst_from_status && time_now - last_obstruction_time > 1000) {
@@ -132,7 +141,7 @@ index 1f28d1d..0c12a61 100755
                  get_status();
              } else {
                  update_obstruction_state(g_status.obstruction == GDO_OBSTRUCTION_STATE_OBSTRUCTED ? GDO_OBSTRUCTION_STATE_CLEAR : GDO_OBSTRUCTION_STATE_OBSTRUCTED);
-@@ -1828,8 +1889,13 @@ static void gdo_main_task(void* arg) {
+@@ -1828,8 +1890,13 @@ static void gdo_main_task(void* arg) {
  /******************************* STATUS FUNCTIONS ************************************/
  
  static void update_door_state(const gdo_door_state_t door_state) {
@@ -148,7 +157,7 @@ index 1f28d1d..0c12a61 100755
  
      if (door_state == g_status.door) {
          return;
-@@ -1841,12 +1907,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1841,12 +1908,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
              start_opening = esp_timer_get_time();
          }
@@ -164,7 +173,7 @@ index 1f28d1d..0c12a61 100755
              start_opening = -1;
          }
      }
-@@ -1855,12 +1922,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1855,12 +1923,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door == GDO_DOOR_STATE_OPEN) {
              start_closing = esp_timer_get_time();
          }
@@ -179,7 +188,7 @@ index 1f28d1d..0c12a61 100755
              start_closing = -1;
          }
      }
-@@ -2099,54 +2166,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
+@@ -2099,54 +2167,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
          g_status.motor = motor_state;
          queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
  
@@ -245,7 +254,7 @@ index 1f28d1d..0c12a61 100755
          }
      }
  }
-@@ -2259,7 +2289,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
+@@ -2259,7 +2290,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
   * @param battery_state The new battery state to update to.
  */
  inline static void update_battery_state(gdo_battery_state_t battery_state) {
