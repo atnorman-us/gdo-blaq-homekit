@@ -75,6 +75,47 @@ int main(void) {
  assert(events==0);
 }''')
 
+    def test_oversized_reads_resync_on_start_signature(self):
+        # Field logs: during motor/light activity a read arrives as 21 bytes
+        # (1 leading break byte + 19-byte packet + 1 trailing byte). Dumping
+        # (size - 19) bytes from the FRONT also dumped the 0x55 start byte,
+        # so the valid packet was rejected as a "signature error" of
+        # exactly 0x01 0x00 xx (the shifted header) every time.
+        stub = 'static void print_buffer(int p, uint8_t *b, bool tx) {(void)p;(void)b;(void)tx;}\n'
+        run_c(self.packet_source(stub) + function('components/gdolib/gdo.c', 'static int decode_rx_stream(') + r'''
+static void reset(void) { g_status.door = GDO_DOOR_STATE_CLOSED; events = updates = 0; now = 1000000; }
+int main(void) {
+ uint8_t pkt[19], buf[64], pkt2[19];
+ assert(encode_wireline(123, 0x123456, 0x181, pkt) == 0);   // STATUS: door Open
+ assert(encode_wireline(124, 0x123456, 0x181, pkt2) == 0);
+ assert(pkt[0] == 0x55 && pkt[1] == 0x01 && pkt[2] == 0x00);
+
+ // Each shape must decode the packet exactly once and update the door.
+ struct { int lead, trail; } shapes[] = {{0,0},{1,0},{2,0},{0,1},{1,1},{1,2},{3,3}};
+ for (unsigned i = 0; i < sizeof(shapes)/sizeof(shapes[0]); ++i) {
+  reset(); memset(buf, 0, sizeof(buf));
+  memcpy(buf + shapes[i].lead, pkt, 19);
+  size_t len = shapes[i].lead + 19 + shapes[i].trail;
+  assert(decode_rx_stream(buf, len, 19) == 1);
+  assert(g_status.door == GDO_DOOR_STATE_OPEN);
+ }
+
+ // Two packets in one read both decode.
+ reset(); memset(buf, 0, sizeof(buf));
+ memcpy(buf + 1, pkt, 19); memcpy(buf + 21, pkt2, 19);
+ assert(decode_rx_stream(buf, 41, 19) == 2);
+
+ // No start signature anywhere: nothing decoded, state untouched.
+ reset(); memset(buf, 0xAA, sizeof(buf));
+ assert(decode_rx_stream(buf, 21, 19) == 0);
+ assert(g_status.door == GDO_DOOR_STATE_CLOSED && events == 0 && updates == 0);
+
+ // A start signature too close to the end to hold a whole packet is ignored.
+ reset(); memset(buf, 0, sizeof(buf));
+ memcpy(buf + 5, pkt, 19);
+ assert(decode_rx_stream(buf, 20, 19) == 0);
+}''')
+
     def test_first_obstruction_event_after_boot_requests_status_not_toggle(self):
         run_c(self.packet_source() + r'''
 int main(void) {

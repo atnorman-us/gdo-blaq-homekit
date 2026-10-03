@@ -1,5 +1,5 @@
 diff --git a/gdo.c b/gdo.c
-index 1f28d1d..94bbc82 100755
+index 1f28d1d..0303aca 100755
 --- a/gdo.c
 +++ b/gdo.c
 @@ -395,7 +395,7 @@ esp_err_t gdo_sync(void) {
@@ -141,7 +141,81 @@ index 1f28d1d..94bbc82 100755
                  get_status();
              } else {
                  update_obstruction_state(g_status.obstruction == GDO_OBSTRUCTION_STATE_OBSTRUCTED ? GDO_OBSTRUCTION_STATE_CLEAR : GDO_OBSTRUCTION_STATE_OBSTRUCTED);
-@@ -1828,8 +1890,13 @@ static void gdo_main_task(void* arg) {
+@@ -1513,6 +1575,47 @@ static void decode_packet(uint8_t *packet) {
+     }
+ }
+ 
++/**
++ * @brief Finds and decodes every complete V2 packet inside one UART read.
++ *
++ * A read can hold extra bytes beyond the 19-byte packet: the break is
++ * sometimes read as a leading 0x00, and - confirmed in the field, only
++ * while the motor or light is running, when frames arrive back to back -
++ * a stray byte can also land AFTER the packet. The old handling assumed
++ * every extra byte was leading and just discarded (size - 19) bytes from
++ * the front, so a 21-byte read (1 leading + packet + 1 trailing) threw
++ * away the 0x55 start byte too, leaving a perfectly valid packet shifted
++ * by one and rejected as an "RX data signature error" (always
++ * 0x01 0x00 xx - the shifted header - never random garbage). Locate each
++ * packet by its 0x55 0x01 0x00 start signature instead.
++ *
++ * @return Number of packets decoded (0 means no start signature was found).
++*/
++static int decode_rx_stream(uint8_t *buf, size_t len, size_t packet_size) {
++    static const uint8_t signature[3] = {0x55, 0x01, 0x00};
++    int decoded = 0;
++    size_t pos = 0;
++
++    while (pos + packet_size <= len) {
++        size_t off = pos;
++        while (off + packet_size <= len && memcmp(buf + off, signature, sizeof(signature)) != 0) {
++            ++off;
++        }
++        if (off + packet_size > len) {
++            break;
++        }
++        if (decoded == 0 && off + packet_size != len) {
++            ESP_LOGW(TAG, "Re-synced RX framing: packet at offset %u of %u bytes",
++                     (unsigned)off, (unsigned)len);
++        }
++        print_buffer(g_status.protocol, buf + off, false);
++        decode_packet(buf + off);
++        ++decoded;
++        pos = off + packet_size;
++    }
++    return decoded;
++}
++
+ /**
+  * @brief Main task that handles all the events from the UART and other tasks.
+ */
+@@ -1620,6 +1723,25 @@ static void gdo_main_task(void* arg) {
+ 
+                     if (rx_packet_size > GDO_PACKET_SIZE) {
+                         ESP_LOGW(TAG, "Oversized packet received: %u bytes, messages pending: %u", rx_packet_size, rx_pending);
++
++                        if (rx_pending == 1 && rx_packet_size <= sizeof(rx_buffer)) {
++                            // One break, one read: take the whole read and find the
++                            // packet by its start signature rather than assuming
++                            // where the extra bytes are - see decode_rx_stream().
++                            int got = uart_read_bytes(g_config.uart_num, rx_buffer, rx_packet_size, 0);
++                            rx_pending = 0;
++                            if (got != (int)rx_packet_size) {
++                                ESP_LOGI(TAG, "RX buffer read error, flushing");
++                                uart_flush(g_config.uart_num);
++                                break;
++                            }
++                            if (decode_rx_stream(rx_buffer, rx_packet_size, GDO_PACKET_SIZE) == 0) {
++                                ESP_LOGE(TAG, "RX data signature error: 0x%02x%02x%02x (%u bytes)",
++                                         rx_buffer[0], rx_buffer[1], rx_buffer[2], rx_packet_size);
++                            }
++                            break;
++                        }
++
+                         // Sometimes the break is interperated as a 0 byte and added to the packet
+                         // So lets just dump the first byte(s) until we have our packet size.
+                         while (rx_packet_size > GDO_PACKET_SIZE) {
+@@ -1828,8 +1950,13 @@ static void gdo_main_task(void* arg) {
  /******************************* STATUS FUNCTIONS ************************************/
  
  static void update_door_state(const gdo_door_state_t door_state) {
@@ -157,7 +231,7 @@ index 1f28d1d..94bbc82 100755
  
      if (door_state == g_status.door) {
          return;
-@@ -1841,12 +1908,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1841,12 +1968,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
              start_opening = esp_timer_get_time();
          }
@@ -173,7 +247,7 @@ index 1f28d1d..94bbc82 100755
              start_opening = -1;
          }
      }
-@@ -1855,12 +1923,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1855,12 +1983,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door == GDO_DOOR_STATE_OPEN) {
              start_closing = esp_timer_get_time();
          }
@@ -188,7 +262,7 @@ index 1f28d1d..94bbc82 100755
              start_closing = -1;
          }
      }
-@@ -2099,54 +2167,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
+@@ -2099,54 +2227,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
          g_status.motor = motor_state;
          queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
  
@@ -254,7 +328,7 @@ index 1f28d1d..94bbc82 100755
          }
      }
  }
-@@ -2259,7 +2290,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
+@@ -2259,7 +2350,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
   * @param battery_state The new battery state to update to.
  */
  inline static void update_battery_state(gdo_battery_state_t battery_state) {
