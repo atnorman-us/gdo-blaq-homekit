@@ -35,7 +35,7 @@
     <ul class="caveats">
       <li>Not certified by Apple.</li>
       <li>Requires an Apple Home hub (HomePod or Apple TV) running the latest software.</li>
-      <li>Replaces the device's current firmware entirely, including a stock ESPHome build.</li>
+      <li>Replaces the device's current firmware entirely, including a stock ESPHome build, and erases saved WiFi, HomeKit pairing and settings. Already running this firmware? <a href="#update">Update without losing them</a> instead.</li>
       <li>Source: <a href="https://github.com/atnorman-us/gdo-blaq-homekit" target="_blank" rel="noopener">github.com/atnorman-us/gdo-blaq-homekit</a></li>
     </ul>
 
@@ -53,6 +53,18 @@
         <a href="https://github.com/atnorman-us/gdo-blaq-homekit/releases" target="_blank" rel="noopener">GitHub Releases page</a> instead.
       </p>
     </div>
+  </section>
+
+  <section class="card update-card" id="update">
+    <h2>Already running this firmware? Update without losing settings</h2>
+    <p>The full install above erases your saved WiFi, HomeKit pairing and settings. To keep them, download the update file and upload it from the device's own diagnostics page instead.</p>
+    <p><a class="btn-link" id="ota-download" href="https://github.com/atnorman-us/gdo-blaq-homekit/releases/latest" target="_blank" rel="noopener">Download update file (.bin)</a></p>
+    <ol>
+      <li>Open <code>http://gdo-blaq.local:8080/</code> on the same network as the device, or <code>http://&lt;device-ip&gt;:8080/</code> if that name doesn't resolve.</li>
+      <li>In the <strong>Firmware</strong> section, choose the downloaded file and select <strong>Upload</strong>. Enter your admin password when asked.</li>
+      <li>Check the version shown, then select <strong>Confirm &amp; Reboot</strong>.</li>
+    </ol>
+    <p class="update-note">Use the file ending in <code>-ota.bin</code>. The larger <code>konnected-…</code> file is for a full USB install and won't work in the dashboard uploader.</p>
   </section>
 
   <section class="card steps-card">
