@@ -35,9 +35,14 @@
     <ul class="caveats">
       <li>Not certified by Apple.</li>
       <li>Requires an Apple Home hub (HomePod or Apple TV) running the latest software.</li>
-      <li>Replaces the device's current firmware entirely, including a stock ESPHome build, and erases saved WiFi, HomeKit pairing and settings. Already running this firmware? <a href="#update">Update without losing them</a> instead.</li>
+      <li>Replaces the device's current firmware entirely, including a stock ESPHome build, and erases saved WiFi, HomeKit pairing and settings.</li>
       <li>Source: <a href="https://github.com/atnorman-us/gdo-blaq-homekit" target="_blank" rel="noopener">github.com/atnorman-us/gdo-blaq-homekit</a></li>
     </ul>
+
+    <a class="update-callout" href="#update">
+      <strong>Already running this firmware?</strong>
+      <span>Update without losing your WiFi, HomeKit pairing or settings &rarr;</span>
+    </a>
 
     <div class="install-row">
       <esp-web-install-button id="install-button" manifest="/firmware/manifest.json">
@@ -56,6 +61,7 @@
   </section>
 
   <section class="card update-card" id="update">
+    <p class="eyebrow">Keeps your settings</p>
     <h2>Already running this firmware? Update without losing settings</h2>
     <p>The full install above erases your saved WiFi, HomeKit pairing and settings. To keep them, download the update file and upload it from the device's own diagnostics page instead.</p>
     <p><a class="btn-link" id="ota-download" href="https://github.com/atnorman-us/gdo-blaq-homekit/releases/latest" target="_blank" rel="noopener">Download update file (.bin)</a></p>
