@@ -1,11 +1,76 @@
 """Characterize the SDK event boundary behind door-state notifications."""
 import unittest
-from test_regressions import function, run_c
+from test_regressions import ROOT, function, run_c
 
 SDK = 'esp-homekit-sdk/components/homekit/esp_hap_core/src/esp_hap_char.c'
 
 
 class HomeKitNotificationTests(unittest.TestCase):
+    def test_learn_mode_depends_on_identified_protocol_not_full_sync(self):
+        source = (ROOT / 'main/homekit.cpp').read_text()
+        start = source.index('    gdo_status_t st = {};')
+        end = source.index('    homekit_notif_queue_init();', start)
+        learn_mode_decision = source[start:end]
+
+        run_c(r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#define ESP_OK 0
+#define ESP_LOGW(...) ((void)0)
+#define pdMS_TO_TICKS(ms) (ms)
+enum {
+ GDO_PROTOCOL_UNKNOWN = 0,
+ GDO_PROTOCOL_SEC_PLUS_V1 = 1,
+ GDO_PROTOCOL_SEC_PLUS_V2 = 2,
+ GDO_PROTOCOL_MAX = 4,
+};
+struct gdo_status_t { int protocol; };
+static bool learn_supported;
+static bool sync_result;
+static bool protocol_identified;
+static int reported_protocol;
+static bool gdo_wait_for_sync(unsigned int) { return sync_result; }
+static bool gdo_wait_for_identified_protocol(unsigned int, gdo_status_t *status) {
+ status->protocol = reported_protocol;
+ return protocol_identified;
+}
+static void vTaskDelay(unsigned int) {}
+static int gdo_get_status(gdo_status_t *status) {
+ status->protocol = reported_protocol;
+ return 0;
+}
+static const char *gdo_protocol_type_to_string(int) { return "test"; }
+static void decide_learn_mode(void) {
+''' + learn_mode_decision + r'''
+}
+int main(void) {
+ sync_result = false;
+ protocol_identified = true;
+ reported_protocol = GDO_PROTOCOL_SEC_PLUS_V2;
+ decide_learn_mode();
+ assert(learn_supported);
+
+ sync_result = true;
+ protocol_identified = true;
+ reported_protocol = GDO_PROTOCOL_SEC_PLUS_V1;
+ decide_learn_mode();
+ assert(!learn_supported);
+
+ sync_result = false;
+ protocol_identified = false;
+ reported_protocol = GDO_PROTOCOL_UNKNOWN;
+ decide_learn_mode();
+ assert(!learn_supported);
+
+ sync_result = false;
+ protocol_identified = false;
+ reported_protocol = GDO_PROTOCOL_SEC_PLUS_V2;
+ decide_learn_mode();
+ assert(!learn_supported);
+}
+''', cpp=True)
+
     def test_repeated_readable_door_state_does_not_enqueue_an_event(self):
         # Compile the real SDK comparison and enqueue routines. Only FreeRTOS
         # queue/interrupt primitives are replaced at the host boundary.

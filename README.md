@@ -2,11 +2,11 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.1.11](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.1.11)**
+**Current release: [1.3.1.12](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.1.12)**
 
-## What's changed in 1.3.1.11
+## What's changed in 1.3.1.12
 
-- Fix valid status packets being dropped as "RX data signature errors" while the motor or light is running. A UART read can contain a stray byte after the 19-byte packet as well as the usual leading break byte; the old framing assumed every extra byte was leading and discarded the packet's `0x55` start byte, so the packet was rejected. Packets are now located by their start signature, so Opening/Closing and other status updates are no longer lost mid-transition.
+- Fix the HomeKit Learn Mode switch being omitted when Security+ 2.0 rolling-code recovery takes longer than the startup sync timeout. HomeKit now waits only until the opener protocol is identified, so Security+ 2.0 openers register Learn Mode without waiting for the full paired-device synchronization sequence.
 
 ## Build from source
 

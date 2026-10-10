@@ -24,8 +24,10 @@ static const char *TAG = "HOMEKIT";
 #include "pre_close_warning.h"
 #include "gdo_settings.h"
 
-// Defined in gdo-blaq-homekit.cpp - blocks until real GDO sync completes.
-extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms);
+// Defined in gdo-blaq-homekit.cpp - blocks until a received GDO event
+// confirms the protocol, without waiting for the full sync sequence.
+extern "C" bool gdo_wait_for_identified_protocol(uint32_t timeout_ms,
+                                                   gdo_status_t *status);
 
 extern "C" {
     #include "esp_wifi.h"
@@ -304,36 +306,24 @@ void homekit_task_entry(void* ctx) {
     hap_serv_t *lock_svc;
 
     // Learn Mode must be decided before the accessory is finalized below -
-    // HAP's service database can't change after hap_start(). Block briefly
-    // for real GDO sync so we know the actual protocol rather than reading
-    // gdo_get_status() before sync has had any chance to complete (it needs
-    // real UART round-trips with the opener, which haven't happened yet
-    // this early in the task). Confirmed via testing: Sec+1.0 openers
-    // return ESP_ERR_NOT_SUPPORTED (262) from gdo_activate_learn(), so this
-    // is now an evidence-based gate, not an assumption.
+    // HAP's service database can't change after hap_start(). Wait only for
+    // gdolib to identify the protocol; full sync can take much longer while
+    // Security+ 2.0 rolling-code recovery runs, but that does not change
+    // whether the opener supports Learn Mode. Confirmed via testing:
+    // Sec+1.0 openers return ESP_ERR_NOT_SUPPORTED (262) from
+    // gdo_activate_learn(), so this remains an evidence-based gate.
     //
-    // Timeout is 32s, not a few seconds, because gdolib's own protocol
-    // auto-detection (try V1, fall back to V2 emulation on failure) can
-    // itself take 10+ seconds on real Sec+2.0 hardware - confirmed via a
-    // real capture where full sync didn't complete until ~10.4s. An 8s
-    // timeout previously hid Learn on hardware that genuinely supports it.
-    // Bumped from 20s to 25s after a capture where the first sync
-    // attempt failed (bad rolling code) and the retry re-ran the whole
-    // ~7.5s V1-detection sequence a second time, pushing real sync past 22s.
-    // Bumped again from 25s to 32s after a capture where BOTH retry fixes
-    // (protocol persisted across retries, scaled rolling-code jump) were
-    // confirmed working exactly as designed - closing a real ~750-unit
-    // gap in the minimum 3 rounds required - and sync still only missed
-    // the 25s timeout by 310ms. This time leaving real margin (~6s)
-    // rather than a tight one, since a near-miss at the previous "safe"
-    // value shows tight margins keep getting found by real hardware.
-    gdo_status_t st;
-    bool gdo_synced = gdo_wait_for_sync(32000);
-    gdo_get_status(&st);
-    learn_supported = gdo_synced && (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
+    // Keep the previous 32-second upper bound for genuinely unknown
+    // hardware, but return as soon as either V1 or V2 is identified. This
+    // avoids delaying WiFi/HomeKit startup for the paired-device portion of
+    // sync and, critically, avoids hiding Learn Mode merely because rolling
+    // code recovery finishes after this deadline.
+    gdo_status_t st = {};
+    bool protocol_known = gdo_wait_for_identified_protocol(32000, &st);
+    learn_supported = protocol_known && (st.protocol == GDO_PROTOCOL_SEC_PLUS_V2);
 
-    if (!gdo_synced) {
-        ESP_LOGW(TAG, "GDO sync did not complete within timeout - hiding Learn Mode tile as a safe default");
+    if (!protocol_known) {
+        ESP_LOGW(TAG, "GDO protocol was not identified within timeout - hiding Learn Mode tile as a safe default");
     } else if (!learn_supported) {
         ESP_LOGW(TAG, "Learn Mode not supported on protocol %s - tile hidden",
                  gdo_protocol_type_to_string(st.protocol));
@@ -431,8 +421,8 @@ void homekit_task_entry(void* ctx) {
 
     hap_start();
 
-    // Learn Mode support is now decided early (see gdo_wait_for_sync() call
-    // near the top of this function), before hap_add_accessory()/hap_start()
+    // Learn Mode support is now decided early (see the protocol-identification
+    // wait near the top of this function), before hap_add_accessory()/hap_start()
     // finalize the service database. That's the only point it can actually
     // affect whether the tile exists - deciding it here (after hap_start())
     // would be a no-op, which is the mistake this comment used to document.

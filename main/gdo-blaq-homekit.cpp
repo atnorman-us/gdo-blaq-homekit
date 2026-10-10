@@ -186,6 +186,8 @@ static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 // real protocol is known, instead of reading gdo_get_status() before sync
 // has had any chance to run.
 static SemaphoreHandle_t s_gdo_synced_sem = nullptr;
+static SemaphoreHandle_t s_gdo_protocol_identified_sem = nullptr;
+static volatile bool     s_gdo_protocol_identified = false;
 static volatile int64_t          s_last_status_event_ms = 0;
 static volatile bool             s_door_in_transition   = false;
 static volatile int64_t          s_transition_start_ms  = 0;
@@ -867,6 +869,38 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
     // detect a fully dead link vs. a door that's just legitimately idle.
     s_last_status_event_ms = now_ms();
 
+    // g_status.protocol is also used internally by gdolib to select the
+    // protocol it is currently probing, so a non-zero value alone is not
+    // proof that an opener answered. Only events produced from received GDO
+    // state (or a successful sync-complete event) confirm the protocol. Keep
+    // local-only obstruction updates out of this list: the GPIO sensor can
+    // change even when no opener is connected.
+    bool protocol_evidence = status->synced;
+    switch (event) {
+    case GDO_CB_EVENT_DOOR_POSITION:
+    case GDO_CB_EVENT_LIGHT:
+    case GDO_CB_EVENT_LOCK:
+    case GDO_CB_EVENT_LEARN:
+    case GDO_CB_EVENT_MOTOR:
+    case GDO_CB_EVENT_BUTTON:
+    case GDO_CB_EVENT_MOTION:
+    case GDO_CB_EVENT_OPENINGS:
+    case GDO_CB_EVENT_TTC:
+    case GDO_CB_EVENT_PAIRED_DEVICES:
+    case GDO_CB_EVENT_BATTERY:
+        protocol_evidence = true;
+        break;
+    default:
+        break;
+    }
+    if (protocol_evidence && status->protocol > 0 &&
+        status->protocol < GDO_PROTOCOL_MAX && !s_gdo_protocol_identified) {
+        s_gdo_protocol_identified = true;
+        if (s_gdo_protocol_identified_sem) {
+            xSemaphoreGive(s_gdo_protocol_identified_sem);
+        }
+    }
+
     switch (event) {
 
     case GDO_CB_EVENT_SYNCED:
@@ -1444,6 +1478,28 @@ extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms)
     return xSemaphoreTake(s_gdo_synced_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
+// Waits for positive protocol evidence rather than g_status.protocol alone.
+// gdolib temporarily sets protocol=V2 while probing silent/unknown hardware,
+// so treating that enum as confirmation would incorrectly expose Learn Mode.
+extern "C" bool gdo_wait_for_identified_protocol(uint32_t timeout_ms,
+                                                   gdo_status_t *status)
+{
+    if (!status || !s_gdo_protocol_identified_sem) {
+        return false;
+    }
+    if (!s_gdo_protocol_identified &&
+        xSemaphoreTake(s_gdo_protocol_identified_sem,
+                       pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        gdo_get_status(status);
+        return false;
+    }
+    if (gdo_get_status(status) != ESP_OK) {
+        return false;
+    }
+    return s_gdo_protocol_identified && status->protocol > 0 &&
+           status->protocol < GDO_PROTOCOL_MAX;
+}
+
 extern "C" void app_main(void)
 {
     // Required before any nvs_open() call - this is the top-level entry
@@ -1474,6 +1530,9 @@ extern "C" void app_main(void)
     gdo_conf.obst_in_pin    = GPIO_NUM_5;
 
     s_gdo_synced_sem = xSemaphoreCreateBinary();
+    s_gdo_protocol_identified_sem = xSemaphoreCreateBinary();
+    configASSERT(s_gdo_synced_sem);
+    configASSERT(s_gdo_protocol_identified_sem);
 
     // Sets up the onboard buzzer (GPIO4) and LED (GPIO3) used by the
     // UL-325 pre-close warning in homekit.cpp's gdo_svc_set(). Independent
