@@ -64,6 +64,15 @@ Use the dashboard's log controls to supply authentication automatically. API cli
 
 The dashboard includes door/light/lock state, motion and obstruction, battery status, lifetime openings, WiFi signal and IP address, memory, HomeKit sessions, reset reason, RX errors, auto-close settings, firmware controls, and a log buffer of approximately 64 KB. A pairing-fault banner appears after prolonged sync failure.
 
+## Scheduled close
+
+Off by default. On the diagnostics page, **Scheduled Close** closes the garage door at a set time of day (for example 23:00 every night) if the door is open at that time. It uses the same beep-and-flash warning as Auto-Close, which plays before the door closes.
+
+- **Time sync:** the device gets the time over Wi-Fi from `pool.ntp.org`. Until it has synced, the schedule does nothing and the card shows "Clock not synced yet".
+- **Timezone:** choose **Use browser timezone**, or enter a POSIX timezone string such as `PST8PDT,M3.2.0,M11.1.0`. **Use browser timezone** only recognizes about 20 common zones, so use a POSIX string for any other zone.
+- **Timing:** the close runs at most once per night. The door must already be open when the set time arrives, but the close can be picked up during the following five minutes (for example, after a brief Wi-Fi drop). A door that was closed at the set time, or opened after it, is left alone until the next night. A device reboot during that window skips that night's close.
+- **Obstruction:** if the obstruction sensor is not clear, the close is skipped and retried for the rest of the five-minute window.
+
 ## Updating firmware over the air (OTA)
 
 Download files from the [GitHub releases page](https://github.com/atnorman-us/gdo-blaq-homekit/releases).
