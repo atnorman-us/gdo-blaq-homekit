@@ -24,6 +24,8 @@
 
 #include "gdo.h"
 #include "gdo_settings.h"
+#include "close_schedule.h"
+#include "clock_sync.h"
 #include "diagnostics_counters.h"
 
 // Small read-only accessors defined alongside the state they own, so this
@@ -526,6 +528,56 @@ static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
 }
 
+// Body: application/x-www-form-urlencoded, e.g.
+// "enabled=1&time=23%3A00&tz=PST8PDT%2CM3.2.0%2CM11.1.0". The timezone can
+// contain characters the browser percent-encodes, so this one does use the
+// decoding parser in form_parse.h (unlike the auto-close handler above).
+static esp_err_t close_schedule_post_handler(httpd_req_t *req)
+{
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    char buf[256] = {0};
+    int len = req->content_len;
+    if (len <= 0 || len >= (int)sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad request body");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < len) {
+        int n = httpd_req_recv(req, buf + received, len - received);
+        if (n <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+            return ESP_FAIL;
+        }
+        received += n;
+    }
+    buf[received] = '\0';
+
+    gdo_close_schedule_t sched;
+    switch (close_schedule_parse_form(buf, &sched)) {
+    case CLOSE_SCHEDULE_FORM_OK:
+        break;
+    case CLOSE_SCHEDULE_FORM_BAD_TIME:
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Time must be HH:MM (00:00-23:59)");
+        return ESP_FAIL;
+    default:
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid timezone string");
+        return ESP_FAIL;
+    }
+
+    if (gdo_set_close_schedule(&sched) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Close schedule updated via web: enabled=%s, %02u:%02u, tz=%s",
+             sched.enabled ? "true" : "false",
+             (unsigned)(sched.minute / 60), (unsigned)(sched.minute % 60), sched.tz);
+
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t favicon_get_handler(httpd_req_t *req)
 {
     // No actual icon - just answer with an empty 204 instead of a 404 so
@@ -604,8 +656,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "button.ghost-danger{background:transparent;border-color:var(--bad);color:var(--bad);}"
         "button.ghost-danger:hover{background:var(--bad-soft);}"
         "button:disabled{opacity:.45;cursor:not-allowed;}"
-        "input[type=\"number\"],input[type=\"file\"],input[type=\"password\"]{font-family:inherit;font-size:13px;border:1px solid var(--line);border-radius:6px;padding:6px 9px;background:var(--bg);color:var(--ink);}"
+        "input[type=\"number\"],input[type=\"time\"],input[type=\"text\"],input[type=\"file\"],input[type=\"password\"]{font-family:inherit;font-size:13px;border:1px solid var(--line);border-radius:6px;padding:6px 9px;background:var(--bg);color:var(--ink);}"
         "input[type=\"number\"]{width:64px;}"
+        "input[type=\"text\"]{width:190px;}"
         "input[type=\"password\"]{width:100%;box-sizing:border-box;margin-top:8px;}"
         "#pwPromptOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;}"
         "#pwPromptOverlay .card{width:280px;max-width:calc(100vw - 32px);}"
@@ -695,6 +748,28 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "      <span id=\"acStatus\" class=\"hint\"></span>"
         "    </div>"
         "    <div id=\"acCountdown\" class=\"hint\"></div>"
+        "  </div>"
+        "  <div class=\"card\">"
+        "    <h2>Scheduled Close</h2>"
+        "    <div class=\"row\">"
+        "      <div class=\"label\"><span class=\"ic\">&#128337;</span>Enabled</div>"
+        "      <label class=\"switch\"><input type=\"checkbox\" id=\"scEnabled\"><span class=\"track\"></span></label>"
+        "    </div>"
+        "    <div class=\"row\">"
+        "      <div class=\"label\"><span class=\"ic\">&#9200;</span>Close at</div>"
+        "      <span class=\"value mono\"><input type=\"time\" id=\"scTime\" value=\"23:00\"></span>"
+        "    </div>"
+        "    <div class=\"row\">"
+        "      <div class=\"label\"><span class=\"ic\">&#127758;</span>Timezone</div>"
+        "      <span class=\"value mono\"><input type=\"text\" id=\"scTz\" maxlength=\"63\" placeholder=\"PST8PDT,M3.2.0,M11.1.0\"></span>"
+        "    </div>"
+        "    <div class=\"divider\"></div>"
+        "    <div class=\"btnrow\">"
+        "      <button class=\"primary\" onclick=\"saveSchedule()\">Save</button>"
+        "      <button onclick=\"useBrowserTz()\">Use browser timezone</button>"
+        "      <span id=\"scStatus\" class=\"hint\"></span>"
+        "    </div>"
+        "    <div id=\"scInfo\" class=\"hint\"></div>"
         "  </div>"
         "  <div class=\"card\">"
         "    <h2>Firmware</h2>"
@@ -836,6 +911,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    }"
         "    acRemainingS = (typeof s.auto_close_remaining_s === 'number') ? s.auto_close_remaining_s : null;"
         "    renderCountdown();"
+        "    if (!scLoaded) {"
+        "      document.getElementById('scEnabled').checked = !!s.close_schedule_enabled;"
+        "      document.getElementById('scTime').value = s.close_schedule_time || '23:00';"
+        "      document.getElementById('scTz').value = s.timezone || 'UTC0';"
+        "      scLoaded = true;"
+        "    }"
+        "    renderScheduleInfo(s);"
         "    document.getElementById('fwPartition').textContent = s.running_partition || '?';"
         "    document.getElementById('fwVersion').textContent = s.fw_version || '?';"
         "    document.getElementById('fwOtherPartition').textContent = s.other_partition || '?';"
@@ -899,6 +981,53 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    setTimeout(function(){ statusEl.textContent = ''; }, 3000);"
         "  }catch(e){"
         "    statusEl.textContent = 'Save failed: ' + e.message + '';"
+        "  }"
+        "}"
+        "let scLoaded = false;"
+        "const TZ_MAP = {"
+        "  'America/New_York':'EST5EDT,M3.2.0,M11.1.0','America/Chicago':'CST6CDT,M3.2.0,M11.1.0',"
+        "  'America/Denver':'MST7MDT,M3.2.0,M11.1.0','America/Phoenix':'MST7',"
+        "  'America/Los_Angeles':'PST8PDT,M3.2.0,M11.1.0','America/Anchorage':'AKST9AKDT,M3.2.0,M11.1.0',"
+        "  'Pacific/Honolulu':'HST10','America/Toronto':'EST5EDT,M3.2.0,M11.1.0',"
+        "  'America/Vancouver':'PST8PDT,M3.2.0,M11.1.0','Europe/London':'GMT0BST,M3.5.0/1,M10.5.0',"
+        "  'Europe/Dublin':'IST-1GMT0,M10.5.0,M3.5.0/1','Europe/Paris':'CET-1CEST,M3.5.0,M10.5.0/3',"
+        "  'Europe/Berlin':'CET-1CEST,M3.5.0,M10.5.0/3','Europe/Madrid':'CET-1CEST,M3.5.0,M10.5.0/3',"
+        "  'Europe/Rome':'CET-1CEST,M3.5.0,M10.5.0/3','Europe/Amsterdam':'CET-1CEST,M3.5.0,M10.5.0/3',"
+        "  'Europe/Athens':'EET-2EEST,M3.5.0/3,M10.5.0/4','Australia/Sydney':'AEST-10AEDT,M10.1.0,M4.1.0/3',"
+        "  'Australia/Perth':'AWST-8','Pacific/Auckland':'NZST-12NZDT,M9.5.0,M4.1.0/3','UTC':'UTC0'"
+        "};"
+        "function useBrowserTz(){"
+        "  const el = document.getElementById('scTz');"
+        "  const st = document.getElementById('scStatus');"
+        "  let name = '';"
+        "  try { name = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e) {}"
+        "  if (TZ_MAP[name]) { el.value = TZ_MAP[name]; st.textContent = 'Using ' + name + '. Save to apply.'; }"
+        "  else { st.textContent = 'Unknown zone' + (name ? ' (' + name + ')' : '') + ' - enter a POSIX TZ string.'; }"
+        "}"
+        "function renderScheduleInfo(s){"
+        "  const el = document.getElementById('scInfo');"
+        "  if (!s) { el.textContent = ''; return; }"
+        "  el.textContent = s.clock_synced ? ('Device local time: ' + s.local_time)"
+        "                                  : 'Clock not synced yet - the schedule will not run until it is.';"
+        "}"
+        "async function saveSchedule(){"
+        "  const enabled = document.getElementById('scEnabled').checked ? 1 : 0;"
+        "  const time = document.getElementById('scTime').value;"
+        "  const tz = document.getElementById('scTz').value.trim();"
+        "  const statusEl = document.getElementById('scStatus');"
+        "  statusEl.textContent = 'Saving...';"
+        "  try{"
+        "    const r = await fetch('/settings/close-schedule', {"
+        "      method: 'POST',"
+        "      headers: {...await authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded'},"
+        "      body: 'enabled=' + enabled + '&time=' + encodeURIComponent(time) + '&tz=' + encodeURIComponent(tz)"
+        "    });"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
+        "    statusEl.textContent = 'Saved.';"
+        "    refresh();"
+        "    setTimeout(function(){ statusEl.textContent = ''; }, 3000);"
+        "  }catch(e){"
+        "    statusEl.textContent = 'Save failed: ' + e.message;"
         "  }"
         "}"
         "async function uploadFirmware(){"
@@ -1056,7 +1185,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     bool have_other_version = other_partition &&
         (esp_ota_get_partition_description(other_partition, &other_app_desc) == ESP_OK);
 
-    char buf[1088];
+    gdo_close_schedule_t sched;
+    gdo_get_close_schedule(&sched);
+    char local_time[24];
+    clock_sync_format_local(local_time, sizeof(local_time));
+
+    char buf[1344];
     int n = snprintf(buf, sizeof(buf),
         "{"
         "\"door\":\"%s\","
@@ -1080,6 +1214,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"auto_close_enabled\":%s,"
         "\"auto_close_minutes\":%u,"
         "\"auto_close_remaining_s\":%lld,"
+        "\"close_schedule_enabled\":%s,"
+        "\"close_schedule_time\":\"%02u:%02u\","
+        "\"timezone\":\"%s\","
+        "\"clock_synced\":%s,"
+        "\"local_time\":\"%s\","
         "\"rx_error_count\":%u,"
         "\"long_obstruction_count\":%u,"
         "\"openings\":%u,"
@@ -1112,6 +1251,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         gdo_get_auto_close_enabled() ? "true" : "false",
         (unsigned)(gdo_get_auto_close_timeout_ms() / 60000),
         auto_close_remaining_s,
+        sched.enabled ? "true" : "false",
+        (unsigned)(sched.minute / 60), (unsigned)(sched.minute % 60),
+        sched.tz,
+        clock_sync_is_synced() ? "true" : "false",
+        local_time,
         (unsigned)diag_rx_error_count_peek(),
         (unsigned)diag_long_obstruction_count(),
         (unsigned)full_status.openings,
@@ -1174,7 +1318,7 @@ static bool start_httpd_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = DIAG_WEB_PORT;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 14;
     config.lru_purge_enable = true;
     // Flash-write paths in the firmware upload handler want more headroom
     // than the 4KB default, and a ~1.7MB upload over a slow WiFi link
@@ -1222,6 +1366,11 @@ static bool start_httpd_server(void)
     auto_close_uri.uri = "/settings/auto-close";
     auto_close_uri.method = HTTP_POST;
     auto_close_uri.handler = auto_close_settings_post_handler;
+
+    httpd_uri_t close_schedule_uri = {};
+    close_schedule_uri.uri = "/settings/close-schedule";
+    close_schedule_uri.method = HTTP_POST;
+    close_schedule_uri.handler = close_schedule_post_handler;
 
     httpd_uri_t firmware_update_uri = {};
     firmware_update_uri.uri = "/firmware/update";
@@ -1279,6 +1428,11 @@ static bool start_httpd_server(void)
         return false;
     }
     if (httpd_register_uri_handler(s_server, &auto_close_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &close_schedule_uri) != ESP_OK) {
         httpd_stop(s_server);
         s_server = nullptr;
         return false;

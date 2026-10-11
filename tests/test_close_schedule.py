@@ -1,6 +1,6 @@
 """Host tests for the pure scheduled-close logic and form parsing."""
 import unittest
-from test_regressions import ROOT, run_c
+from test_regressions import ROOT, run_c, function
 
 INC = ('#include <assert.h>\n#include <string.h>\n'
        '#include "' + str(ROOT / 'main/close_schedule.h') + '"\n'
@@ -145,6 +145,53 @@ int main(void) {
  assert(close_schedule_parse_form("enabled=1&time=23%3A00",&s)==CLOSE_SCHEDULE_FORM_BAD_TZ);
  return 0;
 }''')
+
+
+class CloseScheduleHandlerTests(unittest.TestCase):
+    def test_post_handler_validates_then_saves(self):
+        fn = function('main/diag_webserver.cpp', 'static esp_err_t close_schedule_post_handler(')
+        run_c(r'''
+#include <assert.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include "''' + str(ROOT / 'main/close_schedule.h') + r'''"
+#define ESP_OK 0
+#define ESP_FAIL -1
+#define HTTPD_400_BAD_REQUEST 400
+#define HTTPD_RESP_USE_STRLEN -1
+#define ESP_LOGI(...) ((void)0)
+#define TAG "t"
+typedef int esp_err_t;
+struct httpd_req_t { const char *body; size_t content_len; size_t pos; int status; bool ok_sent; };
+static bool auth_ok = true;
+static int sets, set_result;
+static gdo_close_schedule_t last_set;
+static bool authorize_mutation(httpd_req_t *) { return auth_ok; }
+static int httpd_req_recv(httpd_req_t *r, char *buf, size_t n) {
+ size_t left = r->content_len - r->pos; if (n > left) n = left;
+ memcpy(buf, r->body + r->pos, n); r->pos += n; return (int)n; }
+static void httpd_resp_send_err(httpd_req_t *r, int s, const char *) { r->status = s; }
+static void httpd_resp_send_500(httpd_req_t *r) { r->status = 500; }
+static void httpd_resp_set_type(httpd_req_t *, const char *) {}
+static int httpd_resp_send(httpd_req_t *r, const char *, int) { r->ok_sent = true; r->status = 200; return ESP_OK; }
+static int gdo_set_close_schedule(const gdo_close_schedule_t *s) { ++sets; last_set = *s; return set_result; }
+''' + fn + r'''
+static int post(const char *body) {
+ httpd_req_t r = {body, strlen(body), 0, 0, false};
+ close_schedule_post_handler(&r); return r.status; }
+int main() {
+ assert(post("enabled=1&time=23%3A00&tz=PST8PDT%2CM3.2.0%2CM11.1.0")==200);
+ assert(sets==1 && last_set.enabled && last_set.minute==1380 && !strcmp(last_set.tz,"PST8PDT,M3.2.0,M11.1.0"));
+ assert(post("enabled=1&time=99%3A00&tz=UTC0")==400 && sets==1);
+ assert(post("enabled=1&time=23%3A00&tz=bad%20tz")==400 && sets==1);
+ assert(post("")==400 && sets==1);
+ char big[600]; memset(big,'a',599); big[599]=0;
+ assert(post(big)==400 && sets==1);
+ auth_ok=false; assert(post("enabled=1&time=23%3A00&tz=UTC0")==0 && sets==1);
+ auth_ok=true; set_result=-1; assert(post("enabled=1&time=23%3A00&tz=UTC0")==500);
+ return 0;
+}''', cpp=True)
 
 
 if __name__ == '__main__':
