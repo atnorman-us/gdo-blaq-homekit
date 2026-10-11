@@ -42,14 +42,21 @@ static inline int32_t close_schedule_window_day(uint16_t now_min, int32_t today,
     return now_min >= sched_min ? today : today - 1;
 }
 
-static inline bool close_schedule_should_fire(bool clock_synced, bool door_open,
+// door_open_for_ms is 0 when the door is not open. The door must already have
+// been open when the scheduled minute began: the clock has minute granularity,
+// so real elapsed time since the window start is < (since + 1) * 60 s, and a
+// door open at least that long was provably open before the window. This can
+// miss a door opened less than 60 s before the scheduled minute (acceptable),
+// but never fires for a door opened after the scheduled time.
+static inline bool close_schedule_should_fire(bool clock_synced, int64_t door_open_for_ms,
                                               uint16_t now_min, int32_t today,
                                               uint16_t sched_min, int32_t last_fired_day)
 {
-    if (!clock_synced || !door_open) return false;
+    if (!clock_synced || door_open_for_ms <= 0) return false;
     if (now_min >= 1440 || sched_min >= 1440) return false;
     unsigned since = ((unsigned)now_min + 1440u - (unsigned)sched_min) % 1440u;
     if (since >= CLOSE_SCHEDULE_WINDOW_MIN) return false;
+    if (door_open_for_ms < (int64_t)(since + 1) * 60000) return false;
     return last_fired_day != close_schedule_window_day(now_min, today, sched_min);
 }
 

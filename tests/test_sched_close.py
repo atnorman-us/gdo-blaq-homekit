@@ -28,6 +28,8 @@ static gdo_close_schedule_t s_close_schedule;
 static int32_t s_close_schedule_last_day;
 static uint32_t s_sched_close_generation, s_sched_close_command_id;
 static bool s_sched_close_pending;
+static int64_t s_door_open_since_ms, fake_now_ms;
+static int64_t now_ms() { return fake_now_ms; }
 static bool clock_ok; static uint16_t clock_min; static int32_t clock_day;
 static int warning_calls, warning_fail, saves, saved_day, refreshes, closes, notifies;
 static void (*warning_cb)(void);
@@ -48,6 +50,7 @@ static void reset() {
  s_close_generation = 3; s_auto_close_triggered = false; s_user_close_pending = false;
  s_close_schedule = {true, 23*60, "UTC0"}; s_close_schedule_last_day = 0;
  s_sched_close_pending = false; s_sched_close_generation = s_sched_close_command_id = 0;
+ fake_now_ms = 100000000; s_door_open_since_ms = 1000000;
  clock_ok = true; clock_min = 23*60 + 1; clock_day = 20000;
  warning_calls = warning_fail = saves = saved_day = refreshes = closes = notifies = 0; warning_cb = nullptr;
 }
@@ -80,11 +83,31 @@ int main() {
  reset(); clock_ok=false; sched_close_check(); assert(warning_calls==0);            /* unsynced clock */
  reset(); clock_min=22*60+59; sched_close_check(); assert(warning_calls==0);        /* before window */
  reset(); clock_min=23*60+5; sched_close_check(); assert(warning_calls==0);         /* after window */
- reset(); current.door=GDO_DOOR_STATE_CLOSED; last_door=GDO_DOOR_STATE_CLOSED;
+ reset(); current.door=GDO_DOOR_STATE_CLOSED; last_door=GDO_DOOR_STATE_CLOSED; s_door_open_since_ms=0;
  sched_close_check(); assert(warning_calls==0);
+ reset(); current.door=GDO_DOOR_STATE_CLOSED; sched_close_check(); assert(warning_calls==0);   /* status closed only */
+ reset(); last_door=GDO_DOOR_STATE_CLOSED; sched_close_check(); assert(warning_calls==0);      /* last_door closed only */
+ reset(); s_door_open_since_ms=0; sched_close_check(); assert(warning_calls==0);
  reset(); current.synced=false; sched_close_check(); assert(warning_calls==0);
  reset(); s_auto_close_triggered=true; sched_close_check(); assert(warning_calls==0);
  reset(); s_user_close_pending=true; sched_close_check(); assert(warning_calls==0);
+ return 0;
+}''', cpp=True)
+
+    def test_door_opened_after_scheduled_minute_is_not_closed(self):
+        run_c(sources() + r'''
+int main() {
+ reset(); clock_min = 23*60+3; s_door_open_since_ms = fake_now_ms - 30000;   /* opened 30 s ago */
+ sched_close_check();
+ assert(warning_calls==0 && saves==0 && s_close_schedule_last_day==0 && !s_sched_close_pending);
+ return 0;
+}''', cpp=True)
+
+    def test_door_open_since_before_window_fires(self):
+        run_c(sources() + r'''
+int main() {
+ reset(); clock_min = 23*60+3; s_door_open_since_ms = fake_now_ms - 4*60000;   /* open 4 min, window began 3 min ago */
+ sched_close_check(); assert(warning_calls==1 && saves==1);
  return 0;
 }''', cpp=True)
 

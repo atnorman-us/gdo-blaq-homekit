@@ -3,7 +3,8 @@ import unittest
 from test_regressions import ROOT, run_c
 
 INC = ('#include <assert.h>\n#include <string.h>\n'
-       '#include "' + str(ROOT / 'main/close_schedule.h') + '"\n')
+       '#include "' + str(ROOT / 'main/close_schedule.h') + '"\n'
+       '#define OPEN 10000000LL\n')
 
 
 class CloseScheduleTests(unittest.TestCase):
@@ -25,10 +26,23 @@ int main(void) {
  const uint16_t S = 23*60;      /* 23:00 */
  const int32_t D = 20000, NONE = 0;
  /* bool synced, door_open, now_min, today, sched_min, last_fired */
- assert( close_schedule_should_fire(true,true,S,   D,S,NONE));
- assert( close_schedule_should_fire(true,true,S+4, D,S,NONE));
- assert(!close_schedule_should_fire(true,true,S+5, D,S,NONE));
- assert(!close_schedule_should_fire(true,true,S-1, D,S,NONE));
+ assert( close_schedule_should_fire(true,OPEN,S,   D,S,NONE));
+ assert( close_schedule_should_fire(true,OPEN,S+4, D,S,NONE));
+ assert(!close_schedule_should_fire(true,OPEN,S+5, D,S,NONE));
+ assert(!close_schedule_should_fire(true,OPEN,S-1, D,S,NONE));
+ return 0;
+}''')
+
+    def test_should_fire_requires_door_open_before_scheduled_minute(self):
+        run_c(INC + r'''
+int main() {
+ const uint16_t S = 23*60; const int32_t D = 20000;
+ assert(!close_schedule_should_fire(true,0,S+1,D,S,0));
+ assert(!close_schedule_should_fire(true,90000,S+2,D,S,0));
+ assert(!close_schedule_should_fire(true,179999,S+2,D,S,0));
+ assert( close_schedule_should_fire(true,180000,S+2,D,S,0));
+ assert(!close_schedule_should_fire(true,59999,S,D,S,0));
+ assert( close_schedule_should_fire(true,60000,S,D,S,0));
  return 0;
 }''')
 
@@ -37,12 +51,12 @@ int main(void) {
 int main(void) {
  const uint16_t S = 23*60;
  const int32_t D = 20000;
- assert(!close_schedule_should_fire(true,false,S+1,D,S,0));   /* door not open */
- assert(!close_schedule_should_fire(false,true,S+1,D,S,0));   /* clock unsynced */
- assert(!close_schedule_should_fire(true,true,S+2,D,S,D));    /* already fired today */
- assert( close_schedule_should_fire(true,true,S+2,D,S,D-1));  /* fired yesterday only */
- assert(!close_schedule_should_fire(true,true,1440,D,S,0));   /* invalid now */
- assert(!close_schedule_should_fire(true,true,S,D,1440,0));   /* invalid schedule */
+ assert(!close_schedule_should_fire(true,0,S+1,D,S,0));   /* door not open */
+ assert(!close_schedule_should_fire(false,OPEN,S+1,D,S,0));   /* clock unsynced */
+ assert(!close_schedule_should_fire(true,OPEN,S+2,D,S,D));    /* already fired today */
+ assert( close_schedule_should_fire(true,OPEN,S+2,D,S,D-1));  /* fired yesterday only */
+ assert(!close_schedule_should_fire(true,OPEN,1440,D,S,0));   /* invalid now */
+ assert(!close_schedule_should_fire(true,OPEN,S,D,1440,0));   /* invalid schedule */
  return 0;
 }''')
 
@@ -52,15 +66,15 @@ int main(void) {
  const uint16_t S = 23*60 + 58;   /* 23:58, window ends 00:03 */
  const int32_t D = 20000;
  /* Fires at 23:59 on day D, records window day D. */
- assert(close_schedule_should_fire(true,true,23*60+59,D,S,0));
+ assert(close_schedule_should_fire(true,OPEN,23*60+59,D,S,0));
  assert(close_schedule_window_day(23*60+59,D,S)==D);
  /* At 00:01 on day D+1 the same window is still open: must NOT fire again. */
  assert(close_schedule_window_day(1,D+1,S)==D);
- assert(!close_schedule_should_fire(true,true,1,D+1,S,D));
+ assert(!close_schedule_should_fire(true,OPEN,1,D+1,S,D));
  /* A fresh window the next night fires. */
- assert(close_schedule_should_fire(true,true,23*60+58,D+1,S,D));
+ assert(close_schedule_should_fire(true,OPEN,23*60+58,D+1,S,D));
  /* 00:03 is out of the window. */
- assert(!close_schedule_should_fire(true,true,3,D+1,S,0));
+ assert(!close_schedule_should_fire(true,OPEN,3,D+1,S,0));
  return 0;
 }''')
 

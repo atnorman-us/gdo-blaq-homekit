@@ -1299,8 +1299,13 @@ static void sched_close_check(void)
 
     gdo_status_t current;
     if (gdo_get_status(&current) != ESP_OK || !current.synced) return;
-    bool door_open = current.door == GDO_DOOR_STATE_OPEN && last_door == GDO_DOOR_STATE_OPEN;
-    if (!close_schedule_should_fire(synced, door_open, now_min, today, sched.minute,
+    // The door must have been open when the scheduled minute arrived: one
+    // opened after that must not be closed seconds later. A reboot resets
+    // s_door_open_since_ms, so a mid-window reboot skips that night, which is
+    // the safe direction.
+    int64_t open_for_ms = (current.door == GDO_DOOR_STATE_OPEN && last_door == GDO_DOOR_STATE_OPEN &&
+                           s_door_open_since_ms != 0) ? (now_ms() - s_door_open_since_ms) : 0;
+    if (!close_schedule_should_fire(synced, open_for_ms, now_min, today, sched.minute,
                                     s_close_schedule_last_day)) {
         return;
     }
