@@ -1334,7 +1334,7 @@ On the diagnostics page, **Scheduled Close** closes the garage door at a set tim
 
 - The device gets the time over Wi-Fi (`pool.ntp.org`). Until it has synced, the schedule does nothing, and the card says so.
 - Pick your timezone with **Use browser timezone**, or enter a POSIX timezone string such as `PST8PDT,M3.2.0,M11.1.0`. Daylight saving is handled automatically.
-- The close runs at most once per night. If the door is open any time in the five minutes after the set time, it closes. If it was closed at that time, nothing happens until the next night.
+- The close runs at most once per night. The door must already be open when the set time arrives (it can be picked up during the following five minutes, e.g. after a brief Wi-Fi drop). A door that was closed at that time, or opened afterwards, is left alone until the next night.
 - It is skipped (and retried for the rest of the five minutes) if the door's obstruction sensor is not clear.
 - Off by default.
 ```

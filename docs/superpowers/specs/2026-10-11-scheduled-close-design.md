@@ -35,9 +35,9 @@ Accessors are declared in `main/gdo_settings.h` and defined in
 ### Scheduler (`main/close_schedule.h`, header-only like `retry_budget.h`)
 Pure function, host-testable:
 
-`should_fire(now_minute_of_day, today_day_number, sched_minute, last_fired_day, door_is_open, clock_synced)`
+`should_fire(clock_synced, door_open_for_ms, now_minute_of_day, today_day_number, sched_minute, last_fired_day)`
 
-Returns true when: clock synced, door open, `now` is within a window of
+Returns true when: clock synced, the door has been continuously open since before the window began (`door_open_for_ms >= (whole minutes since window start + 1) * 60000`; a door opened after the scheduled time is never closed), `now` is within a window of
 `[sched_minute, sched_minute + 5)` (wrapping at midnight), and
 `last_fired_day != today`. The window means a reboot or brief Wi-Fi drop
 around the scheduled time does not skip the close, but it never fires hours late.
