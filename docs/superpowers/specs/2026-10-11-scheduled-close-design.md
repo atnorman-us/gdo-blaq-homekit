@@ -39,8 +39,9 @@ Pure function, host-testable:
 
 Returns true when: clock synced, the door has been continuously open since before the window began (`door_open_for_ms >= (whole minutes since window start + 1) * 60000`; a door opened after the scheduled time is never closed), `now` is within a window of
 `[sched_minute, sched_minute + 5)` (wrapping at midnight), and
-`last_fired_day != today`. The window means a reboot or brief Wi-Fi drop
+`last_fired_day != today`. The window means a brief Wi-Fi drop
 around the scheduled time does not skip the close, but it never fires hours late.
+(A reboot inside the window resets the door-open timer, so that night's close is skipped.)
 
 The existing watchdog task (5 s tick) calls the check; on true it records `sched_last_day = today`,
 then runs the existing sequence: pre-close warning, then `gdo_control_close()`.
