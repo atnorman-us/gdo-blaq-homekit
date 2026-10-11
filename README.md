@@ -70,7 +70,10 @@ Off by default. On the diagnostics page, **Scheduled Close** closes the garage d
 
 - **Time sync:** the device gets the time over Wi-Fi from `pool.ntp.org`. Until it has synced, the schedule does nothing and the card shows "Clock not synced yet".
 - **Timezone:** choose **Use browser timezone**, or enter a POSIX timezone string such as `PST8PDT,M3.2.0,M11.1.0`. **Use browser timezone** only recognizes about 20 common zones, so use a POSIX string for any other zone.
-- **Timing:** the close runs at most once per night. The door must already be open when the set time arrives, but the close can be picked up during the following five minutes (for example, after a brief Wi-Fi drop). A door that was closed at the set time, or opened after it, is left alone until the next night. A device reboot during that window skips that night's close.
+- **Timezone default:** until you save a timezone, the device uses UTC, so a saved time is read as UTC. The page pre-fills your browser's timezone when it recognizes it, but nothing takes effect until you save. After saving, check **Device time now** on the card to confirm it matches your clock.
+- **Timing:** the close runs at most once per night. The door must already be open when the set time arrives, but the close can be picked up during the following five minutes (for example, after a brief Wi-Fi drop). A door that was closed at the set time, or opened after it, is left alone until the next night. A device reboot during that window skips that night's close. A door stopped partway (not fully open) is not closed.
+- **Saving inside the window:** if you save a schedule while the door is already open and you are inside an open five-minute window, the door closes within seconds.
+- **Daylight saving:** times from 02:00 to 02:59 do not fire on the night daylight saving time springs forward, because that local time does not exist.
 - **Obstruction:** if the obstruction sensor is not clear, the close is skipped and retried for the rest of the five-minute window.
 
 ## Updating firmware over the air (OTA)
