@@ -2,11 +2,11 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.1.12](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.1.12)**
+**Current release: [1.3.2.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.2.0)**
 
-## What's changed in 1.3.1.12
+## What's changed in 1.3.2.0
 
-- Fix the HomeKit Learn Mode switch being omitted when Security+ 2.0 rolling-code recovery takes longer than the startup sync timeout. HomeKit now waits only until the opener protocol is identified, so Security+ 2.0 openers register Learn Mode without waiting for the full paired-device synchronization sequence.
+- Add **Scheduled Close**: close the garage door at a set time of day (for example 23:00) if it is open, using the same beep-and-flash warning as Auto-Close. It is off by default and configured on the diagnostics page, where the timezone can be filled in from your browser. The device sets its clock over Wi-Fi (`pool.ntp.org`) and does nothing until the clock is synced. A door that was closed at the set time, or opened after it, is left alone. See [Scheduled close](#scheduled-close).
 
 ## Build from source
 
