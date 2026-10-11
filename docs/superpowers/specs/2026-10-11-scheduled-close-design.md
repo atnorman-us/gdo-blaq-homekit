@@ -32,7 +32,7 @@ Accessors are declared in `main/gdo_settings.h` and defined in
 `gdo-blaq-homekit.cpp`, following the auto-close accessors' pattern
 (update in-memory value, then persist; validate input).
 
-### Scheduler (`main/close_schedule.c/.h`)
+### Scheduler (`main/close_schedule.h`, header-only like `retry_budget.h`)
 Pure function, host-testable:
 
 `should_fire(now_minute_of_day, today_day_number, sched_minute, last_fired_day, door_is_open, clock_synced)`
@@ -42,7 +42,7 @@ Returns true when: clock synced, door open, `now` is within a window of
 `last_fired_day != today`. The window means a reboot or brief Wi-Fi drop
 around the scheduled time does not skip the close, but it never fires hours late.
 
-A task polls every ~30 s; on true it records `sched_last_day = today`,
+The existing watchdog task (5 s tick) calls the check; on true it records `sched_last_day = today`,
 then runs the existing sequence: pre-close warning, then `gdo_control_close()`.
 If the door is closed or moving in the window, nothing happens until the next day.
 `sched_last_day` is persisted only when it fires, to limit flash wear.
@@ -60,7 +60,8 @@ If the door is closed or moving in the window, nothing happens until the next da
 
 ## Error handling
 - Invalid time or TZ: 400, nothing changed.
-- NVS write failure: report error, in-memory value reverted (as auto-close does).
+- NVS write failure: error reported and logged; the in-memory value stays updated
+  until reboot (this is what the existing auto-close setters actually do).
 - SNTP unreachable: scheduler idle; `/status` shows clock not synced.
 
 ## Testing
