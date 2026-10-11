@@ -20,6 +20,9 @@
 #include "homekit.h"
 #include "diag_webserver.h"
 #include "pre_close_warning.h"
+#include "close_schedule.h"
+#include "clock_sync.h"
+#include <string.h>
 #include "gdo_settings.h"
 #include "diagnostics_counters.h"
 #include "retry_budget.h"
@@ -150,6 +153,15 @@ static volatile uint32_t s_auto_close_timeout_ms = GDO_AUTO_CLOSE_TIMEOUT_DEFAUL
 // s_auto_close_timeout_ms is already sitting at its 60-minute default
 // above, so enabling it needs no extra "populate the default" logic.
 static volatile bool s_auto_close_enabled = false;
+// Scheduled close (see close_schedule.h). Guarded by ControlGuard. Off by
+// default for the same reason auto-close is: the door moving on its own is a
+// behavior change that must be opted into.
+static gdo_close_schedule_t s_close_schedule = {
+    false, CLOSE_SCHEDULE_DEFAULT_MIN, CLOSE_SCHEDULE_DEFAULT_TZ
+};
+// Local day number of the window that last fired; persisted so a reboot
+// inside the window does not close the door a second time.
+static int32_t s_close_schedule_last_day = 0;
 
 // Tracks consecutive sync failures within this boot, so the rolling-code
 // retry jump can scale up instead of always adding a fixed +100. Reset to
@@ -860,6 +872,109 @@ extern "C" int64_t gdo_get_auto_close_remaining_ms(void)
     return remaining > 0 ? remaining : 0;
 }
 
+#define GDO_SETTINGS_NVS_KEY_SCHED_EN    "sched_en"
+#define GDO_SETTINGS_NVS_KEY_SCHED_MIN   "sched_min"
+#define GDO_SETTINGS_NVS_KEY_SCHED_TZ    "tz"
+#define GDO_SETTINGS_NVS_KEY_SCHED_LAST  "sched_last_day"
+
+// Called once in app_main() after NVS init. Missing keys keep the defaults.
+static void close_schedule_settings_load(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        uint8_t en = 0;
+        if (nvs_get_u8(handle, GDO_SETTINGS_NVS_KEY_SCHED_EN, &en) == ESP_OK) {
+            s_close_schedule.enabled = (en != 0);
+        }
+        uint16_t minute = 0;
+        if (nvs_get_u16(handle, GDO_SETTINGS_NVS_KEY_SCHED_MIN, &minute) == ESP_OK && minute < 1440) {
+            s_close_schedule.minute = minute;
+        }
+        char tz[sizeof(s_close_schedule.tz)] = {0};
+        size_t tz_len = sizeof(tz);
+        if (nvs_get_str(handle, GDO_SETTINGS_NVS_KEY_SCHED_TZ, tz, &tz_len) == ESP_OK &&
+            close_schedule_tz_valid(tz)) {
+            strcpy(s_close_schedule.tz, tz);
+        }
+        int32_t last_day = 0;
+        if (nvs_get_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, &last_day) == ESP_OK) {
+            s_close_schedule_last_day = last_day;
+        }
+        nvs_close(handle);
+    } else {
+        ESP_LOGI(TAG, "No saved close schedule (%s) - using defaults", esp_err_to_name(err));
+    }
+    clock_sync_apply_timezone(s_close_schedule.tz);
+    ESP_LOGI(TAG, "Close schedule: %s at %02u:%02u, tz %s",
+             s_close_schedule.enabled ? "enabled" : "disabled",
+             (unsigned)(s_close_schedule.minute / 60), (unsigned)(s_close_schedule.minute % 60),
+             s_close_schedule.tz);
+}
+
+extern "C" esp_err_t gdo_get_close_schedule(gdo_close_schedule_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    ControlGuard guard;
+    *out = s_close_schedule;
+    return ESP_OK;
+}
+
+extern "C" esp_err_t gdo_set_close_schedule(const gdo_close_schedule_t *in)
+{
+    if (!in || in->minute >= 1440 ||
+        memchr(in->tz, '\0', sizeof(in->tz)) == nullptr ||
+        !close_schedule_tz_valid(in->tz)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t tz_err = clock_sync_apply_timezone(in->tz);
+    if (tz_err != ESP_OK) return tz_err;
+    {
+        ControlGuard guard;
+        ++s_close_generation;   // cancel any warning already counting down
+        s_close_schedule = *in;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Close schedule updated in memory but failed to open NVS: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+    nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_SCHED_EN, in->enabled ? 1 : 0);
+    nvs_set_u16(handle, GDO_SETTINGS_NVS_KEY_SCHED_MIN, in->minute);
+    nvs_set_str(handle, GDO_SETTINGS_NVS_KEY_SCHED_TZ, in->tz);
+    esp_err_t commit_err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (commit_err == ESP_OK) {
+        ESP_LOGI(TAG, "Close schedule %s at %02u:%02u, tz %s - saved to NVS",
+                 in->enabled ? "enabled" : "disabled",
+                 (unsigned)(in->minute / 60), (unsigned)(in->minute % 60), in->tz);
+    } else {
+        ESP_LOGW(TAG, "Close schedule updated in memory but failed to save: %s",
+                 esp_err_to_name(commit_err));
+    }
+    return commit_err;
+}
+
+// Persisted only when the schedule actually fires (once per day at most), to
+// keep flash wear negligible.
+static void close_schedule_last_day_save(int32_t day)
+{
+    nvs_handle_t handle;
+    if (nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not open NVS to record scheduled-close day");
+        return;
+    }
+    nvs_set_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, day);
+    if (nvs_commit(handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not save scheduled-close day");
+    }
+    nvs_close(handle);
+}
+
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
 {
     // Any event at all (light, lock, position, obstruction, ...) means the
@@ -1461,6 +1576,7 @@ extern "C" void app_main(void)
     s_control_mutex = xSemaphoreCreateRecursiveMutex();
     configASSERT(s_control_mutex);
     auto_close_settings_load();
+    close_schedule_settings_load();
 
     diagnostics_counters_init();
 

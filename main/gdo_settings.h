@@ -9,7 +9,9 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
+#include "close_schedule.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +30,13 @@ esp_err_t gdo_set_auto_close_timeout_ms(uint32_t timeout_ms);
 // currently counting down (disabled, door isn't confirmed open, or the
 // warning/close sequence has already started for this open-cycle).
 int64_t gdo_get_auto_close_remaining_ms(void);
+
+// Scheduled close: close the door if it is open at a set local time of day.
+// Defined in gdo-blaq-homekit.cpp (NVS-backed). set() validates the time
+// (0..1439) and POSIX timezone string, applies the timezone immediately, and
+// cancels any warning already counting down.
+esp_err_t gdo_get_close_schedule(gdo_close_schedule_t *out);
+esp_err_t gdo_set_close_schedule(const gdo_close_schedule_t *in);
 
 #ifdef __cplusplus
 }
