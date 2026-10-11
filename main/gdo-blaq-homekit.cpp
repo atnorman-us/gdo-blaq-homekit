@@ -163,6 +163,12 @@ static gdo_close_schedule_t s_close_schedule = {
 // inside the window does not close the door a second time.
 static int32_t s_close_schedule_last_day = 0;
 
+// Scheduled-close bookkeeping, mirrors s_auto_close_generation/command_id:
+// the warning only leads to a close if nothing changed while it ran.
+static uint32_t s_sched_close_generation;
+static uint32_t s_sched_close_command_id;
+static bool s_sched_close_pending;
+
 // Tracks consecutive sync failures within this boot, so the rolling-code
 // retry jump can scale up instead of always adding a fixed +100. Reset to
 // 0 on a successful sync.
@@ -1255,6 +1261,74 @@ static void auto_close_warning_complete_cb(void)
     }
 }
 
+// Fires once the scheduled-close warning finishes. Revalidates everything,
+// exactly like auto_close_warning_complete_cb(): any command, state change or
+// settings change during the warning bumps s_close_generation and cancels it.
+static void sched_close_warning_complete_cb(void)
+{
+    ControlGuard guard;
+    gdo_status_t status;
+    bool valid = gdo_get_status(&status) == ESP_OK && status.synced &&
+        status.door == GDO_DOOR_STATE_OPEN && status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR &&
+        last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR && s_close_schedule.enabled &&
+        s_sched_close_generation == s_close_generation &&
+        s_sched_close_command_id == status.door_command_id;
+    s_sched_close_pending = false;
+    if (!valid) {
+        ESP_LOGI(TAG, "Scheduled close cancelled during warning");
+        return;
+    }
+    if (gdo_door_close() == ESP_OK) notify_homekit_target_door_state_change(TGT_CLOSED);
+    else ESP_LOGW(TAG, "Scheduled close: close command failed");
+}
+
+// Called every watchdog tick. Cheap when disabled or outside the window.
+static void sched_close_check(void)
+{
+    gdo_close_schedule_t sched;
+    gdo_get_close_schedule(&sched);
+    if (!sched.enabled) return;
+
+    uint16_t now_min;
+    int32_t today;
+    bool synced = clock_sync_local_now(&now_min, &today);
+    if (!synced) return;   // never act on an unset clock
+
+    ControlGuard guard;
+    if (s_sched_close_pending || s_auto_close_triggered || s_user_close_pending) return;
+
+    gdo_status_t current;
+    if (gdo_get_status(&current) != ESP_OK || !current.synced) return;
+    bool door_open = current.door == GDO_DOOR_STATE_OPEN && last_door == GDO_DOOR_STATE_OPEN;
+    if (!close_schedule_should_fire(synced, door_open, now_min, today, sched.minute,
+                                    s_close_schedule_last_day)) {
+        return;
+    }
+
+    if (current.obstruction != GDO_OBSTRUCTION_STATE_CLEAR ||
+        last_obstruction != GDO_OBSTRUCTION_STATE_CLEAR) {
+        // Same stance as auto-close: err toward not closing. Don't record the
+        // day, so a later tick inside the window can still fire.
+        ESP_LOGW(TAG, "Scheduled close: obstruction not Clear - holding off");
+        gdo_refresh_status();
+        return;
+    }
+
+    int32_t window_day = close_schedule_window_day(now_min, today, sched.minute);
+    ESP_LOGW(TAG, "Scheduled close: door open at scheduled time - sounding warning and closing");
+    s_sched_close_generation = s_close_generation;
+    s_sched_close_command_id = current.door_command_id;
+    s_sched_close_pending = true;
+    if (pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
+                                    sched_close_warning_complete_cb) != ESP_OK) {
+        s_sched_close_pending = false;
+        ESP_LOGE(TAG, "Scheduled close cancelled: warning could not start");
+        return;   // not recorded; retried next tick while the window is open
+    }
+    s_close_schedule_last_day = window_day;
+    close_schedule_last_day_save(window_day);
+}
+
 static void gdo_watchdog_task(void *arg)
 {
     retry_budget_t retry_budget = {};
@@ -1517,6 +1591,9 @@ static void gdo_watchdog_task(void *arg)
                 gdo_refresh_status();
             }
         }
+
+        // 4) Scheduled close: see sched_close_check().
+        sched_close_check();
     }
 }
 
