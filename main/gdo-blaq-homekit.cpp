@@ -143,6 +143,10 @@ static gdo_motion_state_t      last_motion      = GDO_MOTION_STATE_MAX;
 // below so every place that updates last_door keeps this in sync too,
 // rather than needing six separate call sites to remember to.
 static volatile int64_t s_door_open_since_ms   = 0;
+// Written ONLY by set_last_door_state(): when the door last arrived at OPEN
+// (0 if not open). Unlike s_door_open_since_ms, auto-close never resets it,
+// so scheduled close can tell how long the door has really been open.
+static volatile int64_t s_door_continuously_open_since_ms = 0;
 static volatile bool    s_auto_close_triggered = false;
 static volatile uint32_t s_auto_close_timeout_ms = GDO_AUTO_CLOSE_TIMEOUT_DEFAULT_MS;
 
@@ -328,9 +332,11 @@ static void set_last_door_state(gdo_door_state_t new_state)
     if (new_state != last_door) ++s_close_generation;
     if (new_state == GDO_DOOR_STATE_OPEN && last_door != GDO_DOOR_STATE_OPEN) {
         s_door_open_since_ms   = now_ms();
+        s_door_continuously_open_since_ms = s_door_open_since_ms;
         s_auto_close_triggered = false;
     } else if (new_state != GDO_DOOR_STATE_OPEN && last_door == GDO_DOOR_STATE_OPEN) {
         s_door_open_since_ms   = 0;
+        s_door_continuously_open_since_ms = 0;
         s_auto_close_triggered = false;
     }
     last_door = new_state;
@@ -1301,10 +1307,10 @@ static void sched_close_check(void)
     if (gdo_get_status(&current) != ESP_OK || !current.synced) return;
     // The door must have been open when the scheduled minute arrived: one
     // opened after that must not be closed seconds later. A reboot resets
-    // s_door_open_since_ms, so a mid-window reboot skips that night, which is
+    // s_door_continuously_open_since_ms, so a mid-window reboot skips that night, which is
     // the safe direction.
     int64_t open_for_ms = (current.door == GDO_DOOR_STATE_OPEN && last_door == GDO_DOOR_STATE_OPEN &&
-                           s_door_open_since_ms != 0) ? (now_ms() - s_door_open_since_ms) : 0;
+                           s_door_continuously_open_since_ms != 0) ? (now_ms() - s_door_continuously_open_since_ms) : 0;
     if (!close_schedule_should_fire(synced, open_for_ms, now_min, today, sched.minute,
                                     s_close_schedule_last_day)) {
         return;
@@ -1555,7 +1561,7 @@ static void gdo_watchdog_task(void *arg)
         //    turned on (see gdo_set_auto_close_enabled(), off by default).
         uint32_t auto_close_timeout_ms = s_auto_close_timeout_ms;
         if (s_auto_close_enabled &&
-            s_door_open_since_ms != 0 && !s_auto_close_triggered &&
+            s_door_open_since_ms != 0 && !s_auto_close_triggered && !s_sched_close_pending &&
             (now - s_door_open_since_ms) > auto_close_timeout_ms) {
 
             if (last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
@@ -1567,7 +1573,8 @@ static void gdo_watchdog_task(void *arg)
                 gdo_status_t current;
                 if (gdo_get_status(&current) != ESP_OK || !current.synced ||
                     current.door != GDO_DOOR_STATE_OPEN || !s_auto_close_enabled ||
-                    s_auto_close_triggered || gdo_get_auto_close_remaining_ms() != 0 ||
+                    s_auto_close_triggered || s_sched_close_pending ||
+                    gdo_get_auto_close_remaining_ms() != 0 ||
                     current.obstruction != GDO_OBSTRUCTION_STATE_CLEAR) continue;
                 s_auto_close_generation = s_close_generation;
                 s_auto_close_command_id = current.door_command_id;
@@ -1706,7 +1713,7 @@ extern "C" void app_main(void)
 
     xTaskCreate(gdo_watchdog_task,
                 "gdo_watchdog",
-                3072,
+                4096,
                 NULL,
                 tskIDLE_PRIORITY + 2,
                 NULL);
