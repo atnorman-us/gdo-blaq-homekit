@@ -4,6 +4,7 @@ idf_component_register(
         "homekit.cpp"
         "wifi.cpp"
         "diag_webserver.cpp"
+        "clock_sync.cpp"
         "log_ring_buffer.cpp"
         "pre_close_warning.c"
         "diagnostics_counters.c"
@@ -24,4 +25,5 @@ idf_component_register(
         app_update
         mdns
         mbedtls
+        lwip
 )

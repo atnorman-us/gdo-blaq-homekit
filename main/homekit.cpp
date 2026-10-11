@@ -23,6 +23,7 @@ static const char *TAG = "HOMEKIT";
 #include "diag_webserver.h"
 #include "pre_close_warning.h"
 #include "gdo_settings.h"
+#include "clock_sync.h"
 
 // Defined in gdo-blaq-homekit.cpp - blocks until real GDO sync completes.
 extern "C" bool gdo_wait_for_sync(uint32_t timeout_ms);
@@ -428,6 +429,9 @@ void homekit_task_entry(void* ctx) {
     // wifi setup is stuck in the homekit code because homekit sets up some event handlers, and the
     // ordering matters.
     app_wifi_init();
+
+    // SNTP needs the event loop and netif that app_wifi_init() just created.
+    clock_sync_start();
 
     hap_start();
 
