@@ -1,8 +1,33 @@
 diff --git a/gdo.c b/gdo.c
-index 1f28d1d..0303aca 100755
+index 1f28d1d..b483125 100755
 --- a/gdo.c
 +++ b/gdo.c
-@@ -395,7 +395,7 @@ esp_err_t gdo_sync(void) {
+@@ -105,6 +105,24 @@ static esp_timer_handle_t door_position_sync_timer;
+ static esp_timer_handle_t obst_timer;
+ static void *g_user_cb_arg;
+ static uint32_t g_tx_delay_ms = 50;
++
++// Security+ 1.0 wall-panel emulation. The timer is file-static so the
++// callback can stop it when it discovers a real panel on the bus.
++static esp_timer_handle_t v1_status_timer;
++// Query bytes (0x37/0x38/0x39/0x3A) we transmitted vs. query bytes seen on
++// the receive line. Our own transmissions echo back, so with no other panel
++// the two counts stay roughly equal; a real wall panel polling alongside us
++// makes the received count run ahead.
++static uint32_t g_v1_tx_queries;
++static uint32_t g_v1_rx_queries;
++#define V1_PANEL_CHECK_TICKS   40    // 250 ms timer ticks: evaluate every 10 s
++#define V1_PANEL_EXTRA_QUERIES 8     // tolerance for retries/noise within a window
++#define V1_PANEL_LISTEN_MS     8000  // how long to listen for a panel before emulating one
++
++static inline bool v1_is_query(uint8_t b) {
++    return b == V1_CMD_QUERY_DOOR_STATUS_0x37 || b == V1_CMD_QUERY_DOOR_STATUS ||
++           b == V1_CMD_OBSTRUCTION || b == V1_CMD_QUERY_OTHER_STATUS;
++}
+ static portMUX_TYPE gdo_spinlock = portMUX_INITIALIZER_UNLOCKED;
+ 
+ // Empirical offset added to the move-to-target STOP delay to compensate for the
+@@ -395,7 +413,7 @@ esp_err_t gdo_sync(void) {
   * @brief Opens the door.
   * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
  */
@@ -11,7 +36,7 @@ index 1f28d1d..0303aca 100755
      g_status.door_target = 0;
  
      if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_OPEN) {
-@@ -432,7 +432,7 @@ esp_err_t gdo_door_open(void) {
+@@ -432,7 +450,7 @@ esp_err_t gdo_door_open(void) {
   * @brief Closes the door.
   * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
  */
@@ -20,7 +45,7 @@ index 1f28d1d..0303aca 100755
      g_status.door_target = 10000;
  
      if (g_status.door == GDO_DOOR_STATE_CLOSING || g_status.door == GDO_DOOR_STATE_CLOSED) {
-@@ -446,6 +446,24 @@ esp_err_t gdo_door_close(void) {
+@@ -446,6 +464,31 @@ esp_err_t gdo_door_close(void) {
      return send_door_action(GDO_DOOR_ACTION_CLOSE);
  }
  
@@ -37,6 +62,13 @@ index 1f28d1d..0303aca 100755
 +esp_err_t gdo_retry_door_command(uint32_t command_id) {
 +    if (!command_id || command_id != g_status.door_command_id || !g_status.synced)
 +        return ESP_ERR_INVALID_STATE;
++    // Toggle-only (Security+ 1.0): door_open_impl()/door_close_impl() end
++    // in a TOGGLE chosen from g_status.door, which on this protocol can lag
++    // reality (a status frame missed, or the first TOGGLE already moving the
++    // door). Repeating it can reverse or stop the door instead of completing
++    // the request, so a retry is never safe here; the caller reverts instead.
++    if (g_status.toggle_only)
++        return ESP_ERR_NOT_SUPPORTED;
 +    if (g_status.door_target == 0) return door_open_impl();
 +    if (g_status.door_target == 10000) return door_close_impl();
 +    return ESP_ERR_INVALID_STATE;
@@ -45,7 +77,110 @@ index 1f28d1d..0303aca 100755
  /**
   * @brief Stops the door.
   * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
-@@ -1423,6 +1441,21 @@ static void decode_v1_packet(uint8_t *packet) {
+@@ -809,6 +852,16 @@ esp_err_t gdo_set_client_id(uint32_t client_id) {
+  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the protocol is invalid,
+  * ESP_ERR_INVALID_STATE if the protocol is already set.
+ */
++esp_err_t gdo_reset_protocol(void) {
++    if (g_status.synced || gdo_sync_task_handle) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    g_status.protocol = 0;
++    g_protocol_forced = false;
++    g_status.door = GDO_DOOR_STATE_UNKNOWN;
++    return ESP_OK;
++}
++
+ esp_err_t gdo_set_protocol(gdo_protocol_type_t protocol) {
+     if (g_status.protocol > 0 && g_status.protocol < GDO_PROTOCOL_MAX) {
+         return ESP_ERR_INVALID_STATE;
+@@ -891,7 +944,7 @@ static void gdo_sync_task(void* arg) {
+         xQueueReset(gdo_event_queue);
+ 
+         // Delay forever if there is a smart panel connected to allow it to come online and sync before we do anything.
+-        ulTaskNotifyTake(pdTRUE, g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL ? portMAX_DELAY : pdMS_TO_TICKS(2500));
++        ulTaskNotifyTake(pdTRUE, g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL ? portMAX_DELAY : pdMS_TO_TICKS(V1_PANEL_LISTEN_MS));
+ 
+         if (g_status.door == GDO_DOOR_STATE_UNKNOWN) {
+             ESP_LOGW(TAG, "V1 panel not found, trying emulation");
+@@ -902,7 +955,12 @@ static void gdo_sync_task(void* arg) {
+                 .name = "v1_status_timer"
+             };
+ 
+-            esp_timer_handle_t v1_status_timer;
++            if (v1_status_timer) {
++                esp_timer_stop(v1_status_timer);
++                esp_timer_delete(v1_status_timer);
++                v1_status_timer = NULL;
++            }
++            g_v1_tx_queries = g_v1_rx_queries = 0;
+             if (esp_timer_create(&timer_args, &v1_status_timer) != ESP_OK) {
+                 ESP_LOGE(TAG, "Failed to create V1 status timer");
+                 synced = false;
+@@ -919,6 +977,7 @@ static void gdo_sync_task(void* arg) {
+                 ESP_LOGW(TAG, "secplus V1 panel emulation failed, trying secplus V2 panel emulation");
+                 esp_timer_stop(v1_status_timer);
+                 esp_timer_delete(v1_status_timer);
++                v1_status_timer = NULL;
+             } else {
+                 goto done;
+             }
+@@ -1146,6 +1205,25 @@ static void v1_status_timer_cb(void* arg) {
+     const char secplus1_cmds[] = { 0x35, 0x35, 0x35, 0x35, 0x33, 0x33, 0x53, 0x53, 0x38,
+                                    0x3A, 0x3A, 0x3A, 0x39, 0x38, 0x3A, 0x38, 0x3A, 0x39, 0x3A };
+     static uint8_t index = 0;
++    static uint8_t ticks = 0;
++
++    if (++ticks >= V1_PANEL_CHECK_TICKS) {
++        ticks = 0;
++        uint32_t tx = g_v1_tx_queries, rx = g_v1_rx_queries;
++        g_v1_tx_queries = g_v1_rx_queries = 0;
++        if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1 && rx > tx + V1_PANEL_EXTRA_QUERIES) {
++            // Two panels polling the same wire confuse the real one (an
++            // 889LM beeps and flashes at it). Leave the bus to the panel and
++            // just decode what it and the opener say, exactly as if the panel
++            // had been heard during the startup listen window.
++            ESP_LOGW(TAG, "Another Security+ 1.0 wall panel is polling this bus (%" PRIu32 " queries seen, %" PRIu32 " sent) - switching to listen-only smart-panel mode", rx, tx);
++            g_status.protocol = GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL;
++            esp_timer_stop(v1_status_timer);
++            queue_event((gdo_event_t){GDO_EVENT_SYNC_COMPLETE});
++            return;
++        }
++    }
++
+     queue_v1_command((gdo_v1_command_t)secplus1_cmds[index++]);
+     if (index == 18) {
+         index = 15;
+@@ -1317,6 +1395,7 @@ static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t by
+ 
+     print_buffer(g_status.protocol, message.packet, true);
+     if (xQueueSendToBack(gdo_tx_queue, &message, 0) == pdFALSE) {
++        free(message.packet);
+         return ESP_ERR_NO_MEM;
+     }
+ 
+@@ -1374,6 +1453,9 @@ static esp_err_t transmit_packet(uint8_t *packet) {
+         if (uart_write_bytes(g_config.uart_num, packet, 1) < 0) {
+             return ESP_FAIL;
+         }
++        if (v1_is_query(packet[0])) {
++            ++g_v1_tx_queries;
++        }
+     }
+ 
+     return err;
+@@ -1387,6 +1469,10 @@ static void decode_v1_packet(uint8_t *packet) {
+     gdo_v1_command_t cmd = (gdo_v1_command_t)packet[0];
+     uint8_t resp = packet[1];
+ 
++    if (v1_is_query(packet[0])) {
++        ++g_v1_rx_queries;
++    }
++
+     if (cmd == V1_CMD_QUERY_DOOR_STATUS) {
+         gdo_door_state_t door_state = GDO_DOOR_STATE_UNKNOWN;
+         uint8_t val = resp & 0x7;
+@@ -1423,6 +1509,21 @@ static void decode_v1_packet(uint8_t *packet) {
   * @brief Decodes a packet received from the GDO and updates the status.
   * @param packet The packet received from the GDO.
  */
@@ -67,7 +202,7 @@ index 1f28d1d..0303aca 100755
  static void decode_packet(uint8_t *packet) {
      uint32_t rolling = 0;
      uint64_t fixed = 0;
-@@ -1432,7 +1465,10 @@ static void decode_packet(uint8_t *packet) {
+@@ -1432,7 +1533,10 @@ static void decode_packet(uint8_t *packet) {
      static uint32_t last_obstruction_time = 0;
      static bool obst_clear_from_status = false;
  
@@ -79,7 +214,7 @@ index 1f28d1d..0303aca 100755
  
      data &= ~0xf000;
  
-@@ -1451,12 +1487,17 @@ static void decode_packet(uint8_t *packet) {
+@@ -1451,12 +1555,17 @@ static void decode_packet(uint8_t *packet) {
      ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
  
      if (cmd == GDO_CMD_STATUS) {
@@ -99,7 +234,7 @@ index 1f28d1d..0303aca 100755
              update_obstruction_state((gdo_obstruction_state_t)((byte1 >> 6) & 1));
              if (g_status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
                  obst_clear_from_status = false;
-@@ -1476,9 +1517,18 @@ static void decode_packet(uint8_t *packet) {
+@@ -1476,9 +1585,18 @@ static void decode_packet(uint8_t *packet) {
      } else if (cmd == GDO_CMD_SET_TTC) {
          update_ttc((byte1 << 8) | byte2);
      } else if (cmd == GDO_CMD_PAIRED_DEVICES) {
@@ -120,7 +255,7 @@ index 1f28d1d..0303aca 100755
      } else if (cmd == GDO_CMD_OBST_1) {
          if (g_status.door == GDO_DOOR_STATE_OPEN || g_status.door == GDO_DOOR_STATE_CLOSING) {
              g_status.door = GDO_DOOR_STATE_OPEN; // if the obstruction sensor tripped the door will go back to open state.
-@@ -1495,7 +1545,19 @@ static void decode_packet(uint8_t *packet) {
+@@ -1495,7 +1613,19 @@ static void decode_packet(uint8_t *packet) {
           * avoids an incorrect state being reported.
           */
          if (g_config.obst_from_status && time_now - last_obstruction_time > 1000) {
@@ -141,7 +276,7 @@ index 1f28d1d..0303aca 100755
                  get_status();
              } else {
                  update_obstruction_state(g_status.obstruction == GDO_OBSTRUCTION_STATE_OBSTRUCTED ? GDO_OBSTRUCTION_STATE_CLEAR : GDO_OBSTRUCTION_STATE_OBSTRUCTED);
-@@ -1513,6 +1575,47 @@ static void decode_packet(uint8_t *packet) {
+@@ -1513,6 +1643,47 @@ static void decode_packet(uint8_t *packet) {
      }
  }
  
@@ -189,15 +324,19 @@ index 1f28d1d..0303aca 100755
  /**
   * @brief Main task that handles all the events from the UART and other tasks.
  */
-@@ -1620,6 +1723,25 @@ static void gdo_main_task(void* arg) {
+@@ -1620,6 +1791,31 @@ static void gdo_main_task(void* arg) {
  
                      if (rx_packet_size > GDO_PACKET_SIZE) {
                          ESP_LOGW(TAG, "Oversized packet received: %u bytes, messages pending: %u", rx_packet_size, rx_pending);
 +
-+                        if (rx_pending == 1 && rx_packet_size <= sizeof(rx_buffer)) {
-+                            // One break, one read: take the whole read and find the
-+                            // packet by its start signature rather than assuming
-+                            // where the extra bytes are - see decode_rx_stream().
++                        if (rx_packet_size <= sizeof(rx_buffer)) {
++                            // Take the whole read and find every packet in it by
++                            // its start signature rather than assuming where the
++                            // extra bytes are - see decode_rx_stream(). This also
++                            // covers two breaks followed by one read holding both
++                            // frames back to back (rx_pending == 2, 38+ bytes),
++                            // which the byte-dropping fallback below turned into
++                            // "discard the whole first packet, decode the second".
 +                            int got = uart_read_bytes(g_config.uart_num, rx_buffer, rx_packet_size, 0);
 +                            rx_pending = 0;
 +                            if (got != (int)rx_packet_size) {
@@ -212,10 +351,12 @@ index 1f28d1d..0303aca 100755
 +                            break;
 +                        }
 +
++                        // Only reached for a read larger than the 320-byte
++                        // rx_buffer, i.e. the FIFO was left to overflow.
                          // Sometimes the break is interperated as a 0 byte and added to the packet
                          // So lets just dump the first byte(s) until we have our packet size.
                          while (rx_packet_size > GDO_PACKET_SIZE) {
-@@ -1828,8 +1950,13 @@ static void gdo_main_task(void* arg) {
+@@ -1828,8 +2024,13 @@ static void gdo_main_task(void* arg) {
  /******************************* STATUS FUNCTIONS ************************************/
  
  static void update_door_state(const gdo_door_state_t door_state) {
@@ -231,7 +372,7 @@ index 1f28d1d..0303aca 100755
  
      if (door_state == g_status.door) {
          return;
-@@ -1841,12 +1968,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1841,12 +2042,13 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
              start_opening = esp_timer_get_time();
          }
@@ -247,7 +388,7 @@ index 1f28d1d..0303aca 100755
              start_opening = -1;
          }
      }
-@@ -1855,12 +1983,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
+@@ -1855,12 +2057,12 @@ static void update_door_state(const gdo_door_state_t door_state) {
          if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door == GDO_DOOR_STATE_OPEN) {
              start_closing = esp_timer_get_time();
          }
@@ -262,7 +403,7 @@ index 1f28d1d..0303aca 100755
              start_closing = -1;
          }
      }
-@@ -2099,54 +2227,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
+@@ -2099,54 +2301,17 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
          g_status.motor = motor_state;
          queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
  
@@ -328,7 +469,7 @@ index 1f28d1d..0303aca 100755
          }
      }
  }
-@@ -2259,7 +2350,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
+@@ -2259,7 +2424,7 @@ inline static void update_paired_devices(gdo_paired_device_type_t type, uint8_t
   * @param battery_state The new battery state to update to.
  */
  inline static void update_battery_state(gdo_battery_state_t battery_state) {
@@ -362,7 +503,7 @@ index 9935c6e..a9f4f03 100644
  
  const char* gdo_learn_state_to_string(gdo_learn_state_t state) {
 diff --git a/include/gdo.h b/include/gdo.h
-index dda04f0..57a2da7 100755
+index dda04f0..2635371 100755
 --- a/include/gdo.h
 +++ b/include/gdo.h
 @@ -146,6 +146,7 @@ typedef struct {
@@ -383,3 +524,19 @@ index dda04f0..57a2da7 100755
  /**
   * @brief Stops the door.
   * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+@@ -402,6 +406,15 @@ esp_err_t gdo_set_client_id(uint32_t client_id);
+ */
+ esp_err_t gdo_set_protocol(gdo_protocol_type_t protocol);
+ 
++/**
++ * @brief Forgets the detected (or forced) protocol so the next gdo_sync() re-runs
++ * the full Security+ V1 then V2 detection. Security+ V2 is only a fallback when the
++ * V1 probes hear nothing, so a V2 sync that keeps failing on an unsynced driver may
++ * simply mean the opener was not wired up when the probe ran.
++ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if already synced or a sync is running.
++*/
++esp_err_t gdo_reset_protocol(void);
++
+ /**
+  * @brief Sets the time the door takes to open from fully closed in milliseconds.
+  * @param ms The time the door takes to open from fully closed in milliseconds.

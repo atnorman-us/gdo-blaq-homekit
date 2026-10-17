@@ -4,6 +4,16 @@ Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMa
 
 **Current release: [1.3.2.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.2.0)**
 
+## Unreleased
+
+Opener link:
+
+- **A real Security+ 1.0 wall panel (for example an 889LM) is now detected even when it starts talking after the blaQ does.** The startup listen window grows from 2.5 to 8 seconds, and if the blaQ is already emulating a panel it counts the polls it sees against the polls it sent; a surplus means a real panel is on the wire, so it stops emulating and switches to the listen-only "Security+ 1.0 with smart panel" mode, which is then saved for the next boot. Two panels polling the same wire made the real one beep and flash.
+- **Protocol detection re-runs on its own if the Security+ 2.0 fallback never syncs.** "Security+ 2.0" is only what the driver assumes when the 1.0 probes hear nothing, for instance because the opener was wired up after boot; it used to stay there until the next reboot.
+- **A door command is no longer retried on Security+ 1.0 openers.** Those openers only have a TOGGLE command, chosen from the door state the firmware last saw. Re-sending it 8 seconds after a command that appeared not to start could stop or reverse a door that had in fact started moving (or whose status frame was missed), including closing an open door with no warning. On these openers an unanswered command now just reverts the Home app's target; Security+ 2.0 keeps its single retry, since its Open/Close commands are idempotent.
+- gdolib now decodes every packet in a UART read that holds more than one frame (two breaks followed by one 38-plus-byte read). Previously only the one-break case was handled this way and the older fallback discarded the whole first packet.
+- gdolib no longer leaks a packet buffer when its transmit queue is full.
+
 ## What's changed in 1.3.2.0
 
 - Add **Scheduled Close**: close the garage door at a set time of day (for example 23:00) if it is open, using the same beep-and-flash warning as Auto-Close. It is off by default and configured on the diagnostics page, where the timezone can be filled in from your browser. The device sets its clock over Wi-Fi (`pool.ntp.org`) and does nothing until the clock is synced. A door that was closed at the set time, or opened after it, is left alone. See [Scheduled close](#scheduled-close).
@@ -131,6 +141,8 @@ Automatic closing is **disabled by default**. Enable it and choose a timeout in 
 A real obstruction is reported immediately and is not automatically declared clear after a fixed interval. At boot, an unknown obstruction baseline is resolved from status rather than inferred from an ambiguous toggle.
 
 ## Troubleshooting
+
+- **Security+ 1.0 opener with a smart wall panel (880LM, 889LM, 41A7305 and similar):** power the blaQ from its USB-C port, not from the opener's wall-control terminals. Those openers supply very little power on that pair, and a blaQ drawing from it can keep the panel from recharging; an 889LM then blinks red and yellow and beeps indefinitely, and never starts talking, so the blaQ falls back to emulating a panel instead of listening to the real one. The dashboard's protocol field shows **Security+ 1.0 with smart panel** once the panel is heard.
 
 - **UART errors:** Rejected or malformed frames are ignored and logged. Repeated errors can indicate wiring or electrical noise; inspect signal routing, connections, and grounding.
 - **Pairing fault:** Check opener power, wiring, and whether it still recognizes the controller. The banner is based on sustained synchronization failure, not a definitive diagnosis of lost pairing.
