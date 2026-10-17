@@ -55,15 +55,19 @@ static uint8_t s_admin_pw_salt[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
 static uint8_t s_admin_pw_hash[32];
 static uint32_t s_admin_pw_iterations = 4096;
 static bool s_admin_password_set = false;
+static bool kdf_ok = true;
+#define ESP_LOGE(...) ((void)0)
+#define TAG "t"
 static void httpd_resp_send_err(httpd_req_t *r,int s,const char*) {r->status=s;}
 static size_t httpd_req_get_hdr_value_len(httpd_req_t*r,const char*) {return strlen(r->token);}
 static int httpd_req_get_hdr_value_str(httpd_req_t*r,const char*,char*b,size_t n) {strncpy(b,r->token,n);return 0;}
 // Fake but deterministic stand-in for the real PBKDF2-HMAC-SHA256 - these
 // tests cover the auth flow (unset/missing/wrong/right password), not the
 // KDF itself, which is a well-tested standard primitive.
-static void hash_admin_password(const char *password, size_t len, const uint8_t *salt, uint32_t iterations, uint8_t *out_hash) {
+static bool hash_admin_password(const char *password, size_t len, const uint8_t *salt, uint32_t iterations, uint8_t *out_hash) {
  memset(out_hash, 0, 32);
  for (size_t i = 0; i < len && i < 32; ++i) out_hash[i] = (uint8_t)password[i] ^ salt[i % 16] ^ (uint8_t)iterations;
+ return kdf_ok;
 }
 '''
         main = r'''
@@ -75,6 +79,42 @@ int main() {
  req.token=""; assert(!authorize_mutation(&req)); assert(req.status==401);
  req.token="wrong-password"; assert(!authorize_mutation(&req)); assert(req.status==401);
  req.token="correct-horse"; assert(authorize_mutation(&req));
+ // A KDF failure must deny, never compare an uninitialised candidate.
+ kdf_ok=false; req.status=0; assert(!authorize_mutation(&req)); assert(req.status==401);
 }
 '''
         run_c(prefix+fn+main, cpp=True)
+
+    def test_door_state_update_notifies_homekit_under_the_control_lock(self):
+        fn = function('main/gdo-blaq-homekit.cpp', 'static void set_last_door_state(gdo_door_state_t new_state)')
+        run_c(r'''
+#include <stdint.h>
+#include <assert.h>
+#include <vector>
+enum gdo_door_state_t { GDO_DOOR_STATE_UNKNOWN, GDO_DOOR_STATE_OPEN, GDO_DOOR_STATE_CLOSED,
+ GDO_DOOR_STATE_STOPPED, GDO_DOOR_STATE_OPENING, GDO_DOOR_STATE_CLOSING, GDO_DOOR_STATE_MAX };
+static int lock_depth;
+struct ControlGuard { ControlGuard() { ++lock_depth; } ~ControlGuard() { --lock_depth; } };
+static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
+static uint32_t s_close_generation;
+static int64_t s_door_open_since_ms, s_door_continuously_open_since_ms;
+static bool s_auto_close_triggered;
+static int64_t clock_ms = 1000;
+static int64_t now_ms() { return clock_ms; }
+static std::vector<gdo_door_state_t> notified;
+static void notify_homekit_current_door_state_change(gdo_door_state_t d) {
+ // The notification must be queued before another task can change last_door.
+ assert(lock_depth > 0); assert(d == last_door); notified.push_back(d); }
+''' + fn + r'''
+int main() {
+ set_last_door_state(GDO_DOOR_STATE_OPENING);
+ set_last_door_state(GDO_DOOR_STATE_OPEN);
+ assert(notified.size() == 2 && notified[0] == GDO_DOOR_STATE_OPENING && notified[1] == GDO_DOOR_STATE_OPEN);
+ assert(s_door_open_since_ms == 1000 && s_close_generation == 2 && lock_depth == 0);
+ clock_ms = 5000; s_auto_close_triggered = true;
+ set_last_door_state(GDO_DOOR_STATE_CLOSING);
+ assert(notified.size() == 3 && s_door_open_since_ms == 0 && !s_auto_close_triggered);
+ set_last_door_state(GDO_DOOR_STATE_CLOSING);   // unchanged: offered again, generation kept
+ assert(notified.size() == 4 && s_close_generation == 3);
+}
+''', cpp=True)
