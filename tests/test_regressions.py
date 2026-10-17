@@ -24,7 +24,8 @@ def run_c(source, cpp=False):
 
 class RegressionTests(unittest.TestCase):
     def test_provisioning_rejects_oversized_tokens(self):
-        parser = function('components/nvs_wifi_connect/source/nvs_wifi_connect_http_server.c', 'static esp_err_t json_to_str_parm(')
+        http = 'components/nvs_wifi_connect/source/nvs_wifi_connect_http_server.c'
+        parser = function(http, 'static int json_unescape(') + '\n' + function(http, 'static esp_err_t json_to_str_parm(')
         run_c('#include <stdio.h>\n#include <string.h>\n#include <assert.h>\n'
               '#include "' + str(ROOT / 'components/nvs_wifi_connect/private_include/jsmn.h') + '"\n'
               'typedef int esp_err_t;\n#define ESP_FAIL -1\n#define ESP_OK 0\n' + parser + r'''
@@ -36,6 +37,9 @@ int main(void) {
  assert(json_to_str_parm("{\"name\":\"a\"}",key,value) == ESP_FAIL);
  assert(json_to_str_parm("{\"name\":\"a\",\"msg\":\"b\"}",key,value) == ESP_OK);
  assert(!strcmp(key,"a") && !strcmp(value,"b"));
+ assert(json_to_str_parm("{\"name\":\"nvsStaPass\",\"msg\":\"p\\\"a\\\\s/s\"}",key,value) == ESP_OK);
+ assert(!strcmp(value,"p\"a\\s/s"));
+ assert(json_to_str_parm("{\"name\":\"a\",\"msg\":\"\\u0041\"}",key,value) == ESP_FAIL);
  return 0;
 }''')
 
