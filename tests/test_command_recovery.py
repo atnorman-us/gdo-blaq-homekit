@@ -109,6 +109,9 @@ static int64_t now_val;
 static int64_t now_ms() { return now_val; }
 static int gdo_set_rolling_code(uint32_t) { return ESP_OK; }
 static int gdo_sync() { return ESP_OK; }
+static bool s_protocol_pinned = false;
+static int protocol_resets = 0;
+static int gdo_reset_protocol() { ++protocol_resets; return ESP_OK; }
 static const char *gdo_protocol_type_to_string(int) { return "Security+ 2.0"; }
 static void xSemaphoreGive(void*) {}
 static void gdo_save_synced_protocol(int) {}
