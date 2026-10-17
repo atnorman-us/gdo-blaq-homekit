@@ -55,6 +55,11 @@ static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
 static gdo_motion_state_t last_motion = GDO_MOTION_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_learn_state_t last_learn = GDO_LEARN_STATE_MAX;
+// Last Target Door State handed to HomeKit, by either path: a queued
+// notification or a direct write in gdo_svc_set(). Both the gdolib callback
+// task and the HAP task touch it, hence atomic. 0xFF = nothing pushed yet.
+#define HOMEKIT_TARGET_UNKNOWN 0xFF
+static std::atomic<uint8_t> last_target{HOMEKIT_TARGET_UNKNOWN};
 
 
 #define DEVICE_NAME_SIZE 19
@@ -240,7 +245,10 @@ struct GDOEvent {
 extern "C" void homekit_notif_queue_init(void)
 {
     if (!gdo_notif_event_q) {
-        gdo_notif_event_q = xQueueCreate(16, sizeof(GDOEvent));
+        // 32 slots: the consumer loop does not run until hap_start(), which
+        // waits on protocol identification and Wi-Fi (30 s or more), and
+        // every state that changes in that window needs a slot.
+        gdo_notif_event_q = xQueueCreate(32, sizeof(GDOEvent));
     }
 }
 
@@ -287,7 +295,9 @@ void homekit_task_entry(void* ctx) {
     uint8_t mac[8] = {0};
     ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
 
-    snprintf(device_name, DEVICE_NAME_SIZE, "Garage Door %02X%02X%02X", mac[2], mac[1], mac[0]);
+    // Bytes 3-5 are the device-unique part of the MAC; bytes 0-2 are the
+    // Espressif vendor prefix and would give every blaQ the same name.
+    snprintf(device_name, DEVICE_NAME_SIZE, "Garage Door %02X%02X%02X", mac[3], mac[4], mac[5]);
     snprintf(
         serial_number,
         SERIAL_NAME_SIZE,
@@ -521,6 +531,10 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
                     esp_err_t err = write->val.u == TGT_OPEN ? gdo_control_open() : gdo_control_close();
                     if (err == ESP_OK) {
                         hap_char_update_val(write->hc, &(write->val));
+                        // Keep the notify path's idea of Target current, so a
+                        // later revert to the previous value is not deduplicated
+                        // away (see notify_homekit_target_door_state_change).
+                        last_target.store((uint8_t)write->val.u);
                         *(write->status) = HAP_STATUS_SUCCESS;
                     } else {
                         *(write->status) = HAP_STATUS_COMM_ERR;
@@ -537,14 +551,21 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
             }
 
         } else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_LOCK_TARGET_STATE)) {
-            ESP_LOGI(TAG, "set lock state: %s", write->val.b ? "Locked" : "Unlocked");
-            if (write->val.b) {
-                gdo_lock();
+            bool secure = (write->val.u == HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED);
+            ESP_LOGI(TAG, "set lock state: %s", secure ? "Locked" : "Unlocked");
+            // Only commit the value HomeKit asked for if gdolib accepted the
+            // command. Committing unconditionally made the Home app show a
+            // lock state the opener was never told about (e.g. while the
+            // TX queue was full or before sync), with nothing to correct it.
+            esp_err_t err = secure ? gdo_lock() : gdo_unlock();
+            if (err == ESP_OK) {
+                hap_char_update_val(write->hc, &(write->val));
+                *(write->status) = HAP_STATUS_SUCCESS;
             } else {
-                gdo_unlock();
+                ESP_LOGE(TAG, "lock command failed: %d", err);
+                *(write->status) = HAP_STATUS_COMM_ERR;
+                ret = HAP_FAIL;
             }
-            hap_char_update_val(write->hc, &(write->val));
-            *(write->status) = HAP_STATUS_SUCCESS;
 
         } else {
             // no other characteristics are settable
@@ -576,13 +597,23 @@ GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state) {
     }
 }
 
+// Callers push Target on every door-position event (every 500 ms while
+// gdolib interpolates position), so without this check a single transition
+// filled the queue and later Current/Light/Lock events were dropped. The
+// SDK ignores a repeated value anyway, so skipping it loses nothing. As
+// with the other notify_* functions, last_target is only committed once the
+// event is actually queued, so a dropped push is retried on the next call.
 void notify_homekit_target_door_state_change(uint8_t tgt) {
+    if (tgt == last_target.load()) return;
+
     GDOEvent e;
     e.dest = HomeKitNotifDest::DoorTargetState;
     e.value.u = tgt;
-    if (!gdo_notif_event_q ||
-        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) != pdTRUE) {
-        ESP_LOGE(TAG, "could not queue homekit notif of target door state");
+    if (gdo_notif_event_q &&
+        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
+        last_target.store(tgt);
+    } else {
+        ESP_LOGE(TAG, "could not queue homekit notif of target door state (queue full)");
     }
 }
 
@@ -623,13 +654,17 @@ static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_pr
 
         if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_ON)) {
             ESP_LOGI(TAG, "set light: %s", write->val.b ? "On" : "Off");
-            if (write->val.b) {
-                gdo_light_on();
+            // Same contract as the door and lock writes: report COMM_ERR and
+            // leave the characteristic alone when gdolib refuses the command.
+            esp_err_t err = write->val.b ? gdo_light_on() : gdo_light_off();
+            if (err == ESP_OK) {
+                hap_char_update_val(write->hc, &(write->val));
+                *(write->status) = HAP_STATUS_SUCCESS;
             } else {
-                gdo_light_off();
+                ESP_LOGE(TAG, "light command failed: %d", err);
+                *(write->status) = HAP_STATUS_COMM_ERR;
+                ret = HAP_FAIL;
             }
-            hap_char_update_val(write->hc, &(write->val));
-            *(write->status) = HAP_STATUS_SUCCESS;
 
         } else {
             // no other characteristics are settable
@@ -700,6 +735,23 @@ void notify_homekit_obstruction(gdo_obstruction_state_t obstructed) {
 // update the representation in homekit)
 void notify_homekit_current_lock(gdo_lock_state_t lock) {
     if (lock == last_lock) return;
+
+    // A change that did not come from HomeKit (wall panel, opener state at
+    // boot) has to move Lock Target State as well, otherwise Current and
+    // Target disagree and the Home app shows "Locking..." or "Unlocking..."
+    // until the next HomeKit write.
+    GDOEvent t;
+    t.dest = HomeKitNotifDest::LockTargetState;
+    t.value.u = (lock == GDO_LOCK_STATE_UNLOCKED)
+        ? HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED
+        : HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED;
+    // Bail without committing last_lock if Target could not be queued, so
+    // the next call retries both halves together.
+    if (!gdo_notif_event_q ||
+        xQueueSend(gdo_notif_event_q, &t, pdMS_TO_TICKS(20)) != pdTRUE) {
+        ESP_LOGE(TAG, "could not queue homekit notif of lock target state (queue full)");
+        return;
+    }
 
     GDOEvent e;
     e.dest = HomeKitNotifDest::LockCurrentState;
