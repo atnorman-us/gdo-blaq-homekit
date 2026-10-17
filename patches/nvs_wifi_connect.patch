@@ -1,8 +1,21 @@
 diff --git a/source/nvs_wifi_connect.c b/source/nvs_wifi_connect.c
-index d59140f..5907e72 100644
+index d59140f..0e8ec1f 100644
 --- a/source/nvs_wifi_connect.c
 +++ b/source/nvs_wifi_connect.c
-@@ -103,8 +103,7 @@ static void init_softap(char *ap_ssid, char *ap_pass)
+@@ -90,8 +90,10 @@ static void init_softap(char *ap_ssid, char *ap_pass)
+             .max_connection = AP_MAX_STA_CONN,
+             .authmode = WIFI_AUTH_WPA_WPA2_PSK},
+     };
+-    strcpy((char *)wifi_config.ap.ssid, ap_ssid);
+-    strcpy((char *)wifi_config.ap.password, ap_pass);
++    strncpy((char *)wifi_config.ap.ssid, ap_ssid, sizeof(wifi_config.ap.ssid));
++    strncpy((char *)wifi_config.ap.password, ap_pass, sizeof(wifi_config.ap.password));
++    wifi_config.ap.password[sizeof(wifi_config.ap.password) - 1] = 0;
++    wifi_config.ap.ssid_len = strnlen((const char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid));
+ 
+     if (strlen((char *)wifi_config.ap.password) < 8)
+     {
+@@ -103,8 +105,7 @@ static void init_softap(char *ap_ssid, char *ap_pass)
      ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
      ESP_ERROR_CHECK(esp_wifi_start());
  
@@ -12,7 +25,23 @@ index d59140f..5907e72 100644
  }
  
  static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
-@@ -162,14 +161,12 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
+@@ -141,8 +142,13 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
+                 .required = false},
+         },
+     };
+-    strcpy((char *)wifi_config.sta.ssid, sta_ssid);
+-    strcpy((char *)wifi_config.sta.password, sta_pass);
++    strncpy((char *)wifi_config.sta.ssid, sta_ssid, sizeof(wifi_config.sta.ssid));
++    strncpy((char *)wifi_config.sta.password, sta_pass, sizeof(wifi_config.sta.password));
++    wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = 0;
++    if (wifi_config.sta.password[0] == 0)
++    {
++        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
++    }
+ 
+     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+@@ -162,14 +168,12 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
       * happened. */
      if (bits & WIFI_CONNECTED_BIT)
      {
@@ -29,7 +58,18 @@ index d59140f..5907e72 100644
          err = ESP_FAIL;
      }
      else
-@@ -235,7 +232,7 @@ esp_err_t nvs_wifi_connect(void)
+@@ -208,8 +212,8 @@ _ret:
+ 
+ esp_err_t nvs_wifi_connect(void)
+ {
+-    char nvs_mode[32] = {0};
+-    char nvs_ssid[32] = {0};
++    char nvs_mode[64] = {0};
++    char nvs_ssid[64] = {0};
+     char nvs_password[64] = {0};
+ 
+     esp_err_t err = nvs_flash_init();
+@@ -235,16 +239,19 @@ esp_err_t nvs_wifi_connect(void)
                      return ESP_OK;
                  }
              }
@@ -37,8 +77,14 @@ index d59140f..5907e72 100644
 +            ESP_LOGE(TAG, "STA configuration or connection failed");
              err = ESP_ERR_INVALID_ARG;
          }
-         if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid) || nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password) == ESP_OK)
-@@ -244,7 +241,7 @@ esp_err_t nvs_wifi_connect(void)
+-        if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid) || nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password) == ESP_OK)
++        memset(nvs_ssid, 0, sizeof(nvs_ssid));
++        memset(nvs_password, 0, sizeof(nvs_password));
++        if (nvs_get_key_value_str(NVS_AP_ESP_WIFI_SSID_KEY, nvs_ssid) == ESP_OK && nvs_ssid[0] != 0 &&
++            nvs_get_key_value_str(NVS_AP_ESP_WIFI_PASS_KEY, nvs_password) == ESP_OK)
+         {
+-            init_softap(nvs_ssid, nvs_password); // ssid & pass OK
++            init_softap(nvs_ssid, nvs_password); // stored AP ssid & pass OK
              return err;
          }
      }
@@ -47,41 +93,455 @@ index d59140f..5907e72 100644
      init_softap(CONFIG_DEFAULT_AP_ESP_WIFI_SSID, CONFIG_DEFAULT_AP_ESP_WIFI_PASS);
  
      return ESP_ERR_INVALID_ARG;
+diff --git a/source/nvs_wifi_connect.html b/source/nvs_wifi_connect.html
+index c6d8eff..969b53b 100644
+--- a/source/nvs_wifi_connect.html
++++ b/source/nvs_wifi_connect.html
+@@ -1,198 +1,151 @@
+ <!DOCTYPE html>
++<html lang="en">
+ <head>
+-    <title>NVS WiFi connect</title>
+-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+-    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
++    <meta charset="utf-8">
++    <title>GDO blaQ WiFi setup</title>
++    <meta name="viewport" content="width=device-width, initial-scale=1">
+     <style>
+-        .column {
+-            float: left;
+-            width: 100%;
+-            margin-top: 2px;
+-            margin-bottom: 2px;
+-        }
+-
+-        .btn {
+-            float: left;
+-            width: 100%;
+-            margin: 2px;
+-
+-        }
+-
+-        .cl1 {
+-            float: left;
+-            width: 100%;
+-            margin: 2px;
+-            margin-top: 2px;
+-            margin-bottom: 2px;
+-        }
+-
+-        .cl01 {
+-            float: left;
+-            width: 100%;
+-            text-align: center;
+-            margin-top: 2px;
+-            margin-bottom: 2px;
+-        }
+-
+-        .cl02 {
+-            float: left;
+-            width: 100%;
+-            text-align: center;
+-            margin-top: 2px;
+-            margin-bottom: 2px;
+-        }
+-
+-        .hdr {
+-            float: left;
+-            width: 100%;
+-            text-align: center;
+-            color: white;
+-            background-color: blue;
+-            padding: 5px;
+-            margin: 5px;
+-        }
+-
+-        .logstr {
+-            width: 100%;
+-            float: left;
+-        }
++        body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; padding: 16px; background: #f4f4f6; color: #111; }
++        .card { max-width: 420px; margin: 0 auto; background: #fff; border-radius: 10px; padding: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
++        h1 { font-size: 1.2em; margin: 0 0 12px; }
++        label { display: block; font-size: .9em; margin: 12px 0 4px; }
++        input, select { width: 100%; box-sizing: border-box; font-size: 1em; padding: 8px; border: 1px solid #bbb; border-radius: 6px; }
++        .row { display: flex; gap: 8px; margin-top: 16px; }
++        button { flex: 1; font-size: 1em; padding: 10px; border: 0; border-radius: 6px; background: #2962ff; color: #fff; }
++        button.secondary { background: #e0e0e6; color: #111; }
++        button:disabled { opacity: .5; }
++        .show { display: flex; align-items: center; gap: 6px; font-size: .85em; margin-top: 6px; }
++        .show input { width: auto; }
++        #status { margin-top: 14px; font-size: .9em; min-height: 1.2em; }
++        .err { color: #b00020; }
++        .ok { color: #1b5e20; }
++        .hint { font-size: .8em; color: #555; margin-top: 4px; }
+     </style>
+-
+ </head>
+-
+ <body>
+-    <div class="hdr">Set WiFi params to NVS</div>
+-
+-    <div class="column">
+-        <button class="btn" id="goHome" >Home Page</button>
+-    </div>
+-
+-
+-    <div class="cl1">
+-        <label class="cl01" for="nvsApStaMode">Connect mode</label>
+-        <select class="cl02" id="nvsApStaMode">
+-            <option value="modeSta" selected>Connect to Wifi</option>
+-            <option value="modeAp">Create AP 192.168.4.1</option>
+-        </select>
+-    </div>
+-
+-    <div id="modeSta" style="display:block">
+-        <div class="cl1">
+-            <label class="cl01" for="nvsStaSsid">Wifi SSID</label>
+-            <input class="cl02" type="text" id="nvsStaSsid" placeholder="SSID..">
+-        </div>
+-
+-        <div class="cl1">
+-            <label class="cl01" for="nvsStaPass">Wifi Password</label>
+-            <input class="cl02" type="text" id="nvsStaPass" placeholder="Password..">
+-        </div>
++<div class="card">
++    <h1>GDO blaQ HomeKit &ndash; WiFi setup</h1>
++
++    <label for="nvsApStaMode">Connect mode</label>
++    <select id="nvsApStaMode">
++        <option value="modeSta" selected>Join my WiFi network</option>
++        <option value="modeAp">Create its own access point (192.168.4.1)</option>
++    </select>
++
++    <div id="modeSta">
++        <label for="nvsStaSsid">WiFi network name (SSID)</label>
++        <input type="text" id="nvsStaSsid" placeholder="2.4 GHz network" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="32">
++        <label for="nvsStaPass">WiFi password</label>
++        <input type="password" id="nvsStaPass" placeholder="Leave blank to keep the saved password" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="63">
++        <div class="hint">2.4 GHz networks only. Names and passwords are case-sensitive.</div>
+     </div>
+     <div id="modeAp" style="display:none">
+-        <div class="cl1">
+-            <label class="cl01" for="nvsApSsid">softAP SSID</label>
+-            <input class="cl02" type="text" id="nvsApSsid" placeholder="SSID..">
+-        </div>
+-
+-        <div class="cl1">
+-            <label class="cl01" for="nvsApPass">softAP Password</label>
+-            <input class="cl02" type="text" id="nvsApPass" placeholder="Password..">
+-        </div>
++        <label for="nvsApSsid">Access point name (SSID)</label>
++        <input type="text" id="nvsApSsid" placeholder="SSID" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="32">
++        <label for="nvsApPass">Access point password</label>
++        <input type="password" id="nvsApPass" placeholder="8+ characters, or blank for open" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="63">
+     </div>
++    <label class="show"><input type="checkbox" id="showPw"> Show password</label>
+ 
+-    <div class="column">
+-        <button class="btn" id="Wifi_Upload">Write WiFi data </button>
+-        <button class="btn" id="Wifi_Restart">Write WiFi data and restart</button>
++    <div class="row">
++        <button class="secondary" id="Wifi_Upload">Save</button>
++        <button id="Wifi_Restart">Save and reboot</button>
+     </div>
+-    <script>
+-    </script>
+-
+-    <script>/*WIFI обновление*/
+-
+-        document.getElementById("nvsApStaMode").addEventListener("input", function (e) {
+-            if (e.target.value == "modeSta") {
+-                document.getElementById("modeSta").style.display = "block";
+-                document.getElementById("modeAp").style.display = "none";
+-            } else {
+-                document.getElementById("modeSta").style.display = "none";
+-                document.getElementById("modeAp").style.display = "block";
+-            }
+-        });
+-
+-        document.getElementById("Wifi_Restart").addEventListener("click", function (e) {
+-            send_wifi_data();
+-            socket.send(JSON.stringify({ name: "Wifi_Restart", msg: "restart" }));
+-        });
+-        document.getElementById("Wifi_Upload").addEventListener("click", function (e) {
+-            send_wifi_data();
+-            socket.send(JSON.stringify({ name: "Wifi_Restart", msg: "write" }));
+-        });
+-        document.getElementById("goHome").addEventListener("click", function (e) {
+-            //onclick="window.location.href = '/'"
+-            socket.close();
+-            window.location.href = '/';
+-        });
+-
+-        function send_wifi_data() {
+-            let ssid;
+-            let pass;
+-            let ApStaMode
+-            if (document.getElementById("nvsApStaMode").value == "modeSta") {
+-                ssid = document.getElementById("nvsStaSsid");
+-                pass = document.getElementById("nvsStaPass");
+-            }
+-            else {
+-                ssid = document.getElementById("nvsApSsid");
+-                pass = document.getElementById("nvsApPass");
+-            }
+-            ApStaMode = document.getElementById("nvsApStaMode");
+-            socket.send(JSON.stringify({ name: ApStaMode.id, msg: ApStaMode.value }));
+-            socket.send(JSON.stringify({ name: ssid.id, msg: ssid.value }));
+-            socket.send(JSON.stringify({ name: pass.id, msg: pass.value }));
++    <div id="status"></div>
++</div>
++
++<script>
++    var socket = null;
++    var reconnectAttempts = 0;
++    var rebooting = false;
++    var MAX_RECONNECT = 10;
++
++    function $(id) { return document.getElementById(id); }
++    function setStatus(text, cls) { var el = $('status'); el.textContent = text; el.className = cls || ''; }
++    function setButtons(enabled) { $('Wifi_Upload').disabled = !enabled; $('Wifi_Restart').disabled = !enabled; }
++
++    $('nvsApStaMode').addEventListener('input', function (e) {
++        var sta = e.target.value === 'modeSta';
++        $('modeSta').style.display = sta ? 'block' : 'none';
++        $('modeAp').style.display = sta ? 'none' : 'block';
++    });
++    $('showPw').addEventListener('change', function (e) {
++        var t = e.target.checked ? 'text' : 'password';
++        $('nvsStaPass').type = t;
++        $('nvsApPass').type = t;
++    });
++
++    function sendJson(obj) { socket.send(JSON.stringify(obj)); }
++
++    // Sends mode, SSID and (only if the user typed one) the password. A blank
++    // password keeps whatever is already stored on the device.
++    function sendWifiData() {
++        var sta = $('nvsApStaMode').value === 'modeSta';
++        var ssid = sta ? $('nvsStaSsid') : $('nvsApSsid');
++        var pass = sta ? $('nvsStaPass') : $('nvsApPass');
++        if (!ssid.value) { setStatus('Enter a network name first.', 'err'); return false; }
++        if (!sta && pass.value && pass.value.length < 8) { setStatus('An access point password needs at least 8 characters.', 'err'); return false; }
++        if (!socket || socket.readyState !== WebSocket.OPEN) { setStatus('Not connected to the device yet - wait a moment and try again.', 'err'); return false; }
++        sendJson({ name: 'nvsApStaMode', msg: $('nvsApStaMode').value });
++        sendJson({ name: ssid.id, msg: ssid.value });
++        if (pass.value) sendJson({ name: pass.id, msg: pass.value });
++        return true;
++    }
++
++    $('Wifi_Restart').addEventListener('click', function () {
++        if (!sendWifiData()) return;
++        rebooting = true;
++        setButtons(false);
++        var sta = $('nvsApStaMode').value === 'modeSta';
++        setStatus(sta
++            ? 'Saved. The device is rebooting and will join "' + $('nvsStaSsid').value + '". Reconnect this computer to your own WiFi, then open http://gdo-blaq.local:8080/ to find it.'
++            : 'Saved. The device is rebooting and will start the access point "' + $('nvsApSsid').value + '".', 'ok');
++        sendJson({ name: 'Wifi_Restart', msg: 'restart' });
++    });
++    $('Wifi_Upload').addEventListener('click', function () {
++        if (!sendWifiData()) return;
++        sendJson({ name: 'Wifi_Restart', msg: 'write' });
++        setStatus('Saved. Power-cycle the device to apply.', 'ok');
++    });
++
++    function receiveWsData(data) {
++        try {
++            var obj = JSON.parse(data);
++            var el = $(obj.name);
++            if (!el) return;
++            el.value = obj.msg;
++            if (obj.name === 'nvsApStaMode') el.dispatchEvent(new Event('input'));
++        } catch (e) {
++            console.log('unexpected message: ' + data);
+         }
+-        function receiveWsData(data) {
+-            try {
+-                let obj = JSON.parse(data);
+-                document.getElementById(obj.name).value = obj.msg;
+-                if (obj.name == "nvsApStaMode") {
+-                    document.getElementById(obj.name).dispatchEvent(new Event('input'));
+-                }
+-            }
+-            catch
+-            {
+-                console.log(data + " catch");
+-            }
+-        };
+-    </script>
+-
+-    <script>  // Прием, обработка и отправка данных в WS
+-    </script>
++    }
+ 
+-    <script> // основной старт скрипта, открыть сокет
+-        // создать сокет по адресу
+-        let protocol = "ws:"
+-        if(document.location.protocol == "https:") protocol = "wss:"
+-        let wsHostStr = protocol + "//" + document.location.host + document.location.pathname;
+-        wsHostStr += (document.location.pathname == '/') ? "ws" : "/ws";
+-        var socket = new WebSocket(wsHostStr);
+-    </script>
+-
+-    <script> // события WS
++    function connect() {
++        var protocol = document.location.protocol === 'https:' ? 'wss:' : 'ws:';
++        var url = protocol + '//' + document.location.host + document.location.pathname;
++        url += (document.location.pathname === '/') ? 'ws' : '/ws';
++        socket = new WebSocket(url);
+         socket.onopen = function () {
+-            console.log("connect");
+-        };
+-        socket.onclose = function (event) {
+-            console.log("close");
+-            setTimeout(() => document.location.reload(), 2000);
++            reconnectAttempts = 0;
++            setButtons(true);
++            setStatus('Connected to the device.', 'ok');
+         };
+-        socket.onerror = function () {
+-            console.log("error");
+-            setTimeout(() => document.location.reload(), 2000);
+-        };
+-        socket.onmessage = function (event) {
+-            receiveWsData(event.data);
++        socket.onmessage = function (event) { receiveWsData(event.data); };
++        socket.onclose = function () {
++            setButtons(false);
++            if (rebooting) return;
++            if (reconnectAttempts++ < MAX_RECONNECT) {
++                setStatus('Connection to the device lost - reconnecting...', 'err');
++                setTimeout(connect, 2000);
++            } else {
++                setStatus('Could not reach the device. Make sure this computer is joined to the device’s WiFi, then reload this page.', 'err');
++            }
+         };
+-    </script>
+-
++        socket.onerror = function () { console.log('websocket error'); };
++    }
++    setButtons(false);
++    setStatus('Connecting to the device...');
++    connect();
++</script>
+ </body>
+-
+-</html>
+\ No newline at end of file
++</html>
 diff --git a/source/nvs_wifi_connect_http_server.c b/source/nvs_wifi_connect_http_server.c
-index b45134e..d34f4c4 100644
+index b45134e..14ddf70 100644
 --- a/source/nvs_wifi_connect_http_server.c
 +++ b/source/nvs_wifi_connect_http_server.c
-@@ -24,29 +24,27 @@ static int srv_restart = 0;
+@@ -23,30 +23,102 @@ enum
+ static int srv_restart = 0;
  static nvs_wifi_connect_register_uri_handler_t srv_register_uri_handler;
  
- // simple json parse -> only one parametr name/val
+-// simple json parse -> only one parametr name/val
 -static esp_err_t json_to_str_parm(char *jsonstr, char *nameStr, char *valStr) // распаковать строку json в пару  name/val
-+static esp_err_t json_to_str_parm(char *jsonstr, char *nameStr, char *valStr)
++// Decode the JSON string escapes a browser's JSON.stringify() produces into
++// `out` (out_size includes the terminator). jsmn hands back the raw escaped
++// bytes, so without this a password containing \ or " was stored escaped and
++// never matched the network. Returns -1 on an escape we do not support (\u)
++// or on overflow.
++static int json_unescape(const char *in, int in_len, char *out, int out_size)
  {
 -    int r; // количество токенов
-+    nameStr[0] = valStr[0] = 0;
-+    if (!jsonstr) return ESP_FAIL;
-     jsmn_parser p;
+-    jsmn_parser p;
 -    jsmntok_t t[5]; // только 2 пары параметров и obj
 -
-+    jsmntok_t t[5];
-     jsmn_init(&p);
+-    jsmn_init(&p);
 -    r = jsmn_parse(&p, jsonstr, strlen(jsonstr), t, sizeof(t) / sizeof(t[0]));
 -    if (r < 2)
--    {
++    int o = 0;
++    for (int i = 0; i < in_len; i++)
+     {
 -        valStr[0] = 0;
 -        nameStr[0] = 0;
 -        return ESP_FAIL;
--    }
++        char c = in[i];
++        if (c == '\\')
++        {
++            if (++i >= in_len) return -1;
++            switch (in[i])
++            {
++                case '"':  c = '"';  break;
++                case '\\': c = '\\'; break;
++                case '/':  c = '/';  break;
++                case 'b':  c = '\b'; break;
++                case 'f':  c = '\f'; break;
++                case 'n':  c = '\n'; break;
++                case 'r':  c = '\r'; break;
++                case 't':  c = '\t'; break;
++                default:   return -1; // \uXXXX only appears for control characters; reject
++            }
++        }
++        if (o >= out_size - 1) return -1;
++        out[o++] = c;
+     }
 -    strncpy(nameStr, jsonstr + t[2].start, t[2].end - t[2].start);
 -    nameStr[t[2].end - t[2].start] = 0;
 -    if (r > 3)
--    {
++    out[o] = 0;
++    return o;
++}
++
++// Escape a NUL-terminated string as a JSON string body (no quotes added).
++// Returns the number of bytes written, or -1 if it does not fit.
++static int json_escape(const char *in, char *out, int out_size)
++{
++    int o = 0;
++    for (; *in; in++)
+     {
 -        strncpy(valStr, jsonstr + t[4].start, t[4].end - t[4].start);
 -        valStr[t[4].end - t[4].start] = 0;
--    }
++        unsigned char c = (unsigned char)*in;
++        const char *esc = NULL;
++        char ubuf[8];
++        switch (c)
++        {
++            case '"':  esc = "\\\""; break;
++            case '\\': esc = "\\\\"; break;
++            case '\n': esc = "\\n";  break;
++            case '\r': esc = "\\r";  break;
++            case '\t': esc = "\\t";  break;
++            default:
++                if (c < 0x20)
++                {
++                    snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
++                    esc = ubuf;
++                }
++                break;
++        }
++        if (esc)
++        {
++            int n = strlen(esc);
++            if (o + n >= out_size) return -1;
++            memcpy(out + o, esc, n);
++            o += n;
++        }
++        else
++        {
++            if (o + 1 >= out_size) return -1;
++            out[o++] = (char)c;
++        }
+     }
 -    else
 -        valStr[0] = 0;
++    out[o] = 0;
++    return o;
++}
++
++// simple json parse -> only one parametr name/val
++static esp_err_t json_to_str_parm(char *jsonstr, char *nameStr, char *valStr)
++{
++    nameStr[0] = valStr[0] = 0;
++    if (!jsonstr) return ESP_FAIL;
++    jsmn_parser p;
++    jsmntok_t t[5];
++    jsmn_init(&p);
 +    int r = jsmn_parse(&p, jsonstr, strlen(jsonstr), t, 5);
 +    if (r != 5 || t[0].type != JSMN_OBJECT ||
 +        t[1].type != JSMN_STRING || t[2].type != JSMN_STRING ||
@@ -92,14 +552,66 @@ index b45134e..d34f4c4 100644
 +    int value_len = t[4].end - t[4].start;
 +    // Caller's buffers are key[16] and value[64], including the terminator.
 +    if (name_len <= 0 || name_len >= 16 || value_len < 0 || value_len >= 64) return ESP_FAIL;
-+    memcpy(nameStr, jsonstr + t[2].start, name_len);
-+    nameStr[name_len] = 0;
-+    memcpy(valStr, jsonstr + t[4].start, value_len);
-+    valStr[value_len] = 0;
++    if (json_unescape(jsonstr + t[2].start, name_len, nameStr, 16) < 0) return ESP_FAIL;
++    if (json_unescape(jsonstr + t[4].start, value_len, valStr, 64) < 0) return ESP_FAIL;
      return ESP_OK;
  }
  static void send_json_string(char *str, httpd_req_t *req)
-@@ -95,11 +93,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+@@ -59,34 +131,28 @@ static void send_json_string(char *str, httpd_req_t *req)
+     httpd_ws_send_frame(req, &ws_pkt);
+ }
+ // read & send initial wifi data from nvs
+-static void send_nvs_data(httpd_req_t *req)
++static void send_nvs_key(nvs_handle_t nvs_handle, const char *key, httpd_req_t *req)
+ {
+-    char buf[128] = {0};
+     char nvs_data[64] = {0};
++    char escaped[64 * 6] = {0};
++    char buf[sizeof(escaped) + 64] = {0};
++    size_t required_size = sizeof(nvs_data);
++    if (nvs_get_str(nvs_handle, key, nvs_data, &required_size) != ESP_OK) return;
++    if (json_escape(nvs_data, escaped, sizeof(escaped)) < 0) return;
++    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", key, escaped);
++    send_json_string(buf, req);
++}
++// Mode and SSIDs only. The stored passwords are deliberately not sent: the
++// setup AP is open, so anyone who joins it could otherwise read the home
++// WiFi password straight off the socket. The page keeps a saved password by
++// simply not resending the field when it is left blank.
++static void send_nvs_data(httpd_req_t *req)
++{
+     nvs_handle_t nvs_handle;
+-    size_t required_size = 0;
+-
+-    if(nvs_open(NVS_STORAGE_NAME, NVS_READWRITE, &nvs_handle)) {return;} // err open nvs
+-    required_size = sizeof(nvs_data);
+-    if(nvs_get_str(nvs_handle, NVS_STA_AP_DEFAULT_MODE_KEY, nvs_data, &required_size)==ESP_OK){
+-    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", NVS_STA_AP_DEFAULT_MODE_KEY, nvs_data);
+-    send_json_string(buf, req);}
+-    required_size = sizeof(nvs_data);
+-    if(nvs_get_str(nvs_handle, NVS_AP_ESP_WIFI_SSID_KEY, nvs_data, &required_size)==ESP_OK){
+-    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", NVS_AP_ESP_WIFI_SSID_KEY, nvs_data);
+-    send_json_string(buf, req);}
+-    required_size = sizeof(nvs_data);
+-    if(nvs_get_str(nvs_handle, NVS_AP_ESP_WIFI_PASS_KEY, nvs_data, &required_size)==ESP_OK){
+-    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", NVS_AP_ESP_WIFI_PASS_KEY, nvs_data);
+-    send_json_string(buf, req);}
+-    required_size = sizeof(nvs_data);
+-    if(nvs_get_str(nvs_handle, NVS_STA_ESP_WIFI_SSID_KEY, nvs_data, &required_size)==ESP_OK){
+-    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", NVS_STA_ESP_WIFI_SSID_KEY, nvs_data);
+-    send_json_string(buf, req);}
+-    required_size = sizeof(nvs_data);
+-    if(nvs_get_str(nvs_handle, NVS_STA_ESP_WIFI_PASS_KEY, nvs_data, &required_size)==ESP_OK){
+-    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", NVS_STA_ESP_WIFI_PASS_KEY, nvs_data);
+-    send_json_string(buf, req);}
++    if (nvs_open(NVS_STORAGE_NAME, NVS_READONLY, &nvs_handle) != ESP_OK) return;
++    send_nvs_key(nvs_handle, NVS_STA_AP_DEFAULT_MODE_KEY, req);
++    send_nvs_key(nvs_handle, NVS_AP_ESP_WIFI_SSID_KEY, req);
++    send_nvs_key(nvs_handle, NVS_STA_ESP_WIFI_SSID_KEY, req);
+     nvs_close(nvs_handle);
+ }
+ // write wifi data from ws to nvs
+@@ -95,11 +161,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
      char key[16];
      char value[64];
      nvs_handle_t nvs_handle;
@@ -114,7 +626,7 @@ index b45134e..d34f4c4 100644
      }
      else
      {
-@@ -107,7 +106,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+@@ -107,7 +174,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
          {
              if (nvs_set_str(nvs_handle, key, value)) // write key/value to nvs
              {
@@ -123,7 +635,7 @@ index b45134e..d34f4c4 100644
              }
              nvs_commit(nvs_handle);
              nvs_close(nvs_handle);
-@@ -150,6 +149,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
+@@ -150,6 +217,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
          ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
          return ret;
      }
@@ -131,3 +643,32 @@ index b45134e..d34f4c4 100644
      if (ws_pkt.len)
      {
          /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
+@@ -198,6 +266,7 @@ static httpd_handle_t start_webserver(void)
+ {
+     httpd_handle_t server = NULL;
+     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
++    config.lru_purge_enable = true;
+     // Start the httpd server
+     if (httpd_start(&server, &config) == ESP_OK)
+     {
+@@ -260,7 +329,6 @@ static void full_stop_httpd_server(void *arg, esp_event_base_t event_base,
+             ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler));
+             ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler));
+             ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, &connect_handler));
+-            ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, &disconnect_handler));
+             ESP_ERROR_CHECK(esp_event_handler_unregister(NVS_WIFI_CONNECT_STOP_HTTPD, NVS_WIFI_CONNECT_STOP_HTTPD_EVENT, &full_stop_httpd_server));
+             ESP_LOGI(TAG, "Unregister handlers OK");
+         }
+@@ -291,8 +359,11 @@ httpd_handle_t nvs_wifi_connect_start_http_server(int restart, nvs_wifi_connect_
+     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
+     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
+ 
++    // A station joining the softAP (re)starts the server if it is not
++    // running. A station LEAVING must not stop it: the server is shared by
++    // every client of the AP, and stopping it on one phone's departure
++    // dropped the WebSocket under the laptop that was still mid-setup.
+     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, &connect_handler, &server));
+-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, &disconnect_handler, &server));
+ 
+     ESP_ERROR_CHECK(esp_event_handler_register(NVS_WIFI_CONNECT_STOP_HTTPD, NVS_WIFI_CONNECT_STOP_HTTPD_EVENT, &full_stop_httpd_server, &server));
+ 
