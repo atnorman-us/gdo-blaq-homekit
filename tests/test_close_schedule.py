@@ -110,8 +110,54 @@ int main(void) {
  assert(!close_schedule_tz_valid("UTC\\0"));        /* no backslash */
  char longtz[80]; memset(longtz,'A',79); longtz[79]=0;
  assert(!close_schedule_tz_valid(longtz));
- char ok63[64]; memset(ok63,'A',63); ok63[63]=0;
- assert(close_schedule_tz_valid(ok63));
+ /* 63 characters is the longest accepted string. */
+ const char *ok63 = "<ABCDEFGHIJ>-12:34:56<ABCDEFGHIJ>-11:22:33,M12.5.6/167:59:59,J1";
+ assert(strlen(ok63)==63 && close_schedule_tz_valid(ok63));
+ return 0;
+}''')
+
+    def test_tz_valid_requires_a_form_newlib_tzset_parses(self):
+        # newlib's tzset() silently falls back to UTC for anything it cannot
+        # parse, so every accepted string must carry an explicit offset.
+        run_c(INC + r'''
+int main(void) {
+ /* What the dashboard's TZ_MAP and common hand-typed strings look like. */
+ assert(close_schedule_tz_valid("UTC0"));
+ assert(close_schedule_tz_valid("EST5EDT,M3.2.0,M11.1.0"));
+ assert(close_schedule_tz_valid("EST5EDT4,M3.2.0/2,M11.1.0/2"));
+ assert(close_schedule_tz_valid("GMT0BST,M3.5.0/1,M10.5.0"));
+ assert(close_schedule_tz_valid("EET-2EEST,M3.5.0/3,M10.5.0/4"));
+ assert(close_schedule_tz_valid("NZST-12NZDT,M9.5.0,M4.1.0/3"));
+ assert(close_schedule_tz_valid("AWST-8"));
+ assert(close_schedule_tz_valid("IST-5:30"));
+ assert(close_schedule_tz_valid("<-03>3"));
+ assert(close_schedule_tz_valid("<+0545>-5:45"));
+ assert(close_schedule_tz_valid("EST5EDT"));                 /* US default rules */
+ assert(close_schedule_tz_valid("XYZ-1ABC,J60/2,J300/2"));
+ assert(close_schedule_tz_valid("XYZ-1ABC,0,365"));
+ /* Names alone, or IANA zone names: tzset() reads these as UTC. */
+ assert(!close_schedule_tz_valid("EST"));
+ assert(!close_schedule_tz_valid("UTC"));
+ assert(!close_schedule_tz_valid("America/New_York"));
+ assert(!close_schedule_tz_valid("Europe/London"));
+ assert(!close_schedule_tz_valid("<+0530>"));
+ /* Malformed pieces newlib would misread or truncate. */
+ assert(!close_schedule_tz_valid("PST8PDT,M3.2.0"));          /* one rule only */
+ assert(!close_schedule_tz_valid("PST8PDT,M3.2.0,M11.1.0,x"));
+ assert(!close_schedule_tz_valid("PST8PDT,M13.2.0,M11.1.0"));
+ assert(!close_schedule_tz_valid("PST8PDT,M3.6.0,M11.1.0"));
+ assert(!close_schedule_tz_valid("PST8PDT,M3.2.7,M11.1.0"));
+ assert(!close_schedule_tz_valid("PST8PDT,M3.2.0/-1,M11.1.0"));
+ assert(!close_schedule_tz_valid("PST8PDT,J0,J1"));
+ assert(!close_schedule_tz_valid("PST8PDT,0,366"));
+ assert(!close_schedule_tz_valid("UTC25"));
+ assert(!close_schedule_tz_valid("UTC0:60"));
+ assert(!close_schedule_tz_valid("AB1"));                     /* name too short */
+ assert(!close_schedule_tz_valid("ABCDEFGHIJK1"));            /* name too long for newlib */
+ assert(!close_schedule_tz_valid("<AB>1"));
+ assert(!close_schedule_tz_valid("<+05:30>-5:30"));            /* ':' not allowed in <> */
+ assert(!close_schedule_tz_valid("UTC0 "));
+ assert(!close_schedule_tz_valid(":UTC0"));
  return 0;
 }''')
 
