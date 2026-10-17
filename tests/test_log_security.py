@@ -83,9 +83,10 @@ static size_t log_ring_buffer_read(char*b,size_t) {++reads;strcpy(b,"private log
 static int xSemaphoreTake(int,int) {return 1;}
 static void xSemaphoreGive(int) {}
 // Fake but deterministic stand-in for the real PBKDF2-HMAC-SHA256 - see test_controls.py.
-static void hash_admin_password(const char *password, size_t len, const uint8_t *salt, uint32_t iterations, uint8_t *out_hash) {
+static bool hash_admin_password(const char *password, size_t len, const uint8_t *salt, uint32_t iterations, uint8_t *out_hash) {
  memset(out_hash, 0, 32);
  for (size_t i = 0; i < len && i < 32; ++i) out_hash[i] = (uint8_t)password[i] ^ salt[i % 16] ^ (uint8_t)iterations;
+ return true;
 }
 '''
         for signature in ('static bool authorize_mutation(', 'static esp_err_t send_log_buffer(',

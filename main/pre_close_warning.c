@@ -57,8 +57,21 @@ void pre_close_warning_init(void)
              PRE_CLOSE_WARNING_BUZZER_GPIO, PRE_CLOSE_WARNING_LED_GPIO);
 }
 
+static bool s_buzzer_enabled = true;
+
+void pre_close_warning_set_buzzer_enabled(bool enabled)
+{
+    s_buzzer_enabled = enabled;
+}
+
+bool pre_close_warning_buzzer_enabled(void)
+{
+    return s_buzzer_enabled;
+}
+
 static inline void buzzer_set(bool on)
 {
+    if (!s_buzzer_enabled) on = false;
     ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, on ? BUZZER_DUTY_ON : BUZZER_DUTY_OFF);
     ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 }

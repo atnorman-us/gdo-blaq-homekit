@@ -75,21 +75,109 @@ static inline bool close_schedule_parse_hhmm(const char *s, uint16_t *minute)
     return true;
 }
 
+// Accepts exactly the POSIX TZ grammar that newlib's tzset() (the libc on
+// ESP-IDF) parses:
+//
+//   std offset [ dst [ offset ] [ ,start[/time],end[/time] ] ]
+//
+// where a name is 3-10 letters or <3-10 alphanumerics/+/->, an offset is
+// [+-]h[h][:mm[:ss]], and a rule is Mm.w.d, Jn or n. Anything else, newlib
+// does not reject: it silently falls back to UTC. "EST", "UTC" and
+// "America/New_York" all passed the old character-set check and all
+// produced a schedule that fired at the UTC time, not the local one.
+static inline bool close_schedule_tz_digits(const char **p, int min_digits, int max_digits,
+                                            int lo, int hi)
+{
+    const char *s = *p;
+    int n = 0, value = 0;
+    while (*s >= '0' && *s <= '9' && n < max_digits) {
+        value = value * 10 + (*s - '0');
+        s++; n++;
+    }
+    if (n < min_digits || value < lo || value > hi) return false;
+    *p = s;
+    return true;
+}
+
+static inline bool close_schedule_tz_name(const char **p)
+{
+    const char *s = *p;
+    size_t n = 0;
+    if (*s == '<') {
+        s++;
+        while ((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z') ||
+               (*s >= '0' && *s <= '9') || *s == '+' || *s == '-') { s++; n++; }
+        if (*s != '>') return false;
+        s++;
+    } else {
+        while ((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z')) { s++; n++; }
+    }
+    // newlib reads at most 10 characters of a name; a longer one leaves its
+    // tail where the offset should be and the whole string is dropped.
+    if (n < 3 || n > 10) return false;
+    *p = s;
+    return true;
+}
+
+// [+-]h[h][:m[m][:s[s]]]; max_hours is 24 for a zone offset and 167 for a
+// transition time (POSIX.1-2024). newlib reads a sign on a transition time
+// as a huge unsigned value, so one is only allowed where sign_ok is set.
+static inline bool close_schedule_tz_time(const char **p, bool sign_ok, int max_hours)
+{
+    const char *s = *p;
+    if (sign_ok && (*s == '+' || *s == '-')) s++;
+    if (!close_schedule_tz_digits(&s, 1, 3, 0, max_hours)) return false;
+    if (*s == ':') {
+        s++;
+        if (!close_schedule_tz_digits(&s, 1, 2, 0, 59)) return false;
+        if (*s == ':') {
+            s++;
+            if (!close_schedule_tz_digits(&s, 1, 2, 0, 59)) return false;
+        }
+    }
+    *p = s;
+    return true;
+}
+
+static inline bool close_schedule_tz_rule(const char **p)
+{
+    const char *s = *p;
+    if (*s == 'M') {
+        s++;
+        if (!close_schedule_tz_digits(&s, 1, 2, 1, 12) || *s++ != '.') return false;
+        if (!close_schedule_tz_digits(&s, 1, 1, 1, 5) || *s++ != '.') return false;
+        if (!close_schedule_tz_digits(&s, 1, 1, 0, 6)) return false;
+    } else if (*s == 'J') {
+        s++;
+        if (!close_schedule_tz_digits(&s, 1, 3, 1, 365)) return false;
+    } else if (!close_schedule_tz_digits(&s, 1, 3, 0, 365)) {
+        return false;
+    }
+    if (*s == '/') {
+        s++;
+        if (!close_schedule_tz_time(&s, false, 167)) return false;
+    }
+    *p = s;
+    return true;
+}
+
 static inline bool close_schedule_tz_valid(const char *tz)
 {
     if (!tz) return false;
     size_t n = strlen(tz);
     if (n == 0 || n > CLOSE_SCHEDULE_TZ_MAX_LEN) return false;
-    char first = tz[0];
-    if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '<')) return false;
-    for (size_t i = 0; i < n; i++) {
-        char c = tz[i];
-        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                  c == ',' || c == '.' || c == ':' || c == '/' || c == '+' || c == '-' ||
-                  c == '<' || c == '>' || c == '_';
-        if (!ok) return false;
-    }
-    return true;
+    const char *p = tz;
+    if (!close_schedule_tz_name(&p)) return false;
+    if (!close_schedule_tz_time(&p, true, 24)) return false;   // std offset is mandatory
+    if (*p == '\0') return true;
+    if (!close_schedule_tz_name(&p)) return false;             // dst name
+    if (*p != ',' && *p != '\0' && !close_schedule_tz_time(&p, true, 24)) return false;
+    if (*p == '\0') return true;   // no rules: newlib applies the US defaults
+    if (*p++ != ',') return false;
+    if (!close_schedule_tz_rule(&p)) return false;
+    if (*p++ != ',') return false;
+    if (!close_schedule_tz_rule(&p)) return false;
+    return *p == '\0';
 }
 
 typedef enum {
