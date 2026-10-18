@@ -624,6 +624,10 @@ static void process_door_position(const gdo_status_t *status)
 // nothing has ever been saved (first boot, or NVS was erased): NVS simply
 // won't have the namespace/keys yet, which is treated as "nothing to
 // seed," not an error.
+// True when the protocol was pinned from NVS at boot (a previously confirmed
+// sync). A protocol gdolib merely fell back to in this boot is not pinned.
+static bool s_protocol_pinned = false;
+
 static void gdo_load_persisted_rolling_state(void)
 {
     nvs_handle_t handle;
@@ -652,6 +656,7 @@ static void gdo_load_persisted_rolling_state(void)
         if (gdo_set_protocol((gdo_protocol_type_t)protocol) != ESP_OK) {
             ESP_LOGW(TAG, "Failed to pin persisted protocol (%d)", protocol);
         } else {
+            s_protocol_pinned = true;
             ESP_LOGI(TAG, "Pinned protocol to last confirmed value: %s",
                      gdo_protocol_type_to_string((gdo_protocol_type_t)protocol));
         }
@@ -1058,6 +1063,19 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             s_sync_retry_count++;
             uint32_t shift = (s_sync_retry_count > 4) ? 4 : (s_sync_retry_count - 1);
             uint32_t jump = 100u << shift;
+
+            // "Security+ 2.0" is only gdolib's fallback once the V1 probes
+            // hear nothing, and gdolib keeps that fallback for the rest of
+            // the boot. If the opener was wired up (or powered) after the
+            // probe ran, a V1 opener then sits unsynced forever. Unless the
+            // protocol was pinned from a previously confirmed sync, re-run
+            // the full detection every third failed attempt.
+            if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2 && !s_protocol_pinned &&
+                (s_sync_retry_count % 3) == 0) {
+                if (gdo_reset_protocol() == ESP_OK) {
+                    ESP_LOGW(TAG, "Security+ 2.0 sync keeps failing and was never confirmed - re-running protocol detection");
+                }
+            }
 
             if (gdo_set_rolling_code(status->rolling_code + jump) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to set rolling code");
@@ -1546,8 +1564,13 @@ static void gdo_watchdog_task(void *arg)
                 bool pending = status.synced && !s_door_in_transition &&
                     ((status.door_target == 0 && status.door == GDO_DOOR_STATE_CLOSED) ||
                      (status.door_target == 10000 && status.door == GDO_DOOR_STATE_OPEN));
+                // No retry on a toggle-only (Security+ 1.0) opener: a second
+                // TOGGLE against stale state can reverse or stop the door.
+                // gdo_retry_door_command() refuses it as well; this keeps the
+                // 5 s close warning from sounding for a command never sent.
                 retry_action_t action = retry_budget_step(&retry_budget, status.door_command_id,
-                                                          pending, now, GDO_MOTOR_ENGAGE_TIMEOUT_MS);
+                                                          pending, !status.toggle_only,
+                                                          now, GDO_MOTOR_ENGAGE_TIMEOUT_MS);
                 if (action == RETRY_SEND) {
                     uint32_t generation;
                     { ControlGuard guard; generation = s_close_generation; }
@@ -1562,7 +1585,18 @@ static void gdo_watchdog_task(void *arg)
                     }
                 } else if (action == RETRY_REVERT) {
                     notify_homekit_target_door_state_change(status.door == GDO_DOOR_STATE_OPEN ? TGT_OPEN : TGT_CLOSED);
-                    ESP_LOGW(TAG, "Door request exhausted its single retry");
+                    ESP_LOGW(TAG, "%s", status.toggle_only
+                                  ? "Door request not acted on; not retried on a toggle-only opener"
+                                  : "Door request exhausted its single retry");
+                    ControlGuard guard;
+                    if (status.door == GDO_DOOR_STATE_OPEN && s_auto_close_triggered) {
+                        // The close the auto-close sent never happened. Start
+                        // the timeout over instead of leaving the flag set,
+                        // which would also block the scheduled close.
+                        ESP_LOGW(TAG, "Auto-close did not take effect - restarting its timeout");
+                        s_auto_close_triggered = false;
+                        s_door_open_since_ms = now_ms();
+                    }
                 }
             }
         }
