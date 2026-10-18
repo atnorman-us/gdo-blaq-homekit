@@ -25,6 +25,7 @@
 #include "gdo.h"
 #include "gdo_settings.h"
 #include "close_schedule.h"
+#include "request_origin.h"
 #include "clock_sync.h"
 #include "diagnostics_counters.h"
 
@@ -52,6 +53,10 @@ static const char *TAG = "DIAGWEB";
 // WiFi bounce - the underlying httpd socket doesn't reliably survive an
 // interface going down and coming back up.
 static httpd_handle_t s_server = nullptr;
+// True once the server has started successfully, so a restart that fails
+// (sockets exhausted, heap pressure) is retried on the next network event
+// instead of being skipped forever because s_server is null.
+static bool s_server_started_once = false;
 
 // Reused across every /logs and /logs/download request instead of
 // malloc()/free() per request. The dashboard auto-refreshes /logs every 3s
@@ -125,13 +130,46 @@ static bool s_admin_password_set = false;
 // (CONFIG_MBEDTLS_HARDWARE_SHA).
 #define ADMIN_PASSWORD_PBKDF2_ITERATIONS 4096
 
-static void hash_admin_password(const char *password, size_t len, const uint8_t *salt,
+// Returns false if the KDF failed (e.g. SHA-256 unavailable, out of memory),
+// in which case out_hash is unspecified and must not be stored or compared.
+static bool hash_admin_password(const char *password, size_t len, const uint8_t *salt,
                                  uint32_t iterations, uint8_t *out_hash)
 {
-    mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256,
-                                   (const unsigned char *)password, len,
-                                   salt, sizeof(s_admin_pw_salt),
-                                   iterations, sizeof(s_admin_pw_hash), out_hash);
+    int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256,
+                                            (const unsigned char *)password, len,
+                                            salt, sizeof(s_admin_pw_salt),
+                                            iterations, sizeof(s_admin_pw_hash), out_hash);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "PBKDF2 failed: -0x%04x", (unsigned)-rc);
+        return false;
+    }
+    return true;
+}
+
+// Reads one request header into buf (empty string when absent or too long
+// to be a legitimate value for these headers).
+static void copy_req_header(httpd_req_t *req, const char *name, char *buf, size_t size)
+{
+    buf[0] = '\0';
+    size_t len = httpd_req_get_hdr_value_len(req, name);
+    if (len == 0 || len >= size) return;
+    if (httpd_req_get_hdr_value_str(req, name, buf, size) != ESP_OK) buf[0] = '\0';
+}
+
+// See request_origin.h. Applied to the one endpoint that has no password
+// check; the answer is a 403 so the page's own error path reports it.
+static bool reject_unless_own_page(httpd_req_t *req)
+{
+    char host[128], origin[160], site[32];
+    copy_req_header(req, "Host", host, sizeof(host));
+    copy_req_header(req, "Origin", origin, sizeof(origin));
+    copy_req_header(req, "Sec-Fetch-Site", site, sizeof(site));
+    if (request_from_own_page(host, origin, site)) return true;
+    ESP_LOGW(TAG, "Refusing cross-origin request (Host=%s Origin=%s Sec-Fetch-Site=%s)",
+             host, origin, site);
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "Cross-origin request refused - open the diagnostics page by the device's IP address or gdo-blaq.local");
+    return false;
 }
 
 // Loads a previously-set password's salt+hash+iteration count, if any.
@@ -169,6 +207,9 @@ static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Admin password already set");
         return ESP_FAIL;
     }
+    // Before any password exists this is the only unauthenticated write, and
+    // a plain POST from any web page on the LAN could otherwise set it.
+    if (!reject_unless_own_page(req)) return ESP_FAIL;
     if (req->content_len < ADMIN_PASSWORD_MIN_LEN || req->content_len > ADMIN_PASSWORD_MAX_LEN) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be 8-64 characters");
         return ESP_FAIL;
@@ -185,12 +226,38 @@ static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
     }
     password[received] = '\0';
 
+    // Every later request carries this password in the X-GDO-Token header.
+    // Browsers strip leading/trailing whitespace from header values and
+    // cannot send non-ASCII bytes in one, so a password with either would be
+    // stored here and then never match again - a permanent lockout.
+    for (int i = 0; i < received; ++i) {
+        unsigned char c = (unsigned char)password[i];
+        if (c < 0x20 || c > 0x7e) {
+            memset(password, 0, sizeof(password));
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "Password must use printable ASCII characters only");
+            return ESP_FAIL;
+        }
+    }
+    if (password[0] == ' ' || password[received - 1] == ' ') {
+        memset(password, 0, sizeof(password));
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Password cannot start or end with a space");
+        return ESP_FAIL;
+    }
+
     uint8_t salt[sizeof(s_admin_pw_salt)];
     esp_fill_random(salt, sizeof(salt));
     uint8_t hash[sizeof(s_admin_pw_hash)];
-    hash_admin_password(password, (size_t)received, salt, ADMIN_PASSWORD_PBKDF2_ITERATIONS, hash);
+    bool hashed = hash_admin_password(password, (size_t)received, salt,
+                                      ADMIN_PASSWORD_PBKDF2_ITERATIONS, hash);
     // Done with the plaintext - don't let it linger in memory any longer than needed.
     memset(password, 0, sizeof(password));
+    if (!hashed) {
+        // Storing an uninitialised hash would lock the device out for good.
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open("gdo_admin", NVS_READWRITE, &handle);
@@ -228,7 +295,11 @@ static bool authorize_mutation(httpd_req_t *req)
         return false;
     }
     uint8_t candidate[sizeof(s_admin_pw_hash)];
-    hash_admin_password(supplied, strlen(supplied), s_admin_pw_salt, s_admin_pw_iterations, candidate);
+    if (!hash_admin_password(supplied, strlen(supplied), s_admin_pw_salt, s_admin_pw_iterations, candidate)) {
+        // Fail closed: an uninitialised candidate must never be compared.
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Admin password could not be verified");
+        return false;
+    }
     unsigned difference = 0;
     for (size_t i = 0; i < sizeof(candidate); ++i) difference |= candidate[i] ^ s_admin_pw_hash[i];
     if (difference) {
@@ -274,6 +345,11 @@ static bool s_ota_upload_in_progress = false;
 // (or a fresh confirm/cancel cycle) just overwrites the same inactive
 // partition, so there's nothing to explicitly "undo" on cancel/expiry.
 static const esp_partition_t *s_ota_pending_partition = nullptr;
+// The slot most recently written by an upload that has not been confirmed.
+// esp_ota_begin() erased the firmware that was there, so "roll back to the
+// other slot" would boot the cancelled upload, not the previous release.
+// Cleared only by a confirm (which reboots) or a reboot.
+static const esp_partition_t *s_ota_unconfirmed_partition = nullptr;
 static int64_t s_ota_pending_since_ms = 0;
 static char s_ota_pending_version[32] = {0};
 #define OTA_CONFIRM_EXPIRY_MS (10 * 60 * 1000)
@@ -380,6 +456,7 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
     const char *version = (desc_err == ESP_OK) ? app_desc.version : "unknown";
 
     s_ota_pending_partition = target;
+    s_ota_unconfirmed_partition = target;
     s_ota_pending_since_ms = esp_timer_get_time() / 1000;
     snprintf(s_ota_pending_version, sizeof(s_ota_pending_version), "%s", version);
 
@@ -459,6 +536,11 @@ static esp_err_t firmware_rollback_post_handler(httpd_req_t *req)
                              "Other OTA slot has no valid image to roll back to");
         return ESP_FAIL;
     }
+    if (other == s_ota_unconfirmed_partition) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                             "The other slot holds an upload that was never confirmed, not the previous firmware. Upload again and choose Confirm instead.");
+        return ESP_FAIL;
+    }
 
     esp_err_t err = esp_ota_set_boot_partition(other);
     if (err != ESP_OK) {
@@ -528,6 +610,38 @@ static esp_err_t auto_close_settings_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
 }
 
+// Body: "enabled=1" or "enabled=0". Mutes/unmutes the buzzer of the 5 s
+// warning that precedes every firmware-initiated close; the LED flash and
+// the warning period itself are unaffected.
+static esp_err_t pre_close_buzzer_post_handler(httpd_req_t *req)
+{
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    char buf[32] = {};
+    int len = req->content_len;
+    if (len <= 0 || len >= (int)sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body length");
+        return ESP_FAIL;
+    }
+    int received = 0;
+    while (received < len) {
+        int n = httpd_req_recv(req, buf + received, len - received);
+        if (n <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+            return ESP_FAIL;
+        }
+        received += n;
+    }
+    buf[received] = '\0';
+    bool enabled = (strstr(buf, "enabled=1") != nullptr);
+    if (gdo_set_pre_close_buzzer(enabled) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Pre-close buzzer %s via web", enabled ? "enabled" : "muted");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
+
 // Body: application/x-www-form-urlencoded, e.g.
 // "enabled=1&time=23%3A00&tz=PST8PDT%2CM3.2.0%2CM11.1.0". The timezone can
 // contain characters the browser percent-encodes, so this one does use the
@@ -561,7 +675,8 @@ static esp_err_t close_schedule_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Time must be HH:MM (00:00-23:59)");
         return ESP_FAIL;
     default:
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid timezone string");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Timezone must be a POSIX TZ string with a UTC offset, e.g. EST5EDT,M3.2.0,M11.1.0 (not a name like EST or America/New_York)");
         return ESP_FAIL;
     }
 
@@ -741,6 +856,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "      <div class=\"label\"><span class=\"ic\">&#9201;</span>Close after</div>"
         "      <span class=\"value mono\"><input type=\"number\" id=\"acMinutes\" min=\"1\" value=\"60\"> min</span>"
         "    </div>"
+        "    <div class=\"row\">"
+        "      <div class=\"label\"><span class=\"ic\">&#128276;</span>Beep before closing</div>"
+        "      <label class=\"switch\"><input type=\"checkbox\" id=\"pcBuzzer\" checked onchange=\"savePreCloseBuzzer(this)\"><span class=\"track\"></span></label>"
+        "    </div>"
+        "    <div class=\"hint\">Applies to closes started by the Home app, auto-close and scheduled close. Off keeps the 5-second light warning and cancel window, just without the sound.</div>"
         "    <div class=\"divider\"></div>"
         "    <div class=\"btnrow\">"
         "      <button class=\"primary\" onclick=\"saveAutoClose()\">Save</button>"
@@ -837,6 +957,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  const pw1 = await askPassword('Set an admin password for this device (min 8 characters):');"
         "  if(!pw1) return;"
         "  if(pw1.length < 8){ alert('Password must be at least 8 characters.'); return; }"
+        "  if(!/^[\\x20-\\x7e]+$/.test(pw1) || pw1 !== pw1.trim()){ alert('Use printable ASCII characters only, with no leading or trailing spaces - the password is sent as an HTTP header, which cannot carry other characters.'); return; }"
         "  if(pw1 !== await askPassword('Confirm the admin password:')){ alert('Passwords did not match.'); return; }"
         "  try{"
         "    const r = await fetch('/admin/set-password', {method:'POST', body:pw1});"
@@ -909,6 +1030,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "      document.getElementById('acMinutes').value = s.auto_close_minutes;"
         "      acLoaded = true;"
         "    }"
+        "    if (!pcSaving && typeof s.pre_close_buzzer === 'boolean') document.getElementById('pcBuzzer').checked = s.pre_close_buzzer;"
         "    acRemainingS = (typeof s.auto_close_remaining_s === 'number') ? s.auto_close_remaining_s : null;"
         "    renderCountdown();"
         "    if (!scLoaded) {"
@@ -971,9 +1093,30 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    renderCountdown();"
         "  }"
         "}, 1000);"
+        "let pcSaving = false;"
+        "async function savePreCloseBuzzer(el){"
+        "  const enabled = el.checked ? 1 : 0;"
+        "  const statusEl = document.getElementById('acStatus');"
+        "  pcSaving = true; statusEl.textContent = 'Saving...';"
+        "  try{"
+        "    const r = await fetch('/settings/pre-close-buzzer', {"
+        "      method: 'POST',"
+        "      headers: {...await authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded'},"
+        "      body: 'enabled=' + enabled"
+        "    });"
+        "    if(!r.ok){ if(r.status===401) adminToken=''; throw new Error(await r.text()); }"
+        "    statusEl.textContent = enabled ? 'Beep on.' : 'Beep muted.';"
+        "    setTimeout(function(){ statusEl.textContent = ''; }, 3000);"
+        "  }catch(e){"
+        "    el.checked = !el.checked;"
+        "    statusEl.textContent = 'Save failed: ' + e.message;"
+        "  }"
+        "  pcSaving = false;"
+        "}"
         "async function saveAutoClose(){"
         "  const enabled = document.getElementById('acEnabled').checked ? 1 : 0;"
-        "  const minutes = parseInt(document.getElementById('acMinutes').value, 10) || 60;"
+        "  const minutesRaw = parseInt(document.getElementById('acMinutes').value, 10);"
+        "  const minutes = Number.isNaN(minutesRaw) ? 60 : minutesRaw;"
         "  const statusEl = document.getElementById('acStatus');"
         "  statusEl.textContent = 'Saving...';"
         "  try{"
@@ -1226,6 +1369,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"log_buffer_capacity\":%u,"
         "\"auto_close_enabled\":%s,"
         "\"auto_close_minutes\":%u,"
+        "\"pre_close_buzzer\":%s,"
         "\"auto_close_remaining_s\":%lld,"
         "\"close_schedule_enabled\":%s,"
         "\"close_schedule_time\":\"%02u:%02u\","
@@ -1263,6 +1407,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         (unsigned)log_ring_buffer_capacity(),
         gdo_get_auto_close_enabled() ? "true" : "false",
         (unsigned)(gdo_get_auto_close_timeout_ms() / 60000),
+        gdo_get_pre_close_buzzer() ? "true" : "false",
         auto_close_remaining_s,
         sched.enabled ? "true" : "false",
         (unsigned)(sched.minute / 60), (unsigned)(sched.minute % 60),
@@ -1331,7 +1476,7 @@ static bool start_httpd_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = DIAG_WEB_PORT;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 16;
     config.lru_purge_enable = true;
     // Flash-write paths in the firmware upload handler want more headroom
     // than the 4KB default, and a ~1.7MB upload over a slow WiFi link
@@ -1374,6 +1519,11 @@ static bool start_httpd_server(void)
     restart_uri.uri = "/restart";
     restart_uri.method = HTTP_POST;
     restart_uri.handler = restart_post_handler;
+
+    httpd_uri_t pre_close_buzzer_uri = {};
+    pre_close_buzzer_uri.uri = "/settings/pre-close-buzzer";
+    pre_close_buzzer_uri.method = HTTP_POST;
+    pre_close_buzzer_uri.handler = pre_close_buzzer_post_handler;
 
     httpd_uri_t auto_close_uri = {};
     auto_close_uri.uri = "/settings/auto-close";
@@ -1438,6 +1588,10 @@ static bool start_httpd_server(void)
     if (httpd_register_uri_handler(s_server, &restart_uri) != ESP_OK) {
         httpd_stop(s_server);
         s_server = nullptr;
+        return false;
+    }
+    if (httpd_register_uri_handler(s_server, &pre_close_buzzer_uri) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register /settings/pre-close-buzzer handler");
         return false;
     }
     if (httpd_register_uri_handler(s_server, &auto_close_uri) != ESP_OK) {
@@ -1527,6 +1681,7 @@ static void wait_for_network_and_start_task(void *arg)
         // Do not accept an OTA image before its recovery interface works.
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+    s_server_started_once = true;
 
     // Advertise http://gdo-blaq.local:8080/ so the diagnostics page doesn't
     // require hunting for the device's IP. mdns_init() is safe to call even
@@ -1571,14 +1726,18 @@ static void wait_for_network_and_start_task(void *arg)
 // process of starting it for the first time, and this avoids racing that.
 extern "C" void diag_webserver_restart(void)
 {
-    if (!s_server) {
+    if (!s_server && !s_server_started_once) {
         return;
     }
 
     ESP_LOGI(TAG, "Restarting diagnostics web server after network change");
-    httpd_stop(s_server);
-    s_server = nullptr;
-    start_httpd_server();
+    if (s_server) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+    }
+    if (!start_httpd_server()) {
+        ESP_LOGE(TAG, "Diagnostics web server did not restart - will retry on the next network event");
+    }
 }
 
 void diag_webserver_start(void)

@@ -33,6 +33,7 @@ static uint32_t s_close_generation;
 static uint32_t s_user_close_pending_generation;
 static int warnings, closes, opens, allocation_failure, task_failure, allocated;
 static bool s_user_close_pending;
+static volatile bool s_door_in_transition = false;
 static std::vector<std::pair<void(*)(void*), void*>> pending_tasks;
 static int gdo_get_status(gdo_status_t *p) {*p=current;return ESP_OK;}
 static int gdo_door_close() {++closes;return ESP_OK;}
@@ -53,6 +54,9 @@ static void run_oldest_pending_task() {
 }
 ''' + task + opening + close + r'''
 int main() {
+ current.door=GDO_DOOR_STATE_CLOSED;
+ assert(gdo_control_close()==ESP_OK); assert(pending_tasks.empty() && closes==0); // already closed: nothing to do
+ current.door=GDO_DOOR_STATE_OPEN;
  assert(gdo_control_close()==ESP_OK); assert(warnings==0 && closes==0);
  assert(gdo_control_open()==ESP_OK); run_oldest_pending_task();
  assert(closes==0 && allocated==0);

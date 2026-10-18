@@ -157,12 +157,15 @@ typedef int esp_err_t;
 typedef union { uint32_t u; bool b; } hap_val_t;
 struct hap_char_t { const char *uuid; hap_val_t value; };
 struct hap_write_data_t { hap_char_t *hc; hap_val_t val; int *status; };
-static int command_result, opens, closes;
+#include <atomic>
+#define HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED 1
+static int command_result, opens, closes, locks, unlocks;
+static std::atomic<uint8_t> last_target{0xFF};
 static const char *hap_char_get_type_uuid(hap_char_t *hc) { return hc->uuid; }
 static int gdo_control_open() { ++opens; return command_result; }
 static int gdo_control_close() { ++closes; return command_result; }
-static void gdo_lock() {}
-static void gdo_unlock() {}
+static int gdo_lock() { ++locks; return command_result; }
+static int gdo_unlock() { ++unlocks; return command_result; }
 static void hap_char_update_val(hap_char_t *hc, hap_val_t *v) { hc->value = *v; }
 '''
         source += function('main/homekit.cpp', 'static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv) {')
@@ -173,12 +176,126 @@ int main() {
  hap_write_data_t write = {&door, {.u = 1}, &status};
  assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_SUCCESS);
  assert(status == HAP_STATUS_SUCCESS && door.value.u == 1 && closes == 1);
+ // An accepted write is recorded for the notify path's deduplication.
+ assert(last_target.load() == 1);
  door.value.u = 0; command_result = 1;
  assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_FAIL);
  assert(status == HAP_STATUS_COMM_ERR && door.value.u == 0 && closes == 2);
+ assert(last_target.load() == 1);
  write.val.u = 5;
  assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_FAIL);
  assert(status == HAP_STATUS_VAL_INVALID && closes == 2 && opens == 0);
+
+ // Lock Target State: committed only when gdolib accepted the command.
+ command_result = 0;
+ hap_char_t lock = {"lock", {.u = 0}};
+ hap_write_data_t lock_write = {&lock, {.u = 1}, &status};
+ assert(gdo_svc_set(&lock_write, 1, nullptr, nullptr) == HAP_SUCCESS);
+ assert(status == HAP_STATUS_SUCCESS && lock.value.u == 1 && locks == 1 && unlocks == 0);
+ lock_write.val.u = 0; command_result = 0x103;
+ assert(gdo_svc_set(&lock_write, 1, nullptr, nullptr) == HAP_FAIL);
+ assert(status == HAP_STATUS_COMM_ERR && lock.value.u == 1 && unlocks == 1);
+}
+'''
+        run_c(source, cpp=True)
+
+    def test_light_write_reports_failure_without_committing(self):
+        source = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGE(...) ((void)0)
+#define ESP_OK 0
+#define HAP_SUCCESS 0
+#define HAP_FAIL -1
+#define HAP_STATUS_SUCCESS 0
+#define HAP_STATUS_COMM_ERR -2
+#define HAP_STATUS_RES_ABSENT -4
+#define HAP_CHAR_UUID_ON "on"
+typedef int esp_err_t;
+typedef union { uint32_t u; bool b; } hap_val_t;
+struct hap_char_t { const char *uuid; hap_val_t value; };
+struct hap_write_data_t { hap_char_t *hc; hap_val_t val; int *status; };
+static int command_result, ons, offs;
+static const char *hap_char_get_type_uuid(hap_char_t *hc) { return hc->uuid; }
+static int gdo_light_on() { ++ons; return command_result; }
+static int gdo_light_off() { ++offs; return command_result; }
+static void hap_char_update_val(hap_char_t *hc, hap_val_t *v) { hc->value = *v; }
+'''
+        source += function('main/homekit.cpp', 'static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv) {')
+        source += r'''
+int main() {
+ hap_char_t light = {"on", {.b = false}};
+ int status = 99;
+ hap_write_data_t write = {&light, {.b = true}, &status};
+ assert(light_svc_set(&write, 1, nullptr, nullptr) == HAP_SUCCESS);
+ assert(status == HAP_STATUS_SUCCESS && light.value.b && ons == 1);
+ // gdolib refused (queue full / not synced): HomeKit must not be told the
+ // light is now off.
+ write.val.b = false; command_result = 0x101;
+ assert(light_svc_set(&write, 1, nullptr, nullptr) == HAP_FAIL);
+ assert(status == HAP_STATUS_COMM_ERR && light.value.b && offs == 1);
+ hap_char_t other = {"other", {.b = false}};
+ hap_write_data_t bad = {&other, {.b = true}, &status};
+ assert(light_svc_set(&bad, 1, nullptr, nullptr) == HAP_FAIL);
+ assert(status == HAP_STATUS_RES_ABSENT && ons == 1 && offs == 1);
+}
+'''
+        run_c(source, cpp=True)
+
+    def test_target_pushes_are_deduplicated_and_retried_after_a_drop(self):
+        # Compile the real producer functions against a fake FreeRTOS queue
+        # that can be made full, so the commit-on-success rule is exercised.
+        source = r'''
+#include <assert.h>
+#include <atomic>
+#include <stdint.h>
+#include <vector>
+#define ESP_LOGE(...) ((void)0)
+#define pdTRUE 1
+#define pdFALSE 0
+#define pdMS_TO_TICKS(ms) (ms)
+#define HOMEKIT_TARGET_UNKNOWN 0xFF
+enum gdo_door_state_t { GDO_DOOR_STATE_UNKNOWN, GDO_DOOR_STATE_OPEN, GDO_DOOR_STATE_CLOSED,
+ GDO_DOOR_STATE_STOPPED, GDO_DOOR_STATE_OPENING, GDO_DOOR_STATE_CLOSING, GDO_DOOR_STATE_MAX };
+enum class HomeKitNotifDest { DoorCurrentState, DoorTargetState };
+struct GDOEvent { HomeKitNotifDest dest; union { bool b; uint8_t u; } value; };
+typedef int QueueHandle_t;
+static QueueHandle_t gdo_notif_event_q = 1;
+static std::vector<GDOEvent> queued;
+static bool queue_full;
+static int xQueueSend(QueueHandle_t, const GDOEvent *e, int) {
+ if (queue_full) return pdFALSE; queued.push_back(*e); return pdTRUE; }
+static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
+static std::atomic<uint8_t> last_target{HOMEKIT_TARGET_UNKNOWN};
+static uint8_t map_gdo_to_homekit_state(gdo_door_state_t d) { return (uint8_t)d; }
+'''
+        source += function('main/homekit.cpp', 'void notify_homekit_target_door_state_change(uint8_t tgt) {')
+        source += function('main/homekit.cpp', 'void notify_homekit_current_door_state_change(gdo_door_state_t door) {')
+        source += r'''
+int main() {
+ // Every position event during a transition pushes the same Target.
+ for (int i = 0; i < 40; ++i) notify_homekit_target_door_state_change(1);
+ assert(queued.size() == 1 && queued[0].dest == HomeKitNotifDest::DoorTargetState && queued[0].value.u == 1);
+ notify_homekit_target_door_state_change(0);
+ assert(queued.size() == 2);
+ // A push dropped on a full queue is not remembered as delivered.
+ queue_full = true;
+ notify_homekit_target_door_state_change(1);
+ notify_homekit_current_door_state_change(GDO_DOOR_STATE_OPEN);
+ assert(queued.size() == 2 && last_target.load() == 0 && last_door == GDO_DOOR_STATE_MAX);
+ queue_full = false;
+ notify_homekit_target_door_state_change(1);
+ notify_homekit_current_door_state_change(GDO_DOOR_STATE_OPEN);
+ assert(queued.size() == 4 && last_target.load() == 1 && last_door == GDO_DOOR_STATE_OPEN);
+ // A Target written directly by HomeKit (gdo_svc_set) updates the cache, so
+ // a revert back to the previous value is still pushed.
+ last_target.store(0);
+ notify_homekit_target_door_state_change(1);
+ assert(queued.size() == 5);
+ notify_homekit_current_door_state_change(GDO_DOOR_STATE_OPEN);
+ assert(queued.size() == 5);
 }
 '''
         run_c(source, cpp=True)

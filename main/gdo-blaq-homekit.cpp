@@ -280,6 +280,20 @@ static void user_close_task(void *arg)
                         notify_homekit_target_door_state_change(TGT_CLOSED);
                 }
             }
+        } else if (!s_user_close_pending) {
+            // Superseded by something other than a newer close request (an
+            // obstruction event, a settings change). HomeKit's Target was set
+            // to CLOSED when this request was accepted and nothing else will
+            // move it back, so Home would show "Closing..." until the door
+            // next moves. Put Target back to where the door actually is.
+            ESP_LOGW(TAG, "Pending close superseded before it ran - reverting HomeKit target");
+            gdo_status_t status;
+            if (gdo_get_status(&status) == ESP_OK) {
+                if (status.door == GDO_DOOR_STATE_OPEN)
+                    notify_homekit_target_door_state_change(TGT_OPEN);
+                else if (status.door == GDO_DOOR_STATE_CLOSED)
+                    notify_homekit_target_door_state_change(TGT_CLOSED);
+            }
         }
     }
     vTaskDelete(NULL);
@@ -289,6 +303,16 @@ extern "C" esp_err_t gdo_control_close(void) {
     ControlGuard guard;
     if (s_user_close_pending && s_user_close_pending_generation == s_close_generation) {
         return ESP_ERR_INVALID_STATE;
+    }
+    {
+        gdo_status_t status;
+        if (gdo_get_status(&status) == ESP_OK && status.synced && !s_door_in_transition &&
+            status.door == GDO_DOOR_STATE_CLOSED) {
+            // Already closed (e.g. an automation sending Close every night):
+            // gdolib would ignore the command anyway, so skip the 5 s
+            // buzzer-and-light warning too.
+            return ESP_OK;
+        }
     }
     auto *generation = static_cast<uint32_t *>(pvPortMalloc(sizeof(uint32_t)));
     if (!generation) return ESP_ERR_NO_MEM;
@@ -328,6 +352,13 @@ static inline int64_t now_ms(void)
 // re-sync, watchdog correction, ...) always resets the clock, and a door
 // arriving at OPEN always starts it, with no per-call-site bookkeeping to
 // remember or forget.
+//
+// The HomeKit notification is queued here too, while the lock is still
+// held. The gdolib callback task and gdo_watchdog_task both call this; with
+// the notify outside the lock the two could interleave as
+// "set(OPENING) set(OPEN) notify(OPEN) notify(OPENING)", leaving HomeKit on
+// Opening while last_door said Open, and no later event retried it because
+// the state had not changed.
 static void set_last_door_state(gdo_door_state_t new_state)
 {
     ControlGuard guard;
@@ -342,7 +373,7 @@ static void set_last_door_state(gdo_door_state_t new_state)
         s_auto_close_triggered = false;
     }
     last_door = new_state;
-
+    notify_homekit_current_door_state_change(new_state);
 }
 
 // Shared by the normal GDO_CB_EVENT_DOOR_POSITION path and the sync-complete
@@ -542,7 +573,6 @@ static void process_door_position(const gdo_status_t *status)
         }
 
         set_last_door_state(inferred);
-        notify_homekit_current_door_state_change(inferred);
 
         // Keep Target in sync whenever Current resolves to a definite
         // OPEN/CLOSED. This matters most right after boot: the HAP
@@ -598,8 +628,11 @@ static void process_door_position(const gdo_status_t *status)
 
     if (status->light != last_light) {
         last_light = status->light;
-        notify_homekit_light(status->light);
     }
+    // notify_* functions deduplicate against the value HomeKit actually
+    // has (committed only once queued), so call them unconditionally: a
+    // push dropped earlier is retried here instead of being lost for good.
+    notify_homekit_light(status->light);
 }
 
 // Persists the Security+ 2.0 client_id/rolling_code across reboots so a
@@ -764,6 +797,7 @@ static void gdo_save_synced_protocol(gdo_protocol_type_t protocol)
 #define GDO_SETTINGS_NVS_NAMESPACE      "gdo_settings"
 #define GDO_SETTINGS_NVS_KEY_AUTOCLOSE  "auto_close_ms"
 #define GDO_SETTINGS_NVS_KEY_AC_ENABLED "auto_close_en"
+#define GDO_SETTINGS_NVS_KEY_WARN_BUZZ  "warn_buzzer"
 
 // Called once, early in app_main() - loads a previously saved auto-close
 // timeout if one exists; otherwise s_auto_close_timeout_ms stays at its
@@ -790,7 +824,41 @@ static void auto_close_settings_load(void)
         ESP_LOGI(TAG, "Loaded auto-close enabled state from NVS: %s",
                  s_auto_close_enabled ? "enabled" : "disabled");
     }
+
+    uint8_t saved_buzzer = 1;
+    if (nvs_get_u8(handle, GDO_SETTINGS_NVS_KEY_WARN_BUZZ, &saved_buzzer) == ESP_OK) {
+        pre_close_warning_set_buzzer_enabled(saved_buzzer != 0);
+        ESP_LOGI(TAG, "Loaded pre-close buzzer setting from NVS: %s", saved_buzzer ? "on" : "off");
+    }
     nvs_close(handle);
+}
+
+extern "C" bool gdo_get_pre_close_buzzer(void)
+{
+    return pre_close_warning_buzzer_enabled();
+}
+
+extern "C" esp_err_t gdo_set_pre_close_buzzer(bool enabled)
+{
+    pre_close_warning_set_buzzer_enabled(enabled);
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Pre-close buzzer %s in memory but failed to open NVS: %s",
+                 enabled ? "on" : "off", esp_err_to_name(err));
+        return err;
+    }
+    nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_WARN_BUZZ, enabled ? 1 : 0);
+    esp_err_t commit_err = nvs_commit(handle);
+    nvs_close(handle);
+    if (commit_err == ESP_OK) {
+        ESP_LOGI(TAG, "Pre-close buzzer %s and saved to NVS", enabled ? "on" : "off");
+    } else {
+        ESP_LOGW(TAG, "Pre-close buzzer %s in memory but failed to save: %s",
+                 enabled ? "on" : "off", esp_err_to_name(commit_err));
+    }
+    return commit_err;
 }
 
 // Updates the in-memory timeout AND persists it, so it survives a reboot.
@@ -948,10 +1016,15 @@ extern "C" esp_err_t gdo_set_close_schedule(const gdo_close_schedule_t *in)
     }
     esp_err_t tz_err = clock_sync_apply_timezone(in->tz);
     if (tz_err != ESP_OK) return tz_err;
+    bool minute_changed;
     {
         ControlGuard guard;
         ++s_close_generation;   // cancel any warning already counting down
+        minute_changed = (in->minute != s_close_schedule.minute);
         s_close_schedule = *in;
+        // A new time is a new schedule: forget that today's window already
+        // fired, or a schedule moved from 07:00 to 21:00 would not fire tonight.
+        if (minute_changed) s_close_schedule_last_day = 0;
     }
 
     nvs_handle_t handle;
@@ -964,6 +1037,7 @@ extern "C" esp_err_t gdo_set_close_schedule(const gdo_close_schedule_t *in)
     nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_SCHED_EN, in->enabled ? 1 : 0);
     nvs_set_u16(handle, GDO_SETTINGS_NVS_KEY_SCHED_MIN, in->minute);
     nvs_set_str(handle, GDO_SETTINGS_NVS_KEY_SCHED_TZ, in->tz);
+    if (minute_changed) nvs_set_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, 0);
     esp_err_t commit_err = nvs_commit(handle);
     nvs_close(handle);
 
@@ -1131,20 +1205,25 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         }
         break;
 
+    // The notify_* functions below keep their own last-delivered copy and
+    // commit it only once the event is queued, so they are called on every
+    // event rather than only when this file's last_* copy changes. Gating
+    // them here meant a push dropped on a full queue was never retried,
+    // because this file had already recorded the new value.
     case GDO_CB_EVENT_LIGHT:
         if (status->light != last_light) {
             last_light = status->light;
             ESP_LOGI(TAG, "Light: %s", gdo_light_state_to_string(status->light));
-            notify_homekit_light(status->light);
         }
+        notify_homekit_light(status->light);
         break;
 
     case GDO_CB_EVENT_LOCK:
         if (status->lock != last_lock) {
             last_lock = status->lock;
             ESP_LOGI(TAG, "Lock: %s", gdo_lock_state_to_string(status->lock));
-            notify_homekit_current_lock(status->lock);
         }
+        notify_homekit_current_lock(status->lock);
         break;
 
 case GDO_CB_EVENT_DOOR_POSITION: {
@@ -1160,8 +1239,8 @@ case GDO_CB_EVENT_DOOR_POSITION: {
             ++s_close_generation;
             last_obstruction = status->obstruction;
             ESP_LOGI(TAG, "Obstruction: %s", gdo_obstruction_state_to_string(last_obstruction));
-            notify_homekit_obstruction(last_obstruction);
         }
+        notify_homekit_obstruction(last_obstruction);
         break;
     }
 
@@ -1169,8 +1248,8 @@ case GDO_CB_EVENT_DOOR_POSITION: {
         if (status->motion != last_motion) {
             last_motion = status->motion;
             ESP_LOGI(TAG, "Motion: %s", gdo_motion_state_to_string(status->motion));
-            notify_homekit_motion(status->motion);
         }
+        notify_homekit_motion(status->motion);
         break;
 
     case GDO_CB_EVENT_BATTERY:
@@ -1222,7 +1301,6 @@ case GDO_CB_EVENT_DOOR_POSITION: {
 
             if (motor_inferred != GDO_DOOR_STATE_MAX && motor_inferred != last_door) {
                 set_last_door_state(motor_inferred);
-                notify_homekit_current_door_state_change(motor_inferred);
 
                 if (motor_inferred == GDO_DOOR_STATE_OPENING) {
                     notify_homekit_target_door_state_change(TGT_OPEN);
@@ -1266,8 +1344,8 @@ case GDO_CB_EVENT_DOOR_POSITION: {
         if (status->learn != last_learn) {
             last_learn = status->learn;
             ESP_LOGI(TAG, "Learn: %s", gdo_learn_state_to_string(status->learn));
-            notify_homekit_learn(status->learn);
         }
+        notify_homekit_learn(status->learn);
         break;
 
     case GDO_CB_EVENT_OPEN_DURATION_MEASUREMENT:
@@ -1392,6 +1470,16 @@ static void sched_close_check(void)
     close_schedule_last_day_save(window_day);
 }
 
+static void resend_last_states_to_homekit(void)
+{
+    ControlGuard guard;
+    if (last_door != GDO_DOOR_STATE_MAX) notify_homekit_current_door_state_change(last_door);
+    if (last_light != GDO_LIGHT_STATE_MAX) notify_homekit_light(last_light);
+    if (last_lock != GDO_LOCK_STATE_MAX) notify_homekit_current_lock(last_lock);
+    if (last_obstruction != GDO_OBSTRUCTION_STATE_MAX) notify_homekit_obstruction(last_obstruction);
+    if (last_motion != GDO_MOTION_STATE_MAX) notify_homekit_motion(last_motion);
+}
+
 static void gdo_watchdog_task(void *arg)
 {
     retry_budget_t retry_budget = {};
@@ -1426,7 +1514,8 @@ static void gdo_watchdog_task(void *arg)
             esp_err_t err = gdo_get_status(&status);
 
             if (err == ESP_OK) {
-                uint32_t elapsed = (uint32_t)(now - s_transition_start_ms);
+                int64_t elapsed_signed = now - s_transition_start_ms;
+                uint32_t elapsed = elapsed_signed > 0 ? (uint32_t)elapsed_signed : 0;
                 uint32_t raw_now = (uint32_t)status.door_position;
                 if (raw_now > 10000) raw_now = 10000;
 
@@ -1514,7 +1603,6 @@ static void gdo_watchdog_task(void *arg)
 
                         if (resolved != last_door) {
                             set_last_door_state(resolved);
-                            notify_homekit_current_door_state_change(resolved);
                         }
 
                         // Also fix HomeKit's target right here rather than
@@ -1546,7 +1634,6 @@ static void gdo_watchdog_task(void *arg)
 
                         if (last_door != GDO_DOOR_STATE_STOPPED) {
                             set_last_door_state(GDO_DOOR_STATE_STOPPED);
-                            notify_homekit_current_door_state_change(GDO_DOOR_STATE_STOPPED);
                         }
                         request_gdo_status_recovery();
                     }
@@ -1674,6 +1761,13 @@ static void gdo_watchdog_task(void *arg)
 
         // 4) Scheduled close: see sched_close_check().
         sched_close_check();
+
+        // 5) Re-offer the last known states to HomeKit. Each notify_* keeps
+        //    its own last-delivered value and returns immediately when it
+        //    matches, so this is free in the normal case and only does work
+        //    when an earlier push was dropped on a full queue (which the
+        //    one-shot event paths above would otherwise never retry).
+        resend_last_states_to_homekit();
     }
 }
 

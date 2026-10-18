@@ -18,6 +18,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -44,6 +45,12 @@ extern "C" {
 // Call once at startup (e.g. from app_main / accessory init) to configure
 // the buzzer (LEDC) and LED (GPIO) peripherals.
 void pre_close_warning_init(void);
+
+// Whether the warning sounds the buzzer. Off keeps the LED flash and the
+// full warning period (the cancel window); only the sound is suppressed.
+// Defaults to on; the app persists the user's choice.
+void pre_close_warning_set_buzzer_enabled(bool enabled);
+bool pre_close_warning_buzzer_enabled(void);
 
 // Blocking call: runs the beep/flash sequence for duration_ms.
 // Call this from the HomeKit "Target Door State" write callback,

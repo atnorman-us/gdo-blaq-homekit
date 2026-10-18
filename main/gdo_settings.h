@@ -24,6 +24,11 @@ bool     gdo_get_auto_close_enabled(void);
 esp_err_t gdo_set_auto_close_enabled(bool enabled);
 
 uint32_t gdo_get_auto_close_timeout_ms(void);
+
+// Pre-close warning buzzer (the 5 s beep before a firmware-initiated close).
+// On by default. Off keeps the LED flash and the warning period.
+bool     gdo_get_pre_close_buzzer(void);
+esp_err_t gdo_set_pre_close_buzzer(bool enabled);
 esp_err_t gdo_set_auto_close_timeout_ms(uint32_t timeout_ms);
 
 // Milliseconds remaining until auto-close would fire, or -1 if not
