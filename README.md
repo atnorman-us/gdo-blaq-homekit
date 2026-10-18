@@ -2,9 +2,9 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.2.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.2.0)**
+**Current release: [1.3.2.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.3.0)**
 
-## Unreleased
+## What's changed in 1.3.3.0
 
 Opener link:
 
@@ -13,6 +13,21 @@ Opener link:
 - **A door command is no longer retried on Security+ 1.0 openers.** Those openers only have a TOGGLE command, chosen from the door state the firmware last saw. Re-sending it 8 seconds after a command that appeared not to start could stop or reverse a door that had in fact started moving (or whose status frame was missed), including closing an open door with no warning. On these openers an unanswered command now just reverts the Home app's target; Security+ 2.0 keeps its single retry, since its Open/Close commands are idempotent.
 - gdolib now decodes every packet in a UART read that holds more than one frame (two breaks followed by one 38-plus-byte read). Previously only the one-break case was handled this way and the older fallback discarded the whole first packet.
 - gdolib no longer leaks a packet buffer when its transmit queue is full.
+
+Door control and HomeKit:
+
+- A lock change made at the wall panel now updates Lock Target State too, so the Home app no longer shows "Locking..." or "Unlocking..." indefinitely.
+- The accessory name now uses device-unique MAC bytes instead of the Espressif vendor prefix, so two blaQs no longer share a name. Light and Lock writes that the opener refuses are reported to the Home app instead of silently ignored.
+- A close that is superseded during its warning (by an obstruction or a settings change) puts the Home app's target back instead of leaving it on "Closing...". A close for a door that is already closed skips the warning.
+- HomeKit notifications are deduplicated, the queue is larger, and dropped notifications are retried, so a single door transition can no longer starve later state updates.
+- Changing the scheduled-close time on a day it already fired re-arms it, and an auto-close that the opener accepted but never acted on no longer blocks auto-close and scheduled close until the door moves.
+
+Diagnostics page:
+
+- New **Beep before closing** switch in the Auto-Close card mutes the pre-close beep; the LED flash and cancel window stay. It is on by default.
+- The admin password must be printable ASCII without leading or trailing spaces, so a password can no longer be set that the browser cannot send back. 0 auto-close minutes is rejected, and the scheduled-close timezone must be a POSIX string with a UTC offset; names such as `EST` or `America/New_York` were previously accepted but silently read as UTC.
+- Security: `/admin/set-password`, the one unauthenticated write, now refuses requests from other sites and from non-local Host names, and rejects oversized `Host`, `Origin` and `Sec-Fetch-Site` headers, so a web page elsewhere on the LAN cannot claim a fresh device.
+- "Roll back to other slot" refuses to boot an upload that was cancelled or never confirmed, and a failed server restart after a Wi-Fi bounce is retried.
 
 ## What's changed in 1.3.2.0
 

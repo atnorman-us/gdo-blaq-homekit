@@ -65,7 +65,7 @@ int main(void) {
 
     def test_set_password_handler_checks_origin_before_reading_the_body(self):
         fn = function('main/diag_webserver.cpp', 'static esp_err_t admin_set_password_post_handler(')
-        helpers = (function('main/diag_webserver.cpp', 'static void copy_req_header(') +
+        helpers = (function('main/diag_webserver.cpp', 'static int copy_req_header(') +
                    function('main/diag_webserver.cpp', 'static bool reject_unless_own_page('))
         run_c(INC + r'''
 #include <stdint.h>
@@ -114,6 +114,14 @@ static int post(const char *host, const char *origin, const char *site, const ch
  httpd_req_t r = {host, origin, site, body, (int)strlen(body), 0, 0};
  admin_set_password_post_handler(&r); return r.status; }
 int main() {
+ /* An oversized header is a rejection, not an absent header. */
+ static char longorigin[200], longhost[200];
+ memset(longorigin, 'a', sizeof(longorigin) - 1);
+ memset(longhost, 'b', sizeof(longhost) - 1);
+ assert(post("192.168.1.168:8080", longorigin, NULL, "attacker-pw") == 403);
+ assert(post(longhost, NULL, NULL, "attacker-pw") == 403);
+ assert(post("192.168.1.168:8080", NULL, longorigin, "attacker-pw") == 403);
+ assert(bodies_read == 0 && commits == 0 && !s_admin_password_set);
  /* A page on another LAN host trying to claim a fresh device. */
  assert(post("192.168.1.168:8080", "http://evil.example", "cross-site", "attacker-pw") == 403);
  assert(bodies_read == 0 && commits == 0 && !s_admin_password_set);
