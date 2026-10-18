@@ -146,14 +146,20 @@ static bool hash_admin_password(const char *password, size_t len, const uint8_t 
     return true;
 }
 
-// Reads one request header into buf (empty string when absent or too long
-// to be a legitimate value for these headers).
-static void copy_req_header(httpd_req_t *req, const char *name, char *buf, size_t size)
+// Reads one request header into buf. Returns 0 when absent, 1 when read, and
+// -1 when present but too long or unreadable - callers must treat -1 as a
+// failure, not as "absent", or an oversized header slips past the checks.
+static int copy_req_header(httpd_req_t *req, const char *name, char *buf, size_t size)
 {
     buf[0] = '\0';
     size_t len = httpd_req_get_hdr_value_len(req, name);
-    if (len == 0 || len >= size) return;
-    if (httpd_req_get_hdr_value_str(req, name, buf, size) != ESP_OK) buf[0] = '\0';
+    if (len == 0) return 0;
+    if (len >= size) return -1;
+    if (httpd_req_get_hdr_value_str(req, name, buf, size) != ESP_OK) {
+        buf[0] = '\0';
+        return -1;
+    }
+    return 1;
 }
 
 // See request_origin.h. Applied to the one endpoint that has no password
@@ -161,12 +167,12 @@ static void copy_req_header(httpd_req_t *req, const char *name, char *buf, size_
 static bool reject_unless_own_page(httpd_req_t *req)
 {
     char host[128], origin[160], site[32];
-    copy_req_header(req, "Host", host, sizeof(host));
-    copy_req_header(req, "Origin", origin, sizeof(origin));
-    copy_req_header(req, "Sec-Fetch-Site", site, sizeof(site));
-    if (request_from_own_page(host, origin, site)) return true;
-    ESP_LOGW(TAG, "Refusing cross-origin request (Host=%s Origin=%s Sec-Fetch-Site=%s)",
-             host, origin, site);
+    bool bad_header = copy_req_header(req, "Host", host, sizeof(host)) < 0;
+    bad_header |= copy_req_header(req, "Origin", origin, sizeof(origin)) < 0;
+    bad_header |= copy_req_header(req, "Sec-Fetch-Site", site, sizeof(site)) < 0;
+    if (!bad_header && request_from_own_page(host, origin, site)) return true;
+    ESP_LOGW(TAG, "Refusing cross-origin request (Host=%s Origin=%s Sec-Fetch-Site=%s%s)",
+             host, origin, site, bad_header ? ", oversized header" : "");
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
                         "Cross-origin request refused - open the diagnostics page by the device's IP address or gdo-blaq.local");
     return false;
