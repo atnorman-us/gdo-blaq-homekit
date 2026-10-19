@@ -71,6 +71,17 @@ esp-web-install-button[hidden] { display: none; }
   color: var(--color-text-muted);
 }
 .firmware-error { color: #b3261e; }
+.browser-warning {
+  margin: 0;
+  padding: 12px 16px;
+  font-size: 14px;
+  text-align: left;
+  color: #7a4a00;
+  background: #fff4e0;
+  border: 1px solid #f0c987;
+  border-radius: 8px;
+}
+.browser-warning[hidden] { display: none; }
 .firmware-error[hidden] { display: none; }
 
 .steps-card ol, .update-card ol { padding-left: 20px; line-height: 1.7; }

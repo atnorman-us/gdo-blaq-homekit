@@ -11,6 +11,12 @@ const versionEl = document.getElementById("firmware-version");
 const errorEl = document.getElementById("firmware-error");
 const installButton = document.getElementById("install-button");
 const otaLink = document.getElementById("ota-download");
+const browserWarning = document.getElementById("browser-warning");
+
+if (!("serial" in navigator)) {
+  browserWarning.hidden = false;
+  installButton.hidden = true;
+}
 
 fetch("/firmware/manifest.json")
   .then((response) => {
