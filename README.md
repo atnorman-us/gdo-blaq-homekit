@@ -2,7 +2,22 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.3.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.3.0)**
+**Current release: [1.3.4.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.4.0)**
+
+## What's changed in 1.3.4.0
+
+Wi-Fi setup (the `konnected-blaq-hk` access point and its page at `http://192.168.4.1`):
+
+- **HomeKit no longer starts while the device is in setup (access point) mode.** Its HTTP server and the setup page both want port 80; whichever bound first won, so the setup page at `http://192.168.4.1` was sometimes unreachable, and otherwise HomeKit logged `HTTPD START Failed` on every restart attempt. HomeKit starts normally once the device has joined a network and rebooted.
+- The setup server no longer shuts down when a device leaves the access point. It was stopped on every station disconnect, which dropped the page's WebSocket for anyone else still using it (for example, a laptop mid-setup when a phone wandered off).
+- **A device that failed to join your Wi-Fi no longer starts an access point named after your own network.** A precedence bug in the provisioning library made it clone your SSID *and* password as its own open-to-join AP; other devices (including a second blaQ) could roam onto it and lose the internet. It now falls back to the default `konnected-blaq-hk` AP, as documented.
+- The HTTP server's request-header limit is raised from 512 to 1024 bytes. Chrome and Safari send about 490 bytes of headers on a WebSocket upgrade, so the setup page's connection was one header away from a `431` rejection; `curl` and small scripts were unaffected.
+- The setup server now recycles idle browser connections (`lru_purge_enable`), so a few page reloads can no longer exhaust its seven sockets and make the device refuse new connections.
+- The setup page no longer reloads itself forever when its WebSocket drops; it reconnects a few times and then tells you what to check. It also shows a confirmation after **Save and reboot**, masks password fields, and keeps a saved password when the field is left blank.
+- Passwords and SSIDs containing `"` or `\` are stored correctly (JSON escapes were previously written to flash verbatim), and SSIDs are escaped on the way out.
+- The stored Wi-Fi password is no longer sent to whoever opens the setup page. SSIDs of 32 characters no longer overflow a 32-byte buffer.
+- A station configured with an empty password now connects to an open network instead of being rejected by the WPA2 threshold.
+- The network watchdog no longer prods the station interface every 5 seconds while the device is in setup (AP) mode, and no longer treats 0.0.0.0 as a valid address.
 
 ## What's changed in 1.3.3.0
 
@@ -28,21 +43,6 @@ Diagnostics page:
 - The admin password must be printable ASCII without leading or trailing spaces, so a password can no longer be set that the browser cannot send back. 0 auto-close minutes is rejected, and the scheduled-close timezone must be a POSIX string with a UTC offset; names such as `EST` or `America/New_York` were previously accepted but silently read as UTC.
 - Security: `/admin/set-password`, the one unauthenticated write, now refuses requests from other sites and from non-local Host names, and rejects oversized `Host`, `Origin` and `Sec-Fetch-Site` headers, so a web page elsewhere on the LAN cannot claim a fresh device.
 - "Roll back to other slot" refuses to boot an upload that was cancelled or never confirmed, and a failed server restart after a Wi-Fi bounce is retried.
-
-## Unreleased
-
-Wi-Fi setup (the `konnected-blaq-hk` access point and its page at `http://192.168.4.1`):
-
-- **HomeKit no longer starts while the device is in setup (access point) mode.** Its HTTP server and the setup page both want port 80; whichever bound first won, so the setup page at `http://192.168.4.1` was sometimes unreachable, and otherwise HomeKit logged `HTTPD START Failed` on every restart attempt. HomeKit starts normally once the device has joined a network and rebooted.
-- The setup server no longer shuts down when a device leaves the access point. It was stopped on every station disconnect, which dropped the page's WebSocket for anyone else still using it (for example, a laptop mid-setup when a phone wandered off).
-- **A device that failed to join your Wi-Fi no longer starts an access point named after your own network.** A precedence bug in the provisioning library made it clone your SSID *and* password as its own open-to-join AP; other devices (including a second blaQ) could roam onto it and lose the internet. It now falls back to the default `konnected-blaq-hk` AP, as documented.
-- The HTTP server's request-header limit is raised from 512 to 1024 bytes. Chrome and Safari send about 490 bytes of headers on a WebSocket upgrade, so the setup page's connection was one header away from a `431` rejection; `curl` and small scripts were unaffected.
-- The setup server now recycles idle browser connections (`lru_purge_enable`), so a few page reloads can no longer exhaust its seven sockets and make the device refuse new connections.
-- The setup page no longer reloads itself forever when its WebSocket drops; it reconnects a few times and then tells you what to check. It also shows a confirmation after **Save and reboot**, masks password fields, and keeps a saved password when the field is left blank.
-- Passwords and SSIDs containing `"` or `\` are stored correctly (JSON escapes were previously written to flash verbatim), and SSIDs are escaped on the way out.
-- The stored Wi-Fi password is no longer sent to whoever opens the setup page. SSIDs of 32 characters no longer overflow a 32-byte buffer.
-- A station configured with an empty password now connects to an open network instead of being rejected by the WPA2 threshold.
-- The network watchdog no longer prods the station interface every 5 seconds while the device is in setup (AP) mode, and no longer treats 0.0.0.0 as a valid address.
 
 ## What's changed in 1.3.2.0
 
@@ -81,7 +81,7 @@ python3 -m unittest discover -s tests -v
 3. Once the device joins your network and finishes starting, open Apple's Home app, select **Add Accessory**, then **More Options**.
 4. Select the accessory and enter setup code **`251-02-023`**.
 
-This is native HomeKit firmware. Release 1.3.3.0 does not introduce a Matter migration or claim device-tested iOS 27 certification.
+This is native HomeKit firmware. Release 1.3.4.0 does not introduce a Matter migration or claim device-tested iOS 27 certification.
 
 ## Diagnostics dashboard and admin password
 
@@ -122,8 +122,8 @@ Download files from the [GitHub releases page](https://github.com/atnorman-us/gd
 
 | Release file | Use |
 | --- | --- |
-| `gdo-blaq-homekit-1.3.3.0-ota.bin` | App-only image for the dashboard's firmware uploader |
-| `konnected-gdo-blaq-homekit-1.3.3.0.bin` | Combined image for USB installation at flash address `0x0` |
+| `gdo-blaq-homekit-1.3.4.0-ota.bin` | App-only image for the dashboard's firmware uploader |
+| `konnected-gdo-blaq-homekit-1.3.4.0.bin` | Combined image for USB installation at flash address `0x0` |
 | `SHA256SUMS.txt` | Checksums for both images |
 
 **Upload the OTA image to the dashboard, not the combined image.** When building locally, the OTA image is `build/gdo-blaq-homekit.bin`.
@@ -153,7 +153,7 @@ idf.py -p <serial-port> flash
 For a downloaded combined image, use ESP-IDF's esptool environment:
 
 ```sh
-python -m esptool --chip esp32s3 --port <serial-port> write_flash 0x0 konnected-gdo-blaq-homekit-1.3.3.0.bin
+python -m esptool --chip esp32s3 --port <serial-port> write_flash 0x0 konnected-gdo-blaq-homekit-1.3.4.0.bin
 ```
 
 To generate a combined image locally with the correct partition offsets:
