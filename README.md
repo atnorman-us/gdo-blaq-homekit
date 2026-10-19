@@ -2,7 +2,7 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.2.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.3.0)**
+**Current release: [1.3.3.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.3.0)**
 
 ## What's changed in 1.3.3.0
 
@@ -81,7 +81,7 @@ python3 -m unittest discover -s tests -v
 3. Once the device joins your network and finishes starting, open Apple's Home app, select **Add Accessory**, then **More Options**.
 4. Select the accessory and enter setup code **`251-02-023`**.
 
-This is native HomeKit firmware. Release 1.3.1.9 does not introduce a Matter migration or claim device-tested iOS 27 certification.
+This is native HomeKit firmware. Release 1.3.3.0 does not introduce a Matter migration or claim device-tested iOS 27 certification.
 
 ## Diagnostics dashboard and admin password
 
@@ -122,8 +122,8 @@ Download files from the [GitHub releases page](https://github.com/atnorman-us/gd
 
 | Release file | Use |
 | --- | --- |
-| `gdo-blaq-homekit-1.3.1.9-ota.bin` | App-only image for the dashboard's firmware uploader |
-| `konnected-gdo-blaq-homekit-1.3.1.9.bin` | Combined image for USB installation at flash address `0x0` |
+| `gdo-blaq-homekit-1.3.3.0-ota.bin` | App-only image for the dashboard's firmware uploader |
+| `konnected-gdo-blaq-homekit-1.3.3.0.bin` | Combined image for USB installation at flash address `0x0` |
 | `SHA256SUMS.txt` | Checksums for both images |
 
 **Upload the OTA image to the dashboard, not the combined image.** When building locally, the OTA image is `build/gdo-blaq-homekit.bin`.
@@ -153,7 +153,7 @@ idf.py -p <serial-port> flash
 For a downloaded combined image, use ESP-IDF's esptool environment:
 
 ```sh
-python -m esptool --chip esp32s3 --port <serial-port> write_flash 0x0 konnected-gdo-blaq-homekit-1.3.1.9.bin
+python -m esptool --chip esp32s3 --port <serial-port> write_flash 0x0 konnected-gdo-blaq-homekit-1.3.3.0.bin
 ```
 
 To generate a combined image locally with the correct partition offsets:
