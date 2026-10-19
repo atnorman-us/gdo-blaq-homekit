@@ -29,6 +29,21 @@ Diagnostics page:
 - Security: `/admin/set-password`, the one unauthenticated write, now refuses requests from other sites and from non-local Host names, and rejects oversized `Host`, `Origin` and `Sec-Fetch-Site` headers, so a web page elsewhere on the LAN cannot claim a fresh device.
 - "Roll back to other slot" refuses to boot an upload that was cancelled or never confirmed, and a failed server restart after a Wi-Fi bounce is retried.
 
+## Unreleased
+
+Wi-Fi setup (the `konnected-blaq-hk` access point and its page at `http://192.168.4.1`):
+
+- **HomeKit no longer starts while the device is in setup (access point) mode.** Its HTTP server and the setup page both want port 80; whichever bound first won, so the setup page at `http://192.168.4.1` was sometimes unreachable, and otherwise HomeKit logged `HTTPD START Failed` on every restart attempt. HomeKit starts normally once the device has joined a network and rebooted.
+- The setup server no longer shuts down when a device leaves the access point. It was stopped on every station disconnect, which dropped the page's WebSocket for anyone else still using it (for example, a laptop mid-setup when a phone wandered off).
+- **A device that failed to join your Wi-Fi no longer starts an access point named after your own network.** A precedence bug in the provisioning library made it clone your SSID *and* password as its own open-to-join AP; other devices (including a second blaQ) could roam onto it and lose the internet. It now falls back to the default `konnected-blaq-hk` AP, as documented.
+- The HTTP server's request-header limit is raised from 512 to 1024 bytes. Chrome and Safari send about 490 bytes of headers on a WebSocket upgrade, so the setup page's connection was one header away from a `431` rejection; `curl` and small scripts were unaffected.
+- The setup server now recycles idle browser connections (`lru_purge_enable`), so a few page reloads can no longer exhaust its seven sockets and make the device refuse new connections.
+- The setup page no longer reloads itself forever when its WebSocket drops; it reconnects a few times and then tells you what to check. It also shows a confirmation after **Save and reboot**, masks password fields, and keeps a saved password when the field is left blank.
+- Passwords and SSIDs containing `"` or `\` are stored correctly (JSON escapes were previously written to flash verbatim), and SSIDs are escaped on the way out.
+- The stored Wi-Fi password is no longer sent to whoever opens the setup page. SSIDs of 32 characters no longer overflow a 32-byte buffer.
+- A station configured with an empty password now connects to an open network instead of being rejected by the WPA2 threshold.
+- The network watchdog no longer prods the station interface every 5 seconds while the device is in setup (AP) mode, and no longer treats 0.0.0.0 as a valid address.
+
 ## What's changed in 1.3.2.0
 
 - Add **Scheduled Close**: close the garage door at a set time of day (for example 23:00) if it is open, using the same beep-and-flash warning as Auto-Close. It is off by default and configured on the diagnostics page, where the timezone can be filled in from your browser. The device sets its clock over Wi-Fi (`pool.ntp.org`) and does nothing until the clock is synced. A door that was closed at the set time, or opened after it, is left alone. See [Scheduled close](#scheduled-close).
@@ -62,7 +77,7 @@ python3 -m unittest discover -s tests -v
 ## Provision WiFi and add to HomeKit
 
 1. Connect to the device's **`konnected-blaq-hk`** WiFi access point.
-2. Open **`http://192.168.4.1`**, enter your WiFi credentials, and select **Write and Reboot**.
+2. Open **`http://192.168.4.1`**, enter your WiFi credentials, and select **Save and reboot**. If a browser shows an error but the address bar has changed to `https://`, the browser is replaying a cached redirect from another device that uses the same address (UniFi gateways, for example); open the page in a private window or clear that site's data.
 3. Once the device joins your network and finishes starting, open Apple's Home app, select **Add Accessory**, then **More Options**.
 4. Select the accessory and enter setup code **`251-02-023`**.
 
@@ -123,7 +138,7 @@ Web OTA accepts ordinary ESP-IDF application images; this release does not requi
 
 A new OTA image is marked valid only after WiFi and the diagnostics server start. If it resets before being marked valid, bootloader rollback can restore a valid previous image. This is not a guarantee of recovery from every failure. **Roll back to other slot** is also available when the other slot contains a usable image.
 
-Older firmware without a compatible two-slot OTA partition layout needs a USB installation first. Back up any needed information and expect to reconfigure if changing layouts; a combined-image flash also replaces OTA metadata.
+Older firmware without a compatible two-slot OTA partition layout needs a USB installation first. **A combined-image USB flash erases the saved settings**: the image covers the NVS partition at `0x9000`, so Wi-Fi credentials, the admin password, and the HomeKit pairing are gone and the device boots into the `konnected-blaq-hk` setup access point. Only the dashboard's OTA upload keeps them. A combined-image flash also replaces OTA metadata.
 
 ## USB installation
 

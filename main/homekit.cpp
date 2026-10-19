@@ -197,10 +197,22 @@ static void network_watchdog_task(void *pvParameters)
 {
     while (true) {
         wifi_ap_record_t ap_info;
-        esp_netif_ip_info_t ip_info;
+        esp_netif_ip_info_t ip_info = {};
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+        // Only a station has something to reconnect. In setup (softAP) mode
+        // there is no STA interface, and disconnect/connect calls every 5 s
+        // just produce "Network lost" noise.
+        if (esp_wifi_get_mode(&mode) != ESP_OK || mode != WIFI_MODE_STA || !sta_netif) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
 
         bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
-        bool ip_ok = (esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) == ESP_OK);
+        // esp_netif_get_ip_info() succeeds with 0.0.0.0 while DHCP is still
+        // running, so check the address itself.
+        bool ip_ok = (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) && ip_info.ip.addr != 0;
 
         if (!wifi_ok || !ip_ok) {
             ESP_LOGW(TAG, "Network lost — reconnecting");
@@ -433,7 +445,21 @@ void homekit_task_entry(void* ctx) {
     // SNTP needs the event loop and netif that app_wifi_init() just created.
     clock_sync_start();
 
-    hap_start();
+    // In setup (softAP) mode the provisioning page must own port 80, and
+    // HomeKit's own HTTP server also wants port 80. Whichever bound first
+    // used to win - usually the setup page, after which every hap_start()
+    // (including the watchdog's restarts) failed with "HTTPD START Failed";
+    // in the other order the setup page was unreachable. There is nothing
+    // for HomeKit to do without a LAN, so it simply stays stopped until the
+    // device has joined a network and rebooted.
+    wifi_mode_t wifi_mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&wifi_mode);
+    const bool wifi_setup_mode = (wifi_mode != WIFI_MODE_STA);
+    if (wifi_setup_mode) {
+        ESP_LOGW(TAG, "Wi-Fi setup mode - HomeKit not started so the setup page can use port 80");
+    } else {
+        hap_start();
+    }
 
     // Learn Mode support is now decided early (see the protocol-identification
     // wait near the top of this function), before hap_add_accessory()/hap_start()
@@ -452,8 +478,11 @@ void homekit_task_entry(void* ctx) {
 
     // Start watchdog
     xTaskCreate(network_watchdog_task, "net_watchdog", 4096, NULL, 5, NULL);
-    // Start minimal HomeKit watchdog
-    xTaskCreate(minimal_hap_watchdog_task, "hap_watchdog", 4096, NULL, 5, NULL);
+    // Start minimal HomeKit watchdog (not in setup mode: it would only keep
+    // retrying hap_start() against the setup page's port)
+    if (!wifi_setup_mode) {
+        xTaskCreate(minimal_hap_watchdog_task, "hap_watchdog", 4096, NULL, 5, NULL);
+    }
 
     GDOEvent e;
 
