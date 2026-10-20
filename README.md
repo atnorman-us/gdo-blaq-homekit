@@ -2,7 +2,13 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.4.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.4.0)**
+**Current release: [1.3.5.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.5.0)**
+
+## What's changed in 1.3.5.0
+
+Opener link:
+
+- **Spurious Locked/Unlocked (and Light) flaps on Security+ 1.0 openers with a smart wall panel are gone.** In the listen-only "with smart panel" mode an idle door produces no state-change events, so after five quiet minutes the watchdog sent a status request of its own. That request was a Security+ 2.0 command id the 1.0 bus does not know, it collided with the panel's polls, and one misread status byte showed up in the Home app as a lock that locked and unlocked itself half a second apart, every five minutes. The watchdog now treats any decoded packet as proof of life (the panel's polls count), a status request is never sent in listen-only mode and is a proper 1.0 query otherwise, and light and lock changes on Security+ 1.0 are reported only once two consecutive polls agree.
 
 ## What's changed in 1.3.4.0
 
@@ -18,12 +24,6 @@ Wi-Fi setup (the `konnected-blaq-hk` access point and its page at `http://192.16
 - The stored Wi-Fi password is no longer sent to whoever opens the setup page. SSIDs of 32 characters no longer overflow a 32-byte buffer.
 - A station configured with an empty password now connects to an open network instead of being rejected by the WPA2 threshold.
 - The network watchdog no longer prods the station interface every 5 seconds while the device is in setup (AP) mode, and no longer treats 0.0.0.0 as a valid address.
-
-## Unreleased
-
-Opener link:
-
-- **Spurious Locked/Unlocked (and Light) flaps on Security+ 1.0 openers with a smart wall panel are gone.** In the listen-only "with smart panel" mode an idle door produces no state-change events, so after five quiet minutes the watchdog sent a status request of its own. That request was a Security+ 2.0 command id the 1.0 bus does not know, it collided with the panel's polls, and one misread status byte showed up in the Home app as a lock that locked and unlocked itself half a second apart, every five minutes. The watchdog now treats any decoded packet as proof of life (the panel's polls count), a status request is never sent in listen-only mode and is a proper 1.0 query otherwise, and light and lock changes on Security+ 1.0 are reported only once two consecutive polls agree.
 
 ## What's changed in 1.3.3.0
 
@@ -87,7 +87,7 @@ python3 -m unittest discover -s tests -v
 3. Once the device joins your network and finishes starting, open Apple's Home app, select **Add Accessory**, then **More Options**.
 4. Select the accessory and enter setup code **`251-02-023`**.
 
-This is native HomeKit firmware. Release 1.3.4.0 does not introduce a Matter migration or claim device-tested iOS 27 certification.
+This is native HomeKit firmware. Release 1.3.5.0 does not introduce a Matter migration or claim device-tested iOS 27 certification.
 
 ## Diagnostics dashboard and admin password
 
@@ -128,8 +128,8 @@ Download files from the [GitHub releases page](https://github.com/atnorman-us/gd
 
 | Release file | Use |
 | --- | --- |
-| `gdo-blaq-homekit-1.3.4.0-ota.bin` | App-only image for the dashboard's firmware uploader |
-| `konnected-gdo-blaq-homekit-1.3.4.0.bin` | Combined image for USB installation at flash address `0x0` |
+| `gdo-blaq-homekit-1.3.5.0-ota.bin` | App-only image for the dashboard's firmware uploader |
+| `konnected-gdo-blaq-homekit-1.3.5.0.bin` | Combined image for USB installation at flash address `0x0` |
 | `SHA256SUMS.txt` | Checksums for both images |
 
 **Upload the OTA image to the dashboard, not the combined image.** When building locally, the OTA image is `build/gdo-blaq-homekit.bin`.
@@ -159,7 +159,7 @@ idf.py -p <serial-port> flash
 For a downloaded combined image, use ESP-IDF's esptool environment:
 
 ```sh
-python -m esptool --chip esp32s3 --port <serial-port> write_flash 0x0 konnected-gdo-blaq-homekit-1.3.4.0.bin
+python -m esptool --chip esp32s3 --port <serial-port> write_flash 0x0 konnected-gdo-blaq-homekit-1.3.5.0.bin
 ```
 
 To generate a combined image locally with the correct partition offsets:
