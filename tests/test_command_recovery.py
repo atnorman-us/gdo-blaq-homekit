@@ -150,7 +150,7 @@ int main() {
     def test_stale_link_requests_status_when_already_synced(self):
         path='main/gdo-blaq-homekit.cpp'
         source=(ROOT/path).read_text()
-        start=source.index('        if (s_last_status_event_ms != 0 &&')
+        start=source.index('        int64_t last_alive_ms = s_last_status_event_ms;')
         block=source[start:source.index('        // 3) Auto-close:',start)]
         helper=function(path,'static esp_err_t request_gdo_status_recovery(') if 'static esp_err_t request_gdo_status_recovery(' in source else ''
         run_c(r'''
@@ -165,6 +165,8 @@ struct gdo_status_t {bool synced;};
 static bool synced=true;
 static int refreshes,syncs;
 static int64_t s_last_status_event_ms=1;
+static int64_t last_rx=0;
+static int64_t gdo_get_last_rx_ms() {return last_rx;}
 static int gdo_get_status(gdo_status_t *s) {s->synced=synced;return ESP_OK;}
 static int gdo_sync() {if(synced)return ESP_ERR_INVALID_STATE;++syncs;return ESP_OK;}
 static int gdo_refresh_status() {++refreshes;return ESP_OK;}
@@ -173,5 +175,10 @@ static int gdo_refresh_status() {++refreshes;return ESP_OK;}
 int main() {
  tick(300002); assert(refreshes==1 && syncs==0);
  synced=false;tick(600003);assert(syncs==1);
+ /* Packets decoded without a state change (a wall panel's polls) keep the
+    link alive: no recovery request while the last RX is recent. */
+ synced=true; last_rx=900000; tick(900500); assert(refreshes==1 && syncs==1);
+ tick(1200000); assert(refreshes==1);          /* 299.5 s since last RX */
+ tick(1200600); assert(refreshes==2);          /* 300.6 s: now stale */
 }
 ''',cpp=True)
