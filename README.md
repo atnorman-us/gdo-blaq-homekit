@@ -4,6 +4,12 @@ Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMa
 
 **Current release: [1.3.2.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.3.0)**
 
+## Unreleased
+
+Opener link:
+
+- **Spurious Locked/Unlocked (and Light) flaps on Security+ 1.0 openers with a smart wall panel are gone.** In the listen-only "with smart panel" mode an idle door produces no state-change events, so after five quiet minutes the watchdog sent a status request of its own. That request was a Security+ 2.0 command id the 1.0 bus does not know, it collided with the panel's polls, and one misread status byte showed up in the Home app as a lock that locked and unlocked itself half a second apart, every five minutes. The watchdog now treats any decoded packet as proof of life (the panel's polls count), a status request is never sent in listen-only mode and is a proper 1.0 query otherwise, and light and lock changes on Security+ 1.0 are reported only once two consecutive polls agree.
+
 ## What's changed in 1.3.3.0
 
 Opener link:

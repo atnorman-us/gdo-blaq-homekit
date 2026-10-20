@@ -26,6 +26,7 @@ static struct {int door,door_target,door_position,motor,protocol,last_move_direc
 static struct {bool obst_from_status;} g_config;
 static int events, measurements, updates, status_requests, g_door_start_moving_ms, door_position_sync_timer, gdo_sync_task_handle;
 static int64_t now;
+static int64_t g_last_rx_ms;
 static int64_t esp_timer_get_time(void) { return now; }
 static int esp_timer_start_periodic(int t,int d) {return 0;}
 static void esp_timer_stop(int t) {}

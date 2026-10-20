@@ -1691,12 +1691,21 @@ static void gdo_watchdog_task(void *arg)
         // 2) Fully silent link: no status frames of any kind in a long
         //    time. Distinct from #1 - this fires even while idle, so it
         //    catches a dead UART link that #1 alone wouldn't notice.
-        if (s_last_status_event_ms != 0 &&
-            (now - s_last_status_event_ms) > GDO_LINK_STALE_TIMEOUT_MS) {
+        // Any decoded packet counts as life, not only a state change: in
+        // "with smart panel" mode the wall panel polls constantly but an idle
+        // door produces no events, and the recovery poll this used to send
+        // every five minutes collided with the panel's traffic. A misread
+        // status byte then surfaced as a half-second Locked/Unlocked flap in
+        // the Home app.
+        int64_t last_alive_ms = s_last_status_event_ms;
+        int64_t last_rx_ms = gdo_get_last_rx_ms();
+        if (last_rx_ms > last_alive_ms) last_alive_ms = last_rx_ms;
+        if (last_alive_ms != 0 &&
+            (now - last_alive_ms) > GDO_LINK_STALE_TIMEOUT_MS) {
 
             ESP_LOGW(TAG,
-                     "No GDO status events in %" PRId64 " ms - requesting status recovery",
-                     now - s_last_status_event_ms);
+                     "Nothing received from the GDO in %" PRId64 " ms - requesting status recovery",
+                     now - last_alive_ms);
 
             request_gdo_status_recovery();
 
