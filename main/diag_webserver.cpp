@@ -1021,7 +1021,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    pill(document.getElementById('pillMotion'), s.motion || '?', motionCls(s.motion));"
         "    pill(document.getElementById('pillObstruction'), s.obstruction || '?', obstructionCls(s.obstruction));"
         "    pill(document.getElementById('pillBattery'), s.battery || '?', batteryCls(s.battery));"
-        "    document.getElementById('valOpenings').textContent = (typeof s.openings === 'number') ? s.openings.toLocaleString() : '?';"
+        "    document.getElementById('valOpenings').textContent = (s.protocol || '').indexOf('Security+ 1.0') === 0 ? 'Not reported (Security+ 1.0)' : (typeof s.openings === 'number') ? s.openings.toLocaleString() : '?';"
         "    document.getElementById('valWifi').textContent = s.wifi_connected ? (s.wifi_rssi + ' dBm (' + s.wifi_rssi_pct + '%)') : 'disconnected';"
         "    document.getElementById('valHeap').textContent = (typeof s.free_heap === 'number') ? s.free_heap.toLocaleString() + ' B' : '?';"
         "    document.getElementById('valHap').textContent = (typeof s.hap_sessions === 'number') ? s.hap_sessions : '?';"

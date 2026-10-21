@@ -1,8 +1,74 @@
+diff --git a/private_include/nvs_wifi_connect_private.h b/private_include/nvs_wifi_connect_private.h
+index 81bfe83..d62dbd7 100644
+--- a/private_include/nvs_wifi_connect_private.h
++++ b/private_include/nvs_wifi_connect_private.h
+@@ -27,3 +27,14 @@
+ #define NVS_WIFI_RESTART_VALUE_WRITE "write"
+ 
+ #define NVS_STORAGE_NAME "storage"
++
++// Networks seen by the scan taken just before the setup AP starts, strongest
++// first, one entry per SSID. Read by the setup page's network picker.
++#define NVS_WIFI_SCAN_MAX 20
++typedef struct
++{
++    char ssid[33];
++    int8_t rssi;
++} nvs_wifi_scan_entry_t;
++extern nvs_wifi_scan_entry_t g_nvs_wifi_scan[NVS_WIFI_SCAN_MAX];
++extern int g_nvs_wifi_scan_count;
 diff --git a/source/nvs_wifi_connect.c b/source/nvs_wifi_connect.c
-index d59140f..0e8ec1f 100644
+index d59140f..58ae79d 100644
 --- a/source/nvs_wifi_connect.c
 +++ b/source/nvs_wifi_connect.c
-@@ -90,8 +90,10 @@ static void init_softap(char *ap_ssid, char *ap_pass)
+@@ -21,6 +21,46 @@ static const char *TAG = "nvs_wifi_connect";
+ 
+ static int short_retry_num = 0;
+ 
++nvs_wifi_scan_entry_t g_nvs_wifi_scan[NVS_WIFI_SCAN_MAX];
++int g_nvs_wifi_scan_count = 0;
++
++// Blocking scan, run once while the setup AP comes up (nobody is connected
++// to it yet, so the channel hop is harmless). Keeps the strongest entry per
++// SSID so the setup page can offer a list instead of making the user type
++// a case-sensitive name.
++static void scan_networks(void)
++{
++    g_nvs_wifi_scan_count = 0;
++    if (esp_wifi_scan_start(NULL, true) != ESP_OK)
++    {
++        ESP_LOGW(TAG, "WiFi scan failed");
++        return;
++    }
++    uint16_t num = 0;
++    esp_wifi_scan_get_ap_num(&num);
++    if (num == 0) return;
++    if (num > 40) num = 40;
++    wifi_ap_record_t *recs = calloc(num, sizeof(wifi_ap_record_t));
++    if (!recs) return;
++    if (esp_wifi_scan_get_ap_records(&num, recs) == ESP_OK)
++    {
++        for (int i = 0; i < num; i++) // records arrive sorted by RSSI, strongest first
++        {
++            const char *ssid = (const char *)recs[i].ssid;
++            if (ssid[0] == 0) continue; // hidden
++            int dup = 0;
++            for (int j = 0; j < g_nvs_wifi_scan_count; j++)
++                if (strcmp(g_nvs_wifi_scan[j].ssid, ssid) == 0) { dup = 1; break; }
++            if (dup || g_nvs_wifi_scan_count >= NVS_WIFI_SCAN_MAX) continue;
++            strlcpy(g_nvs_wifi_scan[g_nvs_wifi_scan_count].ssid, ssid, sizeof(g_nvs_wifi_scan[0].ssid));
++            g_nvs_wifi_scan[g_nvs_wifi_scan_count].rssi = recs[i].rssi;
++            g_nvs_wifi_scan_count++;
++        }
++    }
++    free(recs);
++    ESP_LOGI(TAG, "WiFi scan found %d networks", g_nvs_wifi_scan_count);
++}
++
+ static void event_handler_sta(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+ {
+@@ -90,8 +130,10 @@ static void init_softap(char *ap_ssid, char *ap_pass)
              .max_connection = AP_MAX_STA_CONN,
              .authmode = WIFI_AUTH_WPA_WPA2_PSK},
      };
@@ -15,9 +81,16 @@ index d59140f..0e8ec1f 100644
  
      if (strlen((char *)wifi_config.ap.password) < 8)
      {
-@@ -103,8 +105,7 @@ static void init_softap(char *ap_ssid, char *ap_pass)
+@@ -99,12 +141,13 @@ static void init_softap(char *ap_ssid, char *ap_pass)
+         wifi_config.ap.password[0] = 0;
+     }
+ 
+-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
++    // APSTA so the radio can scan; the STA side stays idle.
++    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
      ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
      ESP_ERROR_CHECK(esp_wifi_start());
++    scan_networks();
  
 -    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s",
 -             ap_ssid, ap_pass);
@@ -25,7 +98,7 @@ index d59140f..0e8ec1f 100644
  }
  
  static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
-@@ -141,8 +142,13 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
+@@ -141,8 +184,13 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
                  .required = false},
          },
      };
@@ -41,7 +114,7 @@ index d59140f..0e8ec1f 100644
  
      ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
      ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-@@ -162,14 +168,12 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
+@@ -162,14 +210,12 @@ static esp_err_t init_sta(char *sta_ssid, char *sta_pass)
       * happened. */
      if (bits & WIFI_CONNECTED_BIT)
      {
@@ -58,7 +131,7 @@ index d59140f..0e8ec1f 100644
          err = ESP_FAIL;
      }
      else
-@@ -208,8 +212,8 @@ _ret:
+@@ -208,8 +254,8 @@ _ret:
  
  esp_err_t nvs_wifi_connect(void)
  {
@@ -69,7 +142,7 @@ index d59140f..0e8ec1f 100644
      char nvs_password[64] = {0};
  
      esp_err_t err = nvs_flash_init();
-@@ -235,16 +239,19 @@ esp_err_t nvs_wifi_connect(void)
+@@ -235,16 +281,19 @@ esp_err_t nvs_wifi_connect(void)
                      return ESP_OK;
                  }
              }
@@ -94,10 +167,10 @@ index d59140f..0e8ec1f 100644
  
      return ESP_ERR_INVALID_ARG;
 diff --git a/source/nvs_wifi_connect.html b/source/nvs_wifi_connect.html
-index c6d8eff..969b53b 100644
+index c6d8eff..2ff4fc1 100644
 --- a/source/nvs_wifi_connect.html
 +++ b/source/nvs_wifi_connect.html
-@@ -1,198 +1,151 @@
+@@ -1,198 +1,172 @@
  <!DOCTYPE html>
 +<html lang="en">
  <head>
@@ -215,6 +288,8 @@ index c6d8eff..969b53b 100644
 +    </select>
 +
 +    <div id="modeSta">
++        <label for="nvsStaScan">Nearby networks</label>
++        <select id="nvsStaScan"><option value="">Scanning...</option></select>
 +        <label for="nvsStaSsid">WiFi network name (SSID)</label>
 +        <input type="text" id="nvsStaSsid" placeholder="2.4 GHz network" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="32">
 +        <label for="nvsStaPass">WiFi password</label>
@@ -314,6 +389,19 @@ index c6d8eff..969b53b 100644
 +        $('nvsApPass').type = t;
 +    });
 +
++    var scanCount = 0;
++    $('nvsStaScan').addEventListener('change', function (e) {
++        if (e.target.value) $('nvsStaSsid').value = e.target.value;
++    });
++    function addScanResult(ssid, rssi) {
++        var sel = $('nvsStaScan');
++        if (scanCount++ === 0) sel.innerHTML = '<option value="">Pick a network (or type it below)</option>';
++        var o = document.createElement('option');
++        o.value = ssid;
++        o.textContent = ssid + '  (' + rssi + ' dBm)';
++        sel.appendChild(o);
++    }
++
 +    function sendJson(obj) { socket.send(JSON.stringify(obj)); }
 +
 +    // Sends mode, SSID and (only if the user typed one) the password. A blank
@@ -350,6 +438,7 @@ index c6d8eff..969b53b 100644
 +    function receiveWsData(data) {
 +        try {
 +            var obj = JSON.parse(data);
++            if (obj.name === 'scanResult') { addScanResult(obj.msg, obj.rssi); return; }
 +            var el = $(obj.name);
 +            if (!el) return;
 +            el.value = obj.msg;
@@ -398,6 +487,11 @@ index c6d8eff..969b53b 100644
 -            console.log("close");
 -            setTimeout(() => document.location.reload(), 2000);
 +            reconnectAttempts = 0;
++            scanCount = 0; // the device resends its scan list on every connection
++            $('nvsStaScan').innerHTML = '<option value="">Scanning...</option>';
++            setTimeout(function () {
++                if (scanCount === 0) $('nvsStaScan').innerHTML = '<option value="">No networks found - type the name below</option>';
++            }, 2000);
 +            setButtons(true);
 +            setStatus('Connected to the device.', 'ok');
          };
@@ -432,7 +526,7 @@ index c6d8eff..969b53b 100644
 \ No newline at end of file
 +</html>
 diff --git a/source/nvs_wifi_connect_http_server.c b/source/nvs_wifi_connect_http_server.c
-index b45134e..14ddf70 100644
+index b45134e..f7726e7 100644
 --- a/source/nvs_wifi_connect_http_server.c
 +++ b/source/nvs_wifi_connect_http_server.c
 @@ -23,30 +23,102 @@ enum
@@ -557,7 +651,7 @@ index b45134e..14ddf70 100644
      return ESP_OK;
  }
  static void send_json_string(char *str, httpd_req_t *req)
-@@ -59,34 +131,28 @@ static void send_json_string(char *str, httpd_req_t *req)
+@@ -59,35 +131,43 @@ static void send_json_string(char *str, httpd_req_t *req)
      httpd_ws_send_frame(req, &ws_pkt);
  }
  // read & send initial wifi data from nvs
@@ -573,6 +667,19 @@ index b45134e..14ddf70 100644
 +    if (json_escape(nvs_data, escaped, sizeof(escaped)) < 0) return;
 +    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", key, escaped);
 +    send_json_string(buf, req);
++}
++// One frame per scanned network: {"name":"scanResult","msg":"<ssid>","rssi":-63}
++static void send_scan_results(httpd_req_t *req)
++{
++    char escaped[33 * 6] = {0};
++    char buf[sizeof(escaped) + 64] = {0};
++    for (int i = 0; i < g_nvs_wifi_scan_count; i++)
++    {
++        if (json_escape(g_nvs_wifi_scan[i].ssid, escaped, sizeof(escaped)) < 0) continue;
++        snprintf(buf, sizeof(buf), "{\"name\":\"scanResult\",\"msg\":\"%s\",\"rssi\":%d}",
++                 escaped, g_nvs_wifi_scan[i].rssi);
++        send_json_string(buf, req);
++    }
 +}
 +// Mode and SSIDs only. The stored passwords are deliberately not sent: the
 +// setup AP is open, so anyone who joins it could otherwise read the home
@@ -609,9 +716,11 @@ index b45134e..14ddf70 100644
 +    send_nvs_key(nvs_handle, NVS_AP_ESP_WIFI_SSID_KEY, req);
 +    send_nvs_key(nvs_handle, NVS_STA_ESP_WIFI_SSID_KEY, req);
      nvs_close(nvs_handle);
++    send_scan_results(req);
  }
  // write wifi data from ws to nvs
-@@ -95,11 +161,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+@@ -95,11 +175,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
      char key[16];
      char value[64];
      nvs_handle_t nvs_handle;
@@ -626,7 +735,7 @@ index b45134e..14ddf70 100644
      }
      else
      {
-@@ -107,7 +174,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+@@ -107,7 +188,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
          {
              if (nvs_set_str(nvs_handle, key, value)) // write key/value to nvs
              {
@@ -635,7 +744,7 @@ index b45134e..14ddf70 100644
              }
              nvs_commit(nvs_handle);
              nvs_close(nvs_handle);
-@@ -150,6 +217,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
+@@ -150,6 +231,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
          ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
          return ret;
      }
@@ -643,7 +752,7 @@ index b45134e..14ddf70 100644
      if (ws_pkt.len)
      {
          /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
-@@ -198,6 +266,7 @@ static httpd_handle_t start_webserver(void)
+@@ -198,6 +280,7 @@ static httpd_handle_t start_webserver(void)
  {
      httpd_handle_t server = NULL;
      httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -651,7 +760,7 @@ index b45134e..14ddf70 100644
      // Start the httpd server
      if (httpd_start(&server, &config) == ESP_OK)
      {
-@@ -260,7 +329,6 @@ static void full_stop_httpd_server(void *arg, esp_event_base_t event_base,
+@@ -260,7 +343,6 @@ static void full_stop_httpd_server(void *arg, esp_event_base_t event_base,
              ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler));
              ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler));
              ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, &connect_handler));
@@ -659,7 +768,7 @@ index b45134e..14ddf70 100644
              ESP_ERROR_CHECK(esp_event_handler_unregister(NVS_WIFI_CONNECT_STOP_HTTPD, NVS_WIFI_CONNECT_STOP_HTTPD_EVENT, &full_stop_httpd_server));
              ESP_LOGI(TAG, "Unregister handlers OK");
          }
-@@ -291,8 +359,11 @@ httpd_handle_t nvs_wifi_connect_start_http_server(int restart, nvs_wifi_connect_
+@@ -291,11 +373,14 @@ httpd_handle_t nvs_wifi_connect_start_http_server(int restart, nvs_wifi_connect_
      ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
      ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
  
@@ -672,3 +781,9 @@ index b45134e..14ddf70 100644
  
      ESP_ERROR_CHECK(esp_event_handler_register(NVS_WIFI_CONNECT_STOP_HTTPD, NVS_WIFI_CONNECT_STOP_HTTPD_EVENT, &full_stop_httpd_server, &server));
  
+     server = start_webserver();
+     return server;
+-}
+\ No newline at end of file
++}
+\ No newline at end of file
