@@ -20,6 +20,8 @@ extern "C" {
 esp_err_t gdo_control_open(void);
 esp_err_t gdo_control_close(void);
 
+// Setters persist successfully before publishing RAM changes. An error leaves
+// the active setting and pending-close generation unchanged.
 bool     gdo_get_auto_close_enabled(void);
 esp_err_t gdo_set_auto_close_enabled(bool enabled);
 
@@ -38,8 +40,8 @@ int64_t gdo_get_auto_close_remaining_ms(void);
 
 // Scheduled close: close the door if it is open at a set local time of day.
 // Defined in gdo-blaq-homekit.cpp (NVS-backed). set() validates the time
-// (0..1439) and POSIX timezone string, applies the timezone immediately, and
-// cancels any warning already counting down.
+// (0..1439) and POSIX timezone string. Persistence, timezone application, and
+// warning cancellation are serialized with schedule evaluation.
 esp_err_t gdo_get_close_schedule(gdo_close_schedule_t *out);
 esp_err_t gdo_set_close_schedule(const gdo_close_schedule_t *in);
 

@@ -2,7 +2,18 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.5.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.5.0)**
+**Current release: [1.3.6.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.6.0)**
+
+## What's changed in 1.3.6.0
+
+- Schedule edits and scheduled-close decisions are synchronized, including timezone changes. A removed schedule cannot arm under a newer settings revision.
+- HomeKit target changes share one ordered queue, preventing an older queued update from overwriting a newer command.
+- Settings and password writes report storage errors instead of claiming success. Schedule and credential records are saved together; existing settings are read on upgrade.
+- **Recent activity** shows the latest 32 events: HomeKit requests, observed door/obstruction changes, warning cancellations, retries, and scheduled-close skip reasons. It is password-protected, held in RAM, and resets at reboot. Consecutive identical events are collapsed. Times use the device clock when available, otherwise uptime. Observed opener events do not identify whether MyQ, a remote, or a wall control caused them.
+- **Connection freshness** shows the age of received opener traffic and the last valid door-state report, alongside Wi-Fi and HomeKit session status. Repeated reports refresh the age even when state is unchanged; estimated position and local command echoes do not count as fresh door confirmation. An old report means the state may be stale, not that a fault is proven.
+- **Change admin password** requires the existing password and confirmation of the new password. It preserves Wi-Fi, pairing, and other settings. Other browser pages must authenticate again with the new password.
+- **Firmware review survives a page refresh:** pending version, Confirm/Cancel, time remaining, and rollback availability are restored from the device. A cancelled, failed, or expired upload remains ineligible for rollback across reboot. Reboot clears pending confirmation; upload again to review it.
+- **Rollback compatibility:** only an image that has successfully booted with the new settings format is offered for manual rollback. An older or unknown slot is unavailable because booting it could restore obsolete passwords or schedules. Automatic bootloader recovery remains separate.
 
 ## What's changed in 1.3.5.0
 
@@ -97,7 +108,7 @@ On first use, set an **8–64-character admin password** using the dashboard's s
 
 The password protects settings, restart, firmware upload/confirmation/cancellation/rollback, and log viewing/download. The dashboard and `/status` remain readable without it. These endpoints use local HTTP, so use them on a trusted LAN and do not expose port 8080 to the internet.
 
-There is no dashboard password-reset feature. Erasing NVS to recover a forgotten password also removes WiFi, HomeKit, and opener-related saved state and requires reconfiguration.
+Use **Change admin password** to rotate a known password without erasing settings. There is no forgotten-password reset in the dashboard. Erasing NVS to recover a forgotten password also removes WiFi, HomeKit, and opener-related saved state and requires reconfiguration.
 
 | Endpoint | Purpose | Password required |
 | --- | --- | --- |
@@ -105,6 +116,7 @@ There is no dashboard password-reset feature. Erasing NVS to recover a forgotten
 | `/status` | Current status as JSON | No |
 | `/logs` | Log buffer as plain text | Yes |
 | `/logs/download` | Download `gdo-log.txt` | Yes |
+| `/activity` | Recent structured activity as JSON | Yes |
 
 Use the dashboard's log controls to supply authentication automatically. API clients must send the admin password in the `X-GDO-Token` request header; opening a protected log URL directly does not supply that header.
 

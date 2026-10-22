@@ -27,6 +27,10 @@ static struct {bool obst_from_status;} g_config;
 static int events, measurements, updates, status_requests, g_door_start_moving_ms, door_position_sync_timer, gdo_sync_task_handle;
 static int64_t now;
 static int64_t g_last_rx_ms;
+static struct {int64_t last_packet_us,last_door_status_us;} g_rx_health;
+#define portENTER_CRITICAL(x) ((void)0)
+#define portEXIT_CRITICAL(x) ((void)0)
+
 static int64_t esp_timer_get_time(void) { return now; }
 static int esp_timer_start_periodic(int t,int d) {return 0;}
 static void esp_timer_stop(int t) {}
@@ -46,8 +50,49 @@ class PacketDurationTests(unittest.TestCase):
         return harness() + '\n#include "' + str(ROOT / 'components/gdolib/secplus.c') + '"\n' + stubs + r'''
 static void update_openings(int a,int b) {updates++;}
 static void update_paired_devices(int a,int b) {updates++;}
-''' + extra_stubs + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
+''' + extra_stubs + function('components/gdolib/gdo.c', 'static void record_received_packet(') + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
     + function('components/gdolib/gdo.c', 'static void decode_packet(uint8_t *packet) {')
+
+    def test_receive_age_tracks_reports_not_interpolation_or_echoes(self):
+        run_c(self.packet_source() + r'''
+int main(void) {
+ uint8_t packet[19];
+ g_status.door=GDO_DOOR_STATE_CLOSED;
+ now=1000000;
+ assert(encode_wireline(123,0x123456,0x181,packet)==0);
+ decode_packet(packet);
+ assert(g_rx_health.last_packet_us==1000000 && g_rx_health.last_door_status_us==1000000);
+ now=2000000; decode_packet(packet); // identical state is still a fresh report
+ assert(g_rx_health.last_door_status_us==2000000);
+ now=3000000; packet[17]^=1; decode_packet(packet);
+ assert(g_rx_health.last_packet_us==2000000 && g_rx_health.last_door_status_us==2000000);
+ packet[17]^=1; g_status.client_id=0x123456; decode_packet(packet);
+ assert(g_rx_health.last_packet_us==2000000); // local echo is not opener health
+ g_status.client_id=0; now=4000000;
+ assert(encode_wireline(124,0x123456,0xf81,packet)==0); decode_packet(packet);
+ assert(g_rx_health.last_door_status_us==2000000); // invalid state is not confirmation
+ now=5000000; update_door_state(GDO_DOOR_STATE_CLOSING);
+ assert(g_rx_health.last_door_status_us==2000000); // estimates cannot refresh telemetry
+}''')
+
+    def test_v1_freshness_requires_a_valid_door_report(self):
+        source = self.packet_source() + '\nstatic unsigned g_v1_rx_queries;\nstatic void queue_v1_command(int) {}\n'
+        source += function('components/gdolib/gdo.c', 'static inline bool v1_is_query(')
+        source += function('components/gdolib/gdo.c', 'static void decode_v1_packet(')
+        run_c(source + r'''
+int main(void) {
+ uint8_t packet[2] = {V1_CMD_QUERY_DOOR_STATUS, 2};
+ now=1000000;decode_v1_packet(packet);
+ assert(g_rx_health.last_packet_us==1000000 && g_rx_health.last_door_status_us==1000000);
+ now=2000000;decode_v1_packet(packet);
+ assert(g_rx_health.last_door_status_us==2000000);
+ now=3000000;packet[1]=3;decode_v1_packet(packet);
+ assert(g_rx_health.last_door_status_us==2000000);
+ now=4000000;packet[0]=V1_CMD_QUERY_OTHER_STATUS;decode_v1_packet(packet);
+ assert(g_rx_health.last_packet_us==4000000 && g_rx_health.last_door_status_us==2000000);
+ now=5000000;packet[0]=0xff;decode_v1_packet(packet);
+ assert(g_rx_health.last_packet_us==4000000);
+}''')
 
     def test_bad_parity_cannot_mutate_status_or_emit_events(self):
         run_c(self.packet_source() + r'''

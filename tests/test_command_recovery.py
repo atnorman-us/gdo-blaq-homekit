@@ -28,6 +28,7 @@ class CommandRecoveryTests(unittest.TestCase):
 #define TGT_CLOSED 1
 using esp_err_t = int;
 struct ControlGuard {};
+static void activity_record(const char*, const char*) {}
 struct gdo_status_t { bool synced; int obstruction; int door; } current={true,0,1};
 static uint32_t s_close_generation;
 static uint32_t s_user_close_pending_generation;

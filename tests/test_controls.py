@@ -13,6 +13,7 @@ class ControlTests(unittest.TestCase):
 #define GDO_OBSTRUCTION_STATE_CLEAR 0
 #define TGT_CLOSED 1
 struct ControlGuard {};
+static void activity_record(const char*, const char*) {}
 struct gdo_status_t { bool synced; int door,obstruction; uint32_t door_command_id; } current;
 static int calls, last_door, last_obstruction;
 static bool s_auto_close_enabled, s_auto_close_triggered;
@@ -95,6 +96,7 @@ enum gdo_door_state_t { GDO_DOOR_STATE_UNKNOWN, GDO_DOOR_STATE_OPEN, GDO_DOOR_ST
  GDO_DOOR_STATE_STOPPED, GDO_DOOR_STATE_OPENING, GDO_DOOR_STATE_CLOSING, GDO_DOOR_STATE_MAX };
 static int lock_depth;
 struct ControlGuard { ControlGuard() { ++lock_depth; } ~ControlGuard() { --lock_depth; } };
+static void activity_record(const char*, const char*) {}
 static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
 static uint32_t s_close_generation;
 static int64_t s_door_open_since_ms, s_door_continuously_open_since_ms;

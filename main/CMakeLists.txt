@@ -5,6 +5,7 @@ idf_component_register(
         "wifi.cpp"
         "diag_webserver.cpp"
         "clock_sync.cpp"
+        "activity_history.cpp"
         "log_ring_buffer.cpp"
         "pre_close_warning.c"
         "diagnostics_counters.c"
@@ -25,5 +26,6 @@ idf_component_register(
         app_update
         mdns
         mbedtls
+        json
         lwip
 )

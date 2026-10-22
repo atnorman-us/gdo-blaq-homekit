@@ -167,7 +167,27 @@ static int gdo_control_close() { ++closes; return command_result; }
 static int gdo_lock() { ++locks; return command_result; }
 static int gdo_unlock() { ++unlocks; return command_result; }
 static void hap_char_update_val(hap_char_t *hc, hap_val_t *v) { hc->value = *v; }
+#include <vector>
+#define pdTRUE 1
+#define pdMS_TO_TICKS(ms) (ms)
+enum class HomeKitNotifDest { DoorTargetState };
+struct GDOEvent { HomeKitNotifDest dest; union { bool b; uint8_t u; } value; };
+static int gdo_notif_event_q = 1;
+static std::vector<GDOEvent> queued;
+static bool queue_full;
+static int xQueueSend(int, const GDOEvent *event, int) {
+ if (queue_full) return 0; queued.push_back(*event); return pdTRUE;
+}
+static hap_char_t *hap_serv_get_char_by_uuid(hap_char_t *service, const char *) { return service; }
 '''
+        source += '''\nstatic int target_enqueue_mutex = 1;\nstatic int xSemaphoreTake(int, int) { return pdTRUE; }\nstatic void xSemaphoreGive(int) {}\n'''
+        source += function('main/homekit.cpp', 'static bool queue_homekit_target(uint8_t tgt) {')
+        source += function('main/homekit.cpp', 'void notify_homekit_target_door_state_change(uint8_t tgt) {')
+        production = (ROOT / 'main/homekit.cpp').read_text()
+        branch = production.split('case HomeKitNotifDest::DoorTargetState:', 1)[1].split('break;', 1)[0]
+        source += 'static void consume(hap_char_t *gdo_svc) { for (auto e : queued) { hap_char_t *dest; hap_val_t value = {};'
+        source += branch
+        source += 'hap_char_update_val(dest, &value); } queued.clear(); }\n'
         source += function('main/homekit.cpp', 'static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv) {')
         source += r'''
 int main() {
@@ -175,6 +195,7 @@ int main() {
  int status = 99;
  hap_write_data_t write = {&door, {.u = 1}, &status};
  assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_SUCCESS);
+ consume(&door);
  assert(status == HAP_STATUS_SUCCESS && door.value.u == 1 && closes == 1);
  // An accepted write is recorded for the notify path's deduplication.
  assert(last_target.load() == 1);
@@ -185,6 +206,29 @@ int main() {
  write.val.u = 5;
  assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_FAIL);
  assert(status == HAP_STATUS_VAL_INVALID && closes == 2 && opens == 0);
+
+
+ // Previously queued Open must not win over a newer accepted Close.
+ for (uint32_t target = 0; target <= 1; ++target) {
+   command_result = 0;
+   last_target.store(0xFF);
+   notify_homekit_target_door_state_change(1 - target);
+   write.val.u = target;
+   assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_SUCCESS);
+   consume(&door);
+   notify_homekit_target_door_state_change(target);
+   consume(&door);
+   assert(door.value.u == target);
+ }
+ // If queue admission fails, report failure and leave the target retryable.
+ queue_full = true;
+ write.val.u = 0;
+ assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_FAIL);
+ assert(status == HAP_STATUS_COMM_ERR && last_target.load() == 1);
+ queue_full = false;
+ assert(gdo_svc_set(&write, 1, nullptr, nullptr) == HAP_SUCCESS);
+ consume(&door);
+ assert(door.value.u == 0);
 
  // Lock Target State: committed only when gdolib accepted the command.
  command_result = 0;
@@ -271,6 +315,8 @@ static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
 static std::atomic<uint8_t> last_target{HOMEKIT_TARGET_UNKNOWN};
 static uint8_t map_gdo_to_homekit_state(gdo_door_state_t d) { return (uint8_t)d; }
 '''
+        source += '''\nstatic int target_enqueue_mutex = 1;\nstatic int xSemaphoreTake(int, int) { return pdTRUE; }\nstatic void xSemaphoreGive(int) {}\n'''
+        source += function('main/homekit.cpp', 'static bool queue_homekit_target(uint8_t tgt) {')
         source += function('main/homekit.cpp', 'void notify_homekit_target_door_state_change(uint8_t tgt) {')
         source += function('main/homekit.cpp', 'void notify_homekit_current_door_state_change(gdo_door_state_t door) {')
         source += r'''
@@ -289,7 +335,7 @@ int main() {
  notify_homekit_target_door_state_change(1);
  notify_homekit_current_door_state_change(GDO_DOOR_STATE_OPEN);
  assert(queued.size() == 4 && last_target.load() == 1 && last_door == GDO_DOOR_STATE_OPEN);
- // A Target written directly by HomeKit (gdo_svc_set) updates the cache, so
+ // A Target previously accepted by the shared enqueue path updates the cache, so
  // a revert back to the previous value is still pushed.
  last_target.store(0);
  notify_homekit_target_door_state_change(1);

@@ -1,5 +1,7 @@
 #include "diag_webserver.h"
 #include "log_ring_buffer.h"
+#include "activity_history.h"
+#include "cJSON.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -182,21 +184,70 @@ static bool reject_unless_own_page(httpd_req_t *req)
 // Returns false only on genuine NVS access failure (used to retry boot,
 // same as before) - "no password set yet" is a normal, expected state on a
 // fresh device, not a failure, and simply leaves s_admin_password_set false.
+struct admin_credentials_t {
+    uint32_t iterations;
+    uint8_t salt[16];
+    uint8_t hash[32];
+};
+
+static bool authorize_mutation(httpd_req_t *req)
+{
+    if (!s_admin_password_set) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "No admin password set - open the diagnostics page to set one first");
+        return false;
+    }
+    char supplied[ADMIN_PASSWORD_MAX_LEN + 1] = {};
+    size_t len = httpd_req_get_hdr_value_len(req, "X-GDO-Token");
+    if (len == 0 || len > ADMIN_PASSWORD_MAX_LEN ||
+        httpd_req_get_hdr_value_str(req, "X-GDO-Token", supplied, sizeof(supplied)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Admin password required");
+        return false;
+    }
+    uint8_t candidate[sizeof(s_admin_pw_hash)];
+    if (!hash_admin_password(supplied, strlen(supplied), s_admin_pw_salt, s_admin_pw_iterations, candidate)) {
+        // Fail closed: an uninitialised candidate must never be compared.
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Admin password could not be verified");
+        return false;
+    }
+    unsigned difference = 0;
+    for (size_t i = 0; i < sizeof(candidate); ++i) difference |= candidate[i] ^ s_admin_pw_hash[i];
+    if (difference) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Invalid admin password");
+        return false;
+    }
+    return true;
+}
+
+
 static bool init_admin_credentials(void)
 {
     nvs_handle_t handle;
     if (nvs_open("gdo_admin", NVS_READWRITE, &handle) != ESP_OK) return false;
-    size_t salt_len = sizeof(s_admin_pw_salt), hash_len = sizeof(s_admin_pw_hash);
-    bool have_salt = nvs_get_blob(handle, "pw_salt", s_admin_pw_salt, &salt_len) == ESP_OK &&
-                      salt_len == sizeof(s_admin_pw_salt);
-    bool have_hash = nvs_get_blob(handle, "pw_hash", s_admin_pw_hash, &hash_len) == ESP_OK &&
-                      hash_len == sizeof(s_admin_pw_hash);
-    bool have_iter = nvs_get_u32(handle, "pw_iter", &s_admin_pw_iterations) == ESP_OK;
-    nvs_close(handle);
-    s_admin_password_set = have_salt && have_hash && have_iter;
-    if (!s_admin_password_set) {
-        ESP_LOGW(TAG, "No admin password set yet - open the diagnostics page to set one before using any controls");
+    admin_credentials_t credentials = {};
+    size_t length = sizeof(credentials);
+    esp_err_t result = nvs_get_blob(handle, "credentials", &credentials, &length);
+    if (result == ESP_OK && length == sizeof(credentials) && credentials.iterations > 0) {
+        memcpy(s_admin_pw_salt, credentials.salt, sizeof(credentials.salt));
+        memcpy(s_admin_pw_hash, credentials.hash, sizeof(credentials.hash));
+        s_admin_pw_iterations = credentials.iterations;
+        s_admin_password_set = true;
+    } else if (result == ESP_ERR_NVS_NOT_FOUND) {
+        size_t salt_len = sizeof(s_admin_pw_salt), hash_len = sizeof(s_admin_pw_hash);
+        esp_err_t salt_result = nvs_get_blob(handle, "pw_salt", s_admin_pw_salt, &salt_len);
+        esp_err_t hash_result = nvs_get_blob(handle, "pw_hash", s_admin_pw_hash, &hash_len);
+        esp_err_t iter_result = nvs_get_u32(handle, "pw_iter", &s_admin_pw_iterations);
+        s_admin_password_set = salt_result == ESP_OK && hash_result == ESP_OK && iter_result == ESP_OK &&
+            salt_len == sizeof(s_admin_pw_salt) && hash_len == sizeof(s_admin_pw_hash) && s_admin_pw_iterations > 0;
+        if (!s_admin_password_set && !(salt_result == ESP_ERR_NVS_NOT_FOUND &&
+            hash_result == ESP_ERR_NVS_NOT_FOUND && iter_result == ESP_ERR_NVS_NOT_FOUND)) {
+            nvs_close(handle);
+            return false; // Partial/corrupt credentials must never reopen enrollment.
+        }
+    } else {
+        nvs_close(handle);
+        return false;
     }
+    nvs_close(handle);
     return true;
 }
 
@@ -207,15 +258,16 @@ static bool init_admin_credentials(void)
 // entirely (which also wipes WiFi/HomeKit/rolling-code state) - the same
 // tradeoff most consumer routers and IoT devices make for their admin
 // password.
-static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
+static esp_err_t admin_write_password(httpd_req_t *req, bool changing)
 {
-    if (s_admin_password_set) {
+    if (changing && !authorize_mutation(req)) return ESP_FAIL;
+    if (!changing && s_admin_password_set) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Admin password already set");
         return ESP_FAIL;
     }
     // Before any password exists this is the only unauthenticated write, and
     // a plain POST from any web page on the LAN could otherwise set it.
-    if (!reject_unless_own_page(req)) return ESP_FAIL;
+    if (!changing && !reject_unless_own_page(req)) return ESP_FAIL;
     if (req->content_len < ADMIN_PASSWORD_MIN_LEN || req->content_len > ADMIN_PASSWORD_MAX_LEN) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be 8-64 characters");
         return ESP_FAIL;
@@ -268,10 +320,12 @@ static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
     nvs_handle_t handle;
     esp_err_t err = nvs_open("gdo_admin", NVS_READWRITE, &handle);
     if (err == ESP_OK) {
-        nvs_set_blob(handle, "pw_salt", salt, sizeof(salt));
-        nvs_set_blob(handle, "pw_hash", hash, sizeof(hash));
-        nvs_set_u32(handle, "pw_iter", ADMIN_PASSWORD_PBKDF2_ITERATIONS);
-        err = nvs_commit(handle);
+        admin_credentials_t credentials = {};
+        credentials.iterations = ADMIN_PASSWORD_PBKDF2_ITERATIONS;
+        memcpy(credentials.salt, salt, sizeof(salt));
+        memcpy(credentials.hash, hash, sizeof(hash));
+        err = nvs_set_blob(handle, "credentials", &credentials, sizeof(credentials));
+        if (err == ESP_OK) err = nvs_commit(handle);
         nvs_close(handle);
     }
     if (err != ESP_OK) {
@@ -287,33 +341,16 @@ static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, "ok", 2);
 }
 
-static bool authorize_mutation(httpd_req_t *req)
+static esp_err_t admin_set_password_post_handler(httpd_req_t *req)
 {
-    if (!s_admin_password_set) {
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "No admin password set - open the diagnostics page to set one first");
-        return false;
-    }
-    char supplied[ADMIN_PASSWORD_MAX_LEN + 1] = {};
-    size_t len = httpd_req_get_hdr_value_len(req, "X-GDO-Token");
-    if (len == 0 || len > ADMIN_PASSWORD_MAX_LEN ||
-        httpd_req_get_hdr_value_str(req, "X-GDO-Token", supplied, sizeof(supplied)) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Admin password required");
-        return false;
-    }
-    uint8_t candidate[sizeof(s_admin_pw_hash)];
-    if (!hash_admin_password(supplied, strlen(supplied), s_admin_pw_salt, s_admin_pw_iterations, candidate)) {
-        // Fail closed: an uninitialised candidate must never be compared.
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Admin password could not be verified");
-        return false;
-    }
-    unsigned difference = 0;
-    for (size_t i = 0; i < sizeof(candidate); ++i) difference |= candidate[i] ^ s_admin_pw_hash[i];
-    if (difference) {
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Invalid admin password");
-        return false;
-    }
-    return true;
+    return admin_write_password(req, false);
 }
+
+static esp_err_t admin_change_password_post_handler(httpd_req_t *req)
+{
+    return admin_write_password(req, true);
+}
+
 
 static void delayed_restart_task(void *arg)
 {
@@ -354,8 +391,29 @@ static const esp_partition_t *s_ota_pending_partition = nullptr;
 // The slot most recently written by an upload that has not been confirmed.
 // esp_ota_begin() erased the firmware that was there, so "roll back to the
 // other slot" would boot the cancelled upload, not the previous release.
-// Cleared only by a confirm (which reboots) or a reboot.
-static const esp_partition_t *s_ota_unconfirmed_partition = nullptr;
+// Eligibility survives cancel, expiry, failed uploads, and reboot.
+// Persist ineligibility BEFORE erasing an image. Unknown slots are ineligible:
+// older firmware may read stale legacy credentials/settings after blob migration.
+// Only a healthy boot of format-compatible firmware records explicit eligibility.
+static bool ota_slot_eligible(const esp_partition_t *partition)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gdo_ota", NVS_READWRITE, &handle) != ESP_OK) return false;
+    uint8_t blocked = 0;
+    esp_err_t err = nvs_get_u8(handle, partition->label, &blocked);
+    nvs_close(handle);
+    return err == ESP_OK && blocked == 0;
+}
+
+static bool ota_block_slot(const esp_partition_t *partition, bool blocked)
+{
+    nvs_handle_t handle;
+    if (nvs_open("gdo_ota", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t err = nvs_set_u8(handle, partition->label, blocked ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err == ESP_OK;
+}
 static int64_t s_ota_pending_since_ms = 0;
 static char s_ota_pending_version[32] = {0};
 #define OTA_CONFIRM_EXPIRY_MS (10 * 60 * 1000)
@@ -365,6 +423,20 @@ static void ota_clear_pending(void)
     s_ota_pending_partition = nullptr;
     s_ota_pending_since_ms = 0;
     s_ota_pending_version[0] = '\0';
+}
+
+// Application descriptors are upload-controlled strings. Escape them before
+// interpolation into JSON; buffers allow six output bytes per input byte.
+static void escape_json_version(const char *input, char *output, size_t capacity)
+{
+    size_t used = 0;
+    for (size_t i = 0; i < 32 && input[i] && used + 7 < capacity; ++i) {
+        unsigned char c = (unsigned char)input[i];
+        if (c == '"' || c == '\\') { output[used++] = '\\'; output[used++] = c; }
+        else if (c < 0x20 || c >= 0x7f) { used += snprintf(output + used, capacity - used, "\\u%04x", c); }
+        else output[used++] = c;
+    }
+    output[used] = '\0';
 }
 
 static esp_err_t firmware_update_post_handler(httpd_req_t *req)
@@ -403,6 +475,11 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    if (!ota_block_slot(target, true)) {
+        free(chunk);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     s_ota_upload_in_progress = true;
     ota_clear_pending();
 
@@ -462,16 +539,18 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
     const char *version = (desc_err == ESP_OK) ? app_desc.version : "unknown";
 
     s_ota_pending_partition = target;
-    s_ota_unconfirmed_partition = target;
+
     s_ota_pending_since_ms = esp_timer_get_time() / 1000;
     snprintf(s_ota_pending_version, sizeof(s_ota_pending_version), "%s", version);
 
     ESP_LOGI(TAG, "Firmware validated: version '%s' written to partition '%s', awaiting confirm",
              version, target->label);
 
-    char resp[128];
+    char escaped_version[200];
+    escape_json_version(version, escaped_version, sizeof(escaped_version));
+    char resp[280];
     int n = snprintf(resp, sizeof(resp), "{\"partition\":\"%s\",\"version\":\"%s\",\"size\":%d}",
-                      target->label, version, req->content_len);
+                      target->label, escaped_version, req->content_len);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, resp, (n > 0 && (size_t)n < sizeof(resp)) ? n : HTTPD_RESP_USE_STRLEN);
@@ -496,13 +575,14 @@ static esp_err_t firmware_confirm_post_handler(httpd_req_t *req)
 
     const esp_partition_t *target = s_ota_pending_partition;
     esp_err_t err = esp_ota_set_boot_partition(target);
-    ota_clear_pending();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition() failed: %s", esp_err_to_name(err));
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
+    ota_clear_pending();
+    activity_record("firmware", "Upload confirmed; restarting");
     ESP_LOGW(TAG, "Firmware confirmed, booting '%s' next - restarting", target->label);
 
     httpd_resp_set_type(req, "text/plain");
@@ -542,9 +622,9 @@ static esp_err_t firmware_rollback_post_handler(httpd_req_t *req)
                              "Other OTA slot has no valid image to roll back to");
         return ESP_FAIL;
     }
-    if (other == s_ota_unconfirmed_partition) {
+    if (!ota_slot_eligible(other)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                             "The other slot holds an upload that was never confirmed, not the previous firmware. Upload again and choose Confirm instead.");
+                             "The other slot is unconfirmed or has unknown settings compatibility. Upload compatible firmware and choose Confirm instead.");
         return ESP_FAIL;
     }
 
@@ -828,6 +908,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  </div>"
         "</div>"
         "<div class=\"grid\">"
+        "  <div class=\"card full\"><h2>Connection freshness</h2><p id=\"freshness\">Waiting for status\u2026</p><p>Moving door position is an estimate; confirmed door status comes from the opener.</p></div>"
+        "  <div class=\"card full\"><h2>Recent activity</h2><button onclick=\"loadActivity()\">Load recent events</button><pre id=\"activity\">Authenticate to view recent events.</pre></div>"
+        "  <div class=\"card full\"><h2>Administration</h2><button onclick=\"changePassword()\">Change admin password</button></div>"
         "  <div class=\"card full\">"
         "    <h2>Overview</h2>"
         "    <div class=\"overview\">"
@@ -913,7 +996,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    </div>"
         "    <div id=\"fwStatus\" class=\"hint\"></div>"
         "    <div class=\"divider\"></div>"
-        "    <button class=\"ghost-danger\" onclick=\"rollbackFirmware()\">Roll back to other slot</button>"
+        "    <button id=\"fwRollbackButton\" class=\"ghost-danger\" onclick=\"rollbackFirmware()\">Roll back to other slot</button>"
         "    <div id=\"fwRollbackStatus\" class=\"hint\"></div>"
         "  </div>"
         "  <div class=\"card full\">"
@@ -1010,9 +1093,46 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    setTimeout(()=>URL.revokeObjectURL(url), 1000);"
         "  }catch(e){ document.getElementById('log').textContent = 'Log download failed: ' + e.message; }"
         "}"
+        "async function changePassword(){"
+        "  const oldPassword=await askPassword('Enter the current admin password:');"
+        "  if(!oldPassword) return;"
+        "  const password=await askPassword('New admin password (8\u201364 printable ASCII characters):');"
+        "  if(password===null) return;"
+        "  if(password.length<8 || password.length>64 || !/^[\\x20-\\x7e]+$/.test(password) || password!==password.trim()){alert('Use 8\u201364 printable ASCII characters, without leading or trailing spaces.');return;}"
+        "  if(password!==await askPassword('Confirm the new password:')){alert('Passwords did not match.');return;}"
+        "  try{"
+        "    const r=await fetch('/admin/change-password',{method:'POST',headers:{'X-GDO-Token':oldPassword},body:password});"
+        "    if(!r.ok) throw new Error(await r.text());"
+        "    adminToken=password;"
+        "    alert('Admin password changed. Other browser sessions must enter the new password.');"
+        "  }catch(e){alert('Password change failed: '+e.message);}"
+        "}"
+        "function renderOtaReview(s){"
+        "  document.getElementById('fwRollbackButton').disabled=!s.ota_rollback_eligible;"
+        "  document.getElementById('fwRollbackStatus').textContent=s.ota_rollback_eligible?'Available: '+s.other_fw_version:'Unavailable: other slot is empty, unconfirmed, or has unknown settings compatibility.';"
+        "  document.getElementById('fwConfirmRow').style.display=s.ota_pending?'flex':'none';"
+        "  if(s.ota_pending){"
+        "    document.getElementById('fwUploadRow').style.display='none';"
+        "    document.getElementById('fwStatus').textContent='Validated: '+s.ota_pending_version+' on '+s.ota_pending_partition+'. Confirm within '+Math.ceil(s.ota_confirm_remaining_ms/1000)+' seconds, or cancel.';"
+        "  }else if(document.getElementById('fwStatus').textContent.startsWith('Validated:')){"
+        "    document.getElementById('fwUploadRow').style.display='flex';"
+        "    document.getElementById('fwStatus').textContent='Review expired or cancelled. Upload again to continue.';"
+        "  }"
+        "}"
+        "function ageText(ms){return ms<0?'not yet received':Math.floor(ms/1000)+' seconds ago';}"
+        "async function loadActivity(){"
+        "  try{"
+        "    const r=await fetch('/activity',{headers:await authHeaders()});"
+        "    if(!r.ok){if(r.status===401) adminToken='';throw new Error(await r.text());}"
+        "    const entries=await r.json();"
+        "    document.getElementById('activity').textContent=entries.map(e=>(e.unix_time>0?new Date(e.unix_time*1000).toLocaleString():'Uptime '+Math.floor(e.uptime_ms/1000)+'s')+' \u00b7 '+e.source+': '+e.message).join('\\n') || 'No recent activity.';"
+        "  }catch(e){document.getElementById('activity').textContent='Activity unavailable: '+e.message;}"
+        "}"
         "async function refresh(requestToken=false){"
         "  try{"
         "    const s = await (await fetch('/status')).json();"
+        "    renderOtaReview(s);"
+        "    document.getElementById('freshness').textContent='Last opener packet: '+ageText(s.rx_age_ms)+'. Last confirmed door status: '+ageText(s.door_status_age_ms)+'. Wi-Fi: '+(s.wifi_connected?'connected':'disconnected')+'. HomeKit sessions: '+s.hap_sessions+'.';"
         "    document.getElementById('pwSetupBanner').style.display = s.password_set ? 'none' : 'block';"
         "    document.getElementById('pairingFaultBanner').style.display = s.pairing_fault ? 'block' : 'none';"
         "    pill(document.getElementById('pillDoor'), s.door || '?', doorCls(s.door));"
@@ -1352,7 +1472,16 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char local_time[24];
     clock_sync_format_local(local_time, sizeof(local_time));
 
-    char buf[1344];
+    gdo_rx_health_t health = {};
+    gdo_get_rx_health(&health);
+    int64_t now_us = esp_timer_get_time();
+    int64_t pending_ms = s_ota_pending_partition ? OTA_CONFIRM_EXPIRY_MS - (now_us / 1000 - s_ota_pending_since_ms) : 0;
+    if (pending_ms <= 0) { ota_clear_pending(); pending_ms = 0; }
+    char running_version_json[200], other_version_json[200], pending_version_json[200];
+    escape_json_version(app_desc ? app_desc->version : "unknown", running_version_json, sizeof(running_version_json));
+    escape_json_version(have_other_version ? other_app_desc.version : "none", other_version_json, sizeof(other_version_json));
+    escape_json_version(s_ota_pending_version, pending_version_json, sizeof(pending_version_json));
+    char buf[2560];
     int n = snprintf(buf, sizeof(buf),
         "{"
         "\"door\":\"%s\","
@@ -1390,6 +1519,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"fw_version\":\"%s\","
         "\"other_partition\":\"%s\","
         "\"other_fw_version\":\"%s\","
+        "\"rx_age_ms\":%lld,\"door_status_age_ms\":%lld,"
+        "\"ota_pending\":%s,\"ota_pending_version\":\"%s\",\"ota_pending_partition\":\"%s\","
+        "\"ota_confirm_remaining_ms\":%lld,\"ota_rollback_eligible\":%s,"
         "\"password_set\":%s,"
         "\"pairing_fault\":%s"
         "}",
@@ -1425,9 +1557,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         (unsigned)full_status.openings,
         safe_str(gdo_battery_state_to_string(full_status.battery)),
         running_partition ? running_partition->label : "unknown",
-        app_desc ? app_desc->version : "unknown",
+        running_version_json,
         have_other_version ? other_partition->label : "none",
-        have_other_version ? other_app_desc.version : "none",
+        other_version_json,
+        health.last_packet_us ? (long long)((now_us - health.last_packet_us) / 1000) : -1LL,
+        health.last_door_status_us ? (long long)((now_us - health.last_door_status_us) / 1000) : -1LL,
+        s_ota_pending_partition ? "true" : "false", pending_version_json,
+        s_ota_pending_partition ? s_ota_pending_partition->label : "", (long long)pending_ms,
+        have_other_version && ota_slot_eligible(other_partition) ? "true" : "false",
         s_admin_password_set ? "true" : "false",
         gdo_diag_get_pairing_fault() ? "true" : "false");
 
@@ -1436,6 +1573,40 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, buf, n);
     }
     return httpd_resp_send(req, "{}", 2);
+}
+
+static esp_err_t activity_get_handler(httpd_req_t *req)
+{
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    activity_entry_t *entries = (activity_entry_t *)calloc(32, sizeof(activity_entry_t));
+    cJSON *root = cJSON_CreateArray();
+    if (!entries || !root) { free(entries); cJSON_Delete(root); httpd_resp_send_500(req); return ESP_FAIL; }
+    size_t count = activity_read(entries, 32);
+    for (size_t i = 0; i < count; ++i) {
+        cJSON *entry = cJSON_CreateObject();
+        if (!entry ||
+            !cJSON_AddNumberToObject(entry, "id", entries[i].id) ||
+            !cJSON_AddNumberToObject(entry, "uptime_ms", entries[i].uptime_ms) ||
+            !cJSON_AddNumberToObject(entry, "unix_time", entries[i].unix_time) ||
+            !cJSON_AddStringToObject(entry, "source", entries[i].source) ||
+            !cJSON_AddStringToObject(entry, "message", entries[i].message) ||
+            !cJSON_AddItemToArray(root, entry)) {
+            cJSON_Delete(entry);
+            cJSON_Delete(root);
+            free(entries);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+    }
+    free(entries);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) { httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t result = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return result;
 }
 
 // Shared by the inline log view and the download route - only the response
@@ -1482,12 +1653,12 @@ static bool start_httpd_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = DIAG_WEB_PORT;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 18;
     config.lru_purge_enable = true;
     // Flash-write paths in the firmware upload handler want more headroom
     // than the 4KB default, and a ~1.7MB upload over a slow WiFi link
     // shouldn't time out mid-chunk on the default 5s recv timeout.
-    config.stack_size = 6144;
+    config.stack_size = 8192;
     config.recv_wait_timeout = 15;
 
     if (httpd_start(&s_server, &config) != ESP_OK) {
@@ -1630,6 +1801,20 @@ static bool start_httpd_server(void)
         s_server = nullptr;
         return false;
     }
+    httpd_uri_t change_password_uri = {};
+    change_password_uri.uri = "/admin/change-password";
+    change_password_uri.method = HTTP_POST;
+    change_password_uri.handler = admin_change_password_post_handler;
+    httpd_uri_t activity_uri = {};
+    activity_uri.uri = "/activity";
+    activity_uri.method = HTTP_GET;
+    activity_uri.handler = activity_get_handler;
+    if (httpd_register_uri_handler(s_server, &change_password_uri) != ESP_OK ||
+        httpd_register_uri_handler(s_server, &activity_uri) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        return false;
+    }
     if (httpd_register_uri_handler(s_server, &admin_set_password_uri) != ESP_OK) {
         httpd_stop(s_server);
         s_server = nullptr;
@@ -1718,6 +1903,9 @@ static void wait_for_network_and_start_task(void *arg)
     // the device stuck - this call is what cancels that pending rollback.
     // Safe to call unconditionally; it's a no-op if no rollback is pending.
     esp_err_t mark_valid_err = esp_ota_mark_app_valid_cancel_rollback();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (mark_valid_err == ESP_OK && running && !ota_block_slot(running, false))
+        ESP_LOGW(TAG, "Could not record running OTA slot eligibility");
     if (mark_valid_err != ESP_OK) {
         ESP_LOGW(TAG, "esp_ota_mark_app_valid_cancel_rollback() returned %s",
                  esp_err_to_name(mark_valid_err));

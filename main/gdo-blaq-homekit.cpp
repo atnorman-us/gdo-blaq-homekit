@@ -21,6 +21,7 @@
 #include "diag_webserver.h"
 #include "pre_close_warning.h"
 #include "close_schedule.h"
+#include "activity_history.h"
 #include "clock_sync.h"
 #include <string.h>
 #include "gdo_settings.h"
@@ -243,7 +244,9 @@ public:
 extern "C" esp_err_t gdo_control_open(void) {
     ControlGuard guard;
     ++s_close_generation;
-    return gdo_door_open();
+    esp_err_t err = gdo_door_open();
+    activity_record("HomeKit", err == ESP_OK ? "Open sent" : "Open failed");
+    return err;
 }
 // Keep the HAP request thread available while the warning runs. Each task
 // owns its generation so a later Open or a state change cancels this close.
@@ -268,10 +271,12 @@ static void user_close_task(void *arg)
             if (err == ESP_OK && status.synced &&
                 status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
                 err = gdo_door_close();
+                activity_record("HomeKit", err == ESP_OK ? "Close sent" : "Close failed");
             } else {
                 err = ESP_ERR_INVALID_STATE;
             }
             if (err != ESP_OK) {
+                activity_record("HomeKit", "Close cancelled or failed after warning");
                 ESP_LOGW(TAG, "Pending close cancelled or failed (%d)", err);
                 if (gdo_get_status(&status) == ESP_OK) {
                     if (status.door == GDO_DOOR_STATE_OPEN)
@@ -286,6 +291,7 @@ static void user_close_task(void *arg)
             // to CLOSED when this request was accepted and nothing else will
             // move it back, so Home would show "Closing..." until the door
             // next moves. Put Target back to where the door actually is.
+            activity_record("HomeKit", "Close warning cancelled");
             ESP_LOGW(TAG, "Pending close superseded before it ran - reverting HomeKit target");
             gdo_status_t status;
             if (gdo_get_status(&status) == ESP_OK) {
@@ -302,6 +308,7 @@ static void user_close_task(void *arg)
 extern "C" esp_err_t gdo_control_close(void) {
     ControlGuard guard;
     if (s_user_close_pending && s_user_close_pending_generation == s_close_generation) {
+        activity_record("HomeKit", "Close rejected: warning pending");
         return ESP_ERR_INVALID_STATE;
     }
     {
@@ -323,8 +330,10 @@ extern "C" esp_err_t gdo_control_close(void) {
                     tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
         s_user_close_pending = false;
         vPortFree(generation);
+        activity_record("HomeKit", "Close warning failed to start");
         return ESP_ERR_NO_MEM;
     }
+    activity_record("HomeKit", "Close warning started");
     return ESP_OK;
 }
 
@@ -362,7 +371,16 @@ static inline int64_t now_ms(void)
 static void set_last_door_state(gdo_door_state_t new_state)
 {
     ControlGuard guard;
-    if (new_state != last_door) ++s_close_generation;
+    if (new_state != last_door) {
+        ++s_close_generation;
+        switch (new_state) {
+        case GDO_DOOR_STATE_OPEN: activity_record("opener", "Open"); break;
+        case GDO_DOOR_STATE_CLOSED: activity_record("opener", "Closed"); break;
+        case GDO_DOOR_STATE_OPENING: activity_record("opener", "Opening"); break;
+        case GDO_DOOR_STATE_CLOSING: activity_record("opener", "Closing"); break;
+        default: activity_record("opener", "Stopped or unknown"); break;
+        }
+    }
     if (new_state == GDO_DOOR_STATE_OPEN && last_door != GDO_DOOR_STATE_OPEN) {
         s_door_open_since_ms   = now_ms();
         s_door_continuously_open_since_ms = s_door_open_since_ms;
@@ -733,9 +751,9 @@ static void gdo_save_rolling_state(uint32_t client_id, uint32_t rolling_code)
         return;
     }
 
-    nvs_set_u32(handle, GDO_NVS_KEY_CLIENT_ID, client_id);
-    nvs_set_u32(handle, GDO_NVS_KEY_ROLLING, rolling_code);
-    esp_err_t commit_err = nvs_commit(handle);
+    esp_err_t commit_err = nvs_set_u32(handle, GDO_NVS_KEY_CLIENT_ID, client_id);
+    if (commit_err == ESP_OK) commit_err = nvs_set_u32(handle, GDO_NVS_KEY_ROLLING, rolling_code);
+    if (commit_err == ESP_OK) commit_err = nvs_commit(handle);
     nvs_close(handle);
 
     if (commit_err != ESP_OK) {
@@ -781,8 +799,8 @@ static void gdo_save_synced_protocol(gdo_protocol_type_t protocol)
         }
     }
 
-    nvs_set_u8(handle, GDO_NVS_KEY_PROTOCOL, (uint8_t)protocol);
-    esp_err_t commit_err = nvs_commit(handle);
+    esp_err_t commit_err = nvs_set_u8(handle, GDO_NVS_KEY_PROTOCOL, (uint8_t)protocol);
+    if (commit_err == ESP_OK) commit_err = nvs_commit(handle);
     nvs_close(handle);
 
     if (commit_err != ESP_OK) {
@@ -840,63 +858,36 @@ extern "C" bool gdo_get_pre_close_buzzer(void)
 
 extern "C" esp_err_t gdo_set_pre_close_buzzer(bool enabled)
 {
-    pre_close_warning_set_buzzer_enabled(enabled);
-
+    ControlGuard guard;
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Pre-close buzzer %s in memory but failed to open NVS: %s",
-                 enabled ? "on" : "off", esp_err_to_name(err));
-        return err;
-    }
-    nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_WARN_BUZZ, enabled ? 1 : 0);
-    esp_err_t commit_err = nvs_commit(handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_WARN_BUZZ, enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
-    if (commit_err == ESP_OK) {
-        ESP_LOGI(TAG, "Pre-close buzzer %s and saved to NVS", enabled ? "on" : "off");
-    } else {
-        ESP_LOGW(TAG, "Pre-close buzzer %s in memory but failed to save: %s",
-                 enabled ? "on" : "off", esp_err_to_name(commit_err));
-    }
-    return commit_err;
+    if (err != ESP_OK) return err;
+    ++s_close_generation;
+    pre_close_warning_set_buzzer_enabled(enabled);
+    activity_record("settings", "Pre-close buzzer saved");
+    return ESP_OK;
 }
 
-// Updates the in-memory timeout AND persists it, so it survives a reboot.
-// Not static, and deliberately takes/returns plain types rather than
-// anything GDO-library-specific - this is the function a future HTTP
-// config handler (e.g. in diag_webserver.cpp) should call directly to let
-// the auto-close duration be changed without a reflash. Needs a forward
-// declaration in whatever header that file includes to call it - not
-// wired up yet since diag_webserver.cpp hasn't been shared for this.
+// Persist before publishing the new timeout or cancelling pending closes.
 extern "C" esp_err_t gdo_set_auto_close_timeout_ms(uint32_t timeout_ms)
 {
     if (timeout_ms < 60000 || timeout_ms > 86400000) return ESP_ERR_INVALID_ARG;
-    {
-        ControlGuard guard;
-        ++s_close_generation;
-        s_auto_close_timeout_ms = timeout_ms;
-    }
-
+    ControlGuard guard;
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Auto-close timeout updated in memory (%" PRIu32
-                 " ms) but failed to open NVS to persist it: %s",
-                 timeout_ms, esp_err_to_name(err));
-        return err;
-    }
-
-    nvs_set_u32(handle, GDO_SETTINGS_NVS_KEY_AUTOCLOSE, timeout_ms);
-    esp_err_t commit_err = nvs_commit(handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u32(handle, GDO_SETTINGS_NVS_KEY_AUTOCLOSE, timeout_ms);
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
-
-    if (commit_err == ESP_OK) {
-        ESP_LOGI(TAG, "Auto-close timeout set to %" PRIu32 " ms and saved to NVS", timeout_ms);
-    } else {
-        ESP_LOGW(TAG, "Auto-close timeout updated in memory but failed to save: %s",
-                 esp_err_to_name(commit_err));
-    }
-    return commit_err;
+    if (err != ESP_OK) return err;
+    ++s_close_generation;
+    s_auto_close_timeout_ms = timeout_ms;
+    activity_record("settings", "Auto-close timeout saved");
+    return ESP_OK;
 }
 
 // Read-only accessor, e.g. for a future HTTP config page to show the
@@ -906,37 +897,21 @@ extern "C" uint32_t gdo_get_auto_close_timeout_ms(void)
     return s_auto_close_timeout_ms;
 }
 
-// Same pattern as gdo_set_auto_close_timeout_ms() - updates in-memory
-// state and persists it. This is the toggle: auto-close is entirely
-// gated on this being true, checked first in the watchdog before it even
-// looks at door-open duration.
+// Enabling auto-close uses the same persist-before-publish contract.
 extern "C" esp_err_t gdo_set_auto_close_enabled(bool enabled)
 {
-    {
-        ControlGuard guard;
-        ++s_close_generation;
-        s_auto_close_enabled = enabled;
-    }
-
+    ControlGuard guard;
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Auto-close %s in memory but failed to open NVS to persist it: %s",
-                 enabled ? "enabled" : "disabled", esp_err_to_name(err));
-        return err;
-    }
-
-    nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_AC_ENABLED, enabled ? 1 : 0);
-    esp_err_t commit_err = nvs_commit(handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_AC_ENABLED, enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
-
-    if (commit_err == ESP_OK) {
-        ESP_LOGI(TAG, "Auto-close %s and saved to NVS", enabled ? "enabled" : "disabled");
-    } else {
-        ESP_LOGW(TAG, "Auto-close %s in memory but failed to save: %s",
-                 enabled ? "enabled" : "disabled", esp_err_to_name(commit_err));
-    }
-    return commit_err;
+    if (err != ESP_OK) return err;
+    ++s_close_generation;
+    s_auto_close_enabled = enabled;
+    activity_record("settings", "Auto-close enable setting saved");
+    return ESP_OK;
 }
 
 extern "C" bool gdo_get_auto_close_enabled(void)
@@ -964,29 +939,63 @@ extern "C" int64_t gdo_get_auto_close_remaining_ms(void)
 #define GDO_SETTINGS_NVS_KEY_SCHED_TZ    "tz"
 #define GDO_SETTINGS_NVS_KEY_SCHED_LAST  "sched_last_day"
 
+// One versioned NVS value prevents mixed schedule fields after a failed write.
+#define GDO_SETTINGS_NVS_KEY_SCHED_BLOB "sched_v1"
+struct PersistedSchedule {
+    uint32_t version;
+    gdo_close_schedule_t schedule;
+    int32_t last_day;
+};
+static esp_err_t close_schedule_save(const gdo_close_schedule_t &schedule, int32_t day)
+{
+    PersistedSchedule saved = {};
+    saved.version = 1;
+    saved.schedule = schedule;
+    saved.last_day = day;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, GDO_SETTINGS_NVS_KEY_SCHED_BLOB, &saved, sizeof(saved));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
 // Called once in app_main() after NVS init. Missing keys keep the defaults.
 static void close_schedule_settings_load(void)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_OK) {
-        uint8_t en = 0;
-        if (nvs_get_u8(handle, GDO_SETTINGS_NVS_KEY_SCHED_EN, &en) == ESP_OK) {
-            s_close_schedule.enabled = (en != 0);
-        }
-        uint16_t minute = 0;
-        if (nvs_get_u16(handle, GDO_SETTINGS_NVS_KEY_SCHED_MIN, &minute) == ESP_OK && minute < 1440) {
-            s_close_schedule.minute = minute;
-        }
-        char tz[sizeof(s_close_schedule.tz)] = {0};
-        size_t tz_len = sizeof(tz);
-        if (nvs_get_str(handle, GDO_SETTINGS_NVS_KEY_SCHED_TZ, tz, &tz_len) == ESP_OK &&
-            close_schedule_tz_valid(tz)) {
-            strcpy(s_close_schedule.tz, tz);
-        }
-        int32_t last_day = 0;
-        if (nvs_get_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, &last_day) == ESP_OK) {
-            s_close_schedule_last_day = last_day;
+        PersistedSchedule saved = {};
+        size_t size = sizeof(saved);
+        esp_err_t blob_err = nvs_get_blob(handle, GDO_SETTINGS_NVS_KEY_SCHED_BLOB, &saved, &size);
+        if (blob_err == ESP_OK && size == sizeof(saved) && saved.version == 1 &&
+            saved.schedule.minute < 1440 &&
+            memchr(saved.schedule.tz, '\0', sizeof(saved.schedule.tz)) &&
+            close_schedule_tz_valid(saved.schedule.tz)) {
+            s_close_schedule = saved.schedule;
+            s_close_schedule_last_day = saved.last_day;
+        } else if (blob_err == ESP_ERR_NVS_NOT_FOUND) {
+            // Older firmware used separate keys. Migrate on the next successful save.
+            uint8_t en = 0;
+            if (nvs_get_u8(handle, GDO_SETTINGS_NVS_KEY_SCHED_EN, &en) == ESP_OK) {
+                s_close_schedule.enabled = (en != 0);
+            }
+            uint16_t minute = 0;
+            if (nvs_get_u16(handle, GDO_SETTINGS_NVS_KEY_SCHED_MIN, &minute) == ESP_OK && minute < 1440) {
+                s_close_schedule.minute = minute;
+            }
+            char tz[sizeof(s_close_schedule.tz)] = {0};
+            size_t tz_len = sizeof(tz);
+            if (nvs_get_str(handle, GDO_SETTINGS_NVS_KEY_SCHED_TZ, tz, &tz_len) == ESP_OK &&
+                close_schedule_tz_valid(tz)) {
+                strcpy(s_close_schedule.tz, tz);
+            }
+            int32_t last_day = 0;
+            if (nvs_get_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, &last_day) == ESP_OK) {
+                s_close_schedule_last_day = last_day;
+            }
         }
         nvs_close(handle);
     } else {
@@ -1014,58 +1023,31 @@ extern "C" esp_err_t gdo_set_close_schedule(const gdo_close_schedule_t *in)
         !close_schedule_tz_valid(in->tz)) {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t tz_err = clock_sync_apply_timezone(in->tz);
-    if (tz_err != ESP_OK) return tz_err;
-    bool minute_changed;
-    {
-        ControlGuard guard;
-        ++s_close_generation;   // cancel any warning already counting down
-        minute_changed = (in->minute != s_close_schedule.minute);
-        s_close_schedule = *in;
-        // A new time is a new schedule: forget that today's window already
-        // fired, or a schedule moved from 07:00 to 21:00 would not fire tonight.
-        if (minute_changed) s_close_schedule_last_day = 0;
-    }
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    ControlGuard guard;
+    const bool time_changed = in->minute != s_close_schedule.minute ||
+                              strcmp(in->tz, s_close_schedule.tz) != 0;
+    const int32_t day = time_changed ? 0 : s_close_schedule_last_day;
+    esp_err_t err = clock_sync_apply_timezone(in->tz);
+    if (err != ESP_OK) return err;
+    err = close_schedule_save(*in, day);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Close schedule updated in memory but failed to open NVS: %s",
-                 esp_err_to_name(err));
+        if (clock_sync_apply_timezone(s_close_schedule.tz) != ESP_OK)
+            ESP_LOGE(TAG, "Failed to restore timezone after persistence error");
         return err;
     }
-    nvs_set_u8(handle, GDO_SETTINGS_NVS_KEY_SCHED_EN, in->enabled ? 1 : 0);
-    nvs_set_u16(handle, GDO_SETTINGS_NVS_KEY_SCHED_MIN, in->minute);
-    nvs_set_str(handle, GDO_SETTINGS_NVS_KEY_SCHED_TZ, in->tz);
-    if (minute_changed) nvs_set_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, 0);
-    esp_err_t commit_err = nvs_commit(handle);
-    nvs_close(handle);
-
-    if (commit_err == ESP_OK) {
-        ESP_LOGI(TAG, "Close schedule %s at %02u:%02u, tz %s - saved to NVS",
-                 in->enabled ? "enabled" : "disabled",
-                 (unsigned)(in->minute / 60), (unsigned)(in->minute % 60), in->tz);
-    } else {
-        ESP_LOGW(TAG, "Close schedule updated in memory but failed to save: %s",
-                 esp_err_to_name(commit_err));
-    }
-    return commit_err;
+    s_close_schedule = *in;
+    s_close_schedule_last_day = day;
+    ++s_close_generation;
+    activity_record("settings", "Close schedule saved");
+    return ESP_OK;
 }
 
-// Persisted only when the schedule actually fires (once per day at most), to
-// keep flash wear negligible.
-static void close_schedule_last_day_save(int32_t day)
+// Caller holds ControlGuard, serializing the day with schedule edits.
+static esp_err_t close_schedule_last_day_save(int32_t day)
 {
-    nvs_handle_t handle;
-    if (nvs_open(GDO_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        ESP_LOGW(TAG, "Could not open NVS to record scheduled-close day");
-        return;
-    }
-    nvs_set_i32(handle, GDO_SETTINGS_NVS_KEY_SCHED_LAST, day);
-    if (nvs_commit(handle) != ESP_OK) {
-        ESP_LOGW(TAG, "Could not save scheduled-close day");
-    }
-    nvs_close(handle);
+    esp_err_t err = close_schedule_save(s_close_schedule, day);
+    if (err == ESP_OK) s_close_schedule_last_day = day;
+    return err;
 }
 
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
@@ -1238,6 +1220,7 @@ case GDO_CB_EVENT_DOOR_POSITION: {
         if (status->obstruction != last_obstruction) {
             ++s_close_generation;
             last_obstruction = status->obstruction;
+            activity_record("obstruction", last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR ? "Clear" : "Detected or unknown");
             ESP_LOGI(TAG, "Obstruction: %s", gdo_obstruction_state_to_string(last_obstruction));
         }
         notify_homekit_obstruction(last_obstruction);
@@ -1258,6 +1241,7 @@ case GDO_CB_EVENT_DOOR_POSITION: {
 
     case GDO_CB_EVENT_BUTTON:
         if (status->button == GDO_BUTTON_STATE_PRESSED) {
+            activity_record("opener", "Button press received");
             ControlGuard guard;
             ++s_close_generation;
         }
@@ -1384,14 +1368,19 @@ static void auto_close_warning_complete_cb(void)
         s_auto_close_generation == s_close_generation &&
         s_auto_close_command_id == status.door_command_id;
     if (!valid) {
+        activity_record("auto-close", "Close warning cancelled");
         ESP_LOGI(TAG, "Auto-close cancelled during warning");
         s_auto_close_triggered = false;
         // Require a full fresh timeout after cancellation.
         if (last_door == GDO_DOOR_STATE_OPEN) s_door_open_since_ms = now_ms();
         return;
     }
-    if (gdo_door_close() == ESP_OK) notify_homekit_target_door_state_change(TGT_CLOSED);
+    if (gdo_door_close() == ESP_OK) {
+        activity_record("auto-close", "Close sent after warning");
+        notify_homekit_target_door_state_change(TGT_CLOSED);
+    }
     else {
+        activity_record("auto-close", "Close command failed");
         s_auto_close_triggered = false;
         s_door_open_since_ms = now_ms();
     }
@@ -1411,30 +1400,45 @@ static void sched_close_warning_complete_cb(void)
         s_sched_close_command_id == status.door_command_id;
     s_sched_close_pending = false;
     if (!valid) {
+        activity_record("schedule", "Close warning cancelled");
         ESP_LOGI(TAG, "Scheduled close cancelled during warning");
         return;
     }
-    if (gdo_door_close() == ESP_OK) notify_homekit_target_door_state_change(TGT_CLOSED);
-    else ESP_LOGW(TAG, "Scheduled close: close command failed");
+    if (gdo_door_close() == ESP_OK) {
+        activity_record("schedule", "Close sent after warning");
+        notify_homekit_target_door_state_change(TGT_CLOSED);
+    }
+    else {
+        activity_record("schedule", "Close command failed");
+        ESP_LOGW(TAG, "Scheduled close: close command failed");
+    }
 }
 
 // Called every watchdog tick. Cheap when disabled or outside the window.
 static void sched_close_check(void)
 {
-    gdo_close_schedule_t sched;
-    gdo_get_close_schedule(&sched);
+    ControlGuard guard;
+    gdo_close_schedule_t sched = s_close_schedule;
     if (!sched.enabled) return;
 
     uint16_t now_min;
     int32_t today;
     bool synced = clock_sync_local_now(&now_min, &today);
-    if (!synced) return;   // never act on an unset clock
+    if (!synced) {
+        activity_record("schedule", "Skipped: clock unsynced");
+        return;
+    }
 
-    ControlGuard guard;
-    if (s_sched_close_pending || s_auto_close_triggered || s_user_close_pending) return;
+    if (s_sched_close_pending || s_auto_close_triggered || s_user_close_pending) {
+        activity_record("schedule", "Skipped: close already pending");
+        return;
+    }
 
     gdo_status_t current;
-    if (gdo_get_status(&current) != ESP_OK || !current.synced) return;
+    if (gdo_get_status(&current) != ESP_OK || !current.synced) {
+        activity_record("schedule", "Skipped: opener unavailable");
+        return;
+    }
     // The door must have been open when the scheduled minute arrived: one
     // opened after that must not be closed seconds later. A reboot resets
     // s_door_continuously_open_since_ms, so a mid-window reboot skips that night, which is
@@ -1443,6 +1447,13 @@ static void sched_close_check(void)
                            s_door_continuously_open_since_ms != 0) ? (now_ms() - s_door_continuously_open_since_ms) : 0;
     if (!close_schedule_should_fire(synced, open_for_ms, now_min, today, sched.minute,
                                     s_close_schedule_last_day)) {
+        // Outside the window is normal, not an activity event.
+        if ((now_min + 1440 - sched.minute) % 1440 < CLOSE_SCHEDULE_WINDOW_MIN) {
+            if (s_close_schedule_last_day == close_schedule_window_day(now_min, today, sched.minute))
+                activity_record("schedule", "Skipped: already fired this window");
+            else
+                activity_record("schedule", "Skipped: door not open before window");
+        }
         return;
     }
 
@@ -1450,12 +1461,19 @@ static void sched_close_check(void)
         last_obstruction != GDO_OBSTRUCTION_STATE_CLEAR) {
         // Same stance as auto-close: err toward not closing. Don't record the
         // day, so a later tick inside the window can still fire.
+        activity_record("schedule", "Skipped: obstruction not clear");
         ESP_LOGW(TAG, "Scheduled close: obstruction not Clear - holding off");
         gdo_refresh_status();
         return;
     }
 
     int32_t window_day = close_schedule_window_day(now_min, today, sched.minute);
+    int32_t previous_day = s_close_schedule_last_day;
+    if (close_schedule_last_day_save(window_day) != ESP_OK) {
+        activity_record("schedule", "Skipped: failed to persist firing day");
+        return;
+    }
+    activity_record("schedule", "Close warning started");
     ESP_LOGW(TAG, "Scheduled close: door open at scheduled time - sounding warning and closing");
     s_sched_close_generation = s_close_generation;
     s_sched_close_command_id = current.door_command_id;
@@ -1463,11 +1481,13 @@ static void sched_close_check(void)
     if (pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
                                     sched_close_warning_complete_cb) != ESP_OK) {
         s_sched_close_pending = false;
+        activity_record("schedule", "Close warning failed to start");
+        // Retry next tick only if we can durably undo the reservation.
+        close_schedule_last_day_save(previous_day);
         ESP_LOGE(TAG, "Scheduled close cancelled: warning could not start");
-        return;   // not recorded; retried next tick while the window is open
+        return;   // retried only if reservation rollback succeeded
     }
-    s_close_schedule_last_day = window_day;
-    close_schedule_last_day_save(window_day);
+
 }
 
 static void resend_last_states_to_homekit(void)
@@ -1668,9 +1688,13 @@ static void gdo_watchdog_task(void *arg)
                     if (generation == s_close_generation && gdo_get_status(&fresh) == ESP_OK &&
                         fresh.door == status.door && fresh.door_target == status.door_target &&
                         (fresh.door_target != 10000 || fresh.obstruction == GDO_OBSTRUCTION_STATE_CLEAR)) {
-                        gdo_retry_door_command(status.door_command_id);
+                        esp_err_t retry_err = gdo_retry_door_command(status.door_command_id);
+                        activity_record("watchdog", retry_err == ESP_OK ? "Door command resent" : "Door retry failed");
+                    } else {
+                        activity_record("watchdog", "Door retry cancelled after state change");
                     }
                 } else if (action == RETRY_REVERT) {
+                    activity_record("watchdog", "Door request exhausted or unsafe to retry");
                     notify_homekit_target_door_state_change(status.door == GDO_DOOR_STATE_OPEN ? TGT_OPEN : TGT_CLOSED);
                     ESP_LOGW(TAG, "%s", status.toggle_only
                                   ? "Door request not acted on; not retried on a toggle-only opener"
@@ -1743,10 +1767,12 @@ static void gdo_watchdog_task(void *arg)
                 s_auto_close_generation = s_close_generation;
                 s_auto_close_command_id = current.door_command_id;
                 s_auto_close_triggered = true;
+                activity_record("auto-close", "Close warning started");
                 if (pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
                                                  auto_close_warning_complete_cb) != ESP_OK) {
                     s_auto_close_triggered = false;
                     s_door_open_since_ms = now_ms();
+                    activity_record("auto-close", "Close warning failed to start");
                     ESP_LOGE(TAG, "Auto-close cancelled: warning could not start");
                 }
             } else {
@@ -1861,6 +1887,7 @@ extern "C" void app_main(void)
     close_schedule_settings_load();
 
     diagnostics_counters_init();
+    activity_record("system", "Firmware booted; history starts here");
 
 
     gdo_config_t gdo_conf;

@@ -64,7 +64,8 @@ int main(void) {
 }''')
 
     def test_set_password_handler_checks_origin_before_reading_the_body(self):
-        fn = function('main/diag_webserver.cpp', 'static esp_err_t admin_set_password_post_handler(')
+        fn = (function('main/diag_webserver.cpp', 'static esp_err_t admin_write_password(') +
+              function('main/diag_webserver.cpp', 'static esp_err_t admin_set_password_post_handler('))
         helpers = (function('main/diag_webserver.cpp', 'static int copy_req_header(') +
                    function('main/diag_webserver.cpp', 'static bool reject_unless_own_page('))
         run_c(INC + r'''
@@ -84,6 +85,8 @@ int main(void) {
 typedef int esp_err_t;
 typedef int nvs_handle_t;
 struct httpd_req_t { const char *host, *origin, *site, *body; int content_len, pos, status; };
+struct admin_credentials_t { uint32_t iterations; uint8_t salt[16]; uint8_t hash[32]; };
+static bool authorize_mutation(httpd_req_t *) { assert(false); return false; }
 static uint8_t s_admin_pw_salt[16], s_admin_pw_hash[32];
 static uint32_t s_admin_pw_iterations;
 static bool s_admin_password_set, kdf_ok = true;

@@ -8,6 +8,7 @@ static const char *TAG = "HOMEKIT";
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include <esp_log.h>
 #include <esp_system.h>
@@ -55,9 +56,8 @@ static gdo_door_state_t last_door = GDO_DOOR_STATE_MAX;
 static gdo_motion_state_t last_motion = GDO_MOTION_STATE_MAX;
 static gdo_obstruction_state_t last_obstruction = GDO_OBSTRUCTION_STATE_MAX;
 static gdo_learn_state_t last_learn = GDO_LEARN_STATE_MAX;
-// Last Target Door State handed to HomeKit, by either path: a queued
-// notification or a direct write in gdo_svc_set(). Both the gdolib callback
-// task and the HAP task touch it, hence atomic. 0xFF = nothing pushed yet.
+// Last Target accepted by the notification queue. Only the consumer writes
+// the HAP characteristic; both producers serialize enqueue and deduplication.
 #define HOMEKIT_TARGET_UNKNOWN 0xFF
 static std::atomic<uint8_t> last_target{HOMEKIT_TARGET_UNKNOWN};
 
@@ -227,6 +227,7 @@ static void network_watchdog_task(void *pvParameters)
 
 // Queue to store GDO notification events
 static QueueHandle_t gdo_notif_event_q;
+static SemaphoreHandle_t target_enqueue_mutex;
 
 enum class HomeKitNotifDest {
     DoorCurrentState,
@@ -256,6 +257,7 @@ struct GDOEvent {
 // yet"). Idempotent - safe to call more than once.
 extern "C" void homekit_notif_queue_init(void)
 {
+    if (!target_enqueue_mutex) target_enqueue_mutex = xSemaphoreCreateMutex();
     if (!gdo_notif_event_q) {
         // 32 slots: the consumer loop does not run until hap_start(), which
         // waits on protocol identification and Wi-Fi (30 s or more), and
@@ -264,6 +266,7 @@ extern "C" void homekit_notif_queue_init(void)
     }
 }
 
+static bool queue_homekit_target(uint8_t tgt);
 static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 
@@ -558,12 +561,9 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
                 case TGT_OPEN:
                 case TGT_CLOSED: {
                     esp_err_t err = write->val.u == TGT_OPEN ? gdo_control_open() : gdo_control_close();
-                    if (err == ESP_OK) {
-                        hap_char_update_val(write->hc, &(write->val));
-                        // Keep the notify path's idea of Target current, so a
-                        // later revert to the previous value is not deduplicated
-                        // away (see notify_homekit_target_door_state_change).
-                        last_target.store((uint8_t)write->val.u);
+                    if (err == ESP_OK && queue_homekit_target((uint8_t)write->val.u)) {
+                        // Queue with the other Target updates. A direct SDK write
+                        // here could be overwritten by an older queued target.
                         *(write->status) = HAP_STATUS_SUCCESS;
                     } else {
                         *(write->status) = HAP_STATUS_COMM_ERR;
@@ -626,22 +626,27 @@ GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state) {
     }
 }
 
-// Callers push Target on every door-position event (every 500 ms while
-// gdolib interpolates position), so without this check a single transition
-// filled the queue and later Current/Light/Lock events were dropped. The
-// SDK ignores a repeated value anyway, so skipping it loses nothing. As
-// with the other notify_* functions, last_target is only committed once the
-// event is actually queued, so a dropped push is retried on the next call.
-void notify_homekit_target_door_state_change(uint8_t tgt) {
-    if (tgt == last_target.load()) return;
+// The mutex protects only producer ordering, never an SDK call. The HAP
+// callback must not wait on a lock held by a consumer blocked in the SDK.
+// Queue admission is bounded; failed pushes leave the cache retryable.
+static bool queue_homekit_target(uint8_t tgt) {
+    if (!target_enqueue_mutex ||
+        xSemaphoreTake(target_enqueue_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+    bool accepted = tgt == last_target.load();
+    if (!accepted) {
+        GDOEvent e;
+        e.dest = HomeKitNotifDest::DoorTargetState;
+        e.value.u = tgt;
+        accepted = gdo_notif_event_q &&
+            xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE;
+        if (accepted) last_target.store(tgt);
+    }
+    xSemaphoreGive(target_enqueue_mutex);
+    return accepted;
+}
 
-    GDOEvent e;
-    e.dest = HomeKitNotifDest::DoorTargetState;
-    e.value.u = tgt;
-    if (gdo_notif_event_q &&
-        xQueueSend(gdo_notif_event_q, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
-        last_target.store(tgt);
-    } else {
+void notify_homekit_target_door_state_change(uint8_t tgt) {
+    if (!queue_homekit_target(tgt)) {
         ESP_LOGE(TAG, "could not queue homekit notif of target door state (queue full)");
     }
 }
