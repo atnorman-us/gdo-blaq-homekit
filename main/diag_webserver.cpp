@@ -908,7 +908,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  </div>"
         "</div>"
         "<div class=\"grid\">"
-        "  <div class=\"card full\"><h2>Connection freshness</h2><p id=\"freshness\">Waiting for status\u2026</p><p>Moving door position is an estimate; confirmed door status comes from the opener.</p></div>"
         "  <div class=\"card full\"><h2>Recent activity</h2><button onclick=\"loadActivity()\">Load recent events</button><pre id=\"activity\">Authenticate to view recent events.</pre></div>"
         "  <div class=\"card full\"><h2>Administration</h2><button onclick=\"changePassword()\">Change admin password</button></div>"
         "  <div class=\"card full\">"
@@ -1119,7 +1118,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    document.getElementById('fwStatus').textContent='Review expired or cancelled. Upload again to continue.';"
         "  }"
         "}"
-        "function ageText(ms){return ms<0?'not yet received':Math.floor(ms/1000)+' seconds ago';}"
         "async function loadActivity(){"
         "  try{"
         "    const r=await fetch('/activity',{headers:await authHeaders()});"
@@ -1132,7 +1130,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  try{"
         "    const s = await (await fetch('/status')).json();"
         "    renderOtaReview(s);"
-        "    document.getElementById('freshness').textContent='Last opener packet: '+ageText(s.rx_age_ms)+'. Last confirmed door status: '+ageText(s.door_status_age_ms)+'. Wi-Fi: '+(s.wifi_connected?'connected':'disconnected')+'. HomeKit sessions: '+s.hap_sessions+'.';"
         "    document.getElementById('pwSetupBanner').style.display = s.password_set ? 'none' : 'block';"
         "    document.getElementById('pairingFaultBanner').style.display = s.pairing_fault ? 'block' : 'none';"
         "    pill(document.getElementById('pillDoor'), s.door || '?', doorCls(s.door));"
@@ -1472,8 +1469,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char local_time[24];
     clock_sync_format_local(local_time, sizeof(local_time));
 
-    gdo_rx_health_t health = {};
-    gdo_get_rx_health(&health);
     int64_t now_us = esp_timer_get_time();
     int64_t pending_ms = s_ota_pending_partition ? OTA_CONFIRM_EXPIRY_MS - (now_us / 1000 - s_ota_pending_since_ms) : 0;
     if (pending_ms <= 0) { ota_clear_pending(); pending_ms = 0; }
@@ -1519,7 +1514,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         "\"fw_version\":\"%s\","
         "\"other_partition\":\"%s\","
         "\"other_fw_version\":\"%s\","
-        "\"rx_age_ms\":%lld,\"door_status_age_ms\":%lld,"
         "\"ota_pending\":%s,\"ota_pending_version\":\"%s\",\"ota_pending_partition\":\"%s\","
         "\"ota_confirm_remaining_ms\":%lld,\"ota_rollback_eligible\":%s,"
         "\"password_set\":%s,"
@@ -1560,8 +1554,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         running_version_json,
         have_other_version ? other_partition->label : "none",
         other_version_json,
-        health.last_packet_us ? (long long)((now_us - health.last_packet_us) / 1000) : -1LL,
-        health.last_door_status_us ? (long long)((now_us - health.last_door_status_us) / 1000) : -1LL,
         s_ota_pending_partition ? "true" : "false", pending_version_json,
         s_ota_pending_partition ? s_ota_pending_partition->label : "", (long long)pending_ms,
         have_other_version && ota_slot_eligible(other_partition) ? "true" : "false",

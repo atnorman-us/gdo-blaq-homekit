@@ -51,7 +51,6 @@ assert(document.getElementById('fwStatus').textContent.includes('2 seconds'));
 renderOtaReview({ota_pending:false});
 assert.equal(document.getElementById('fwConfirmRow').style.display,'none');
 assert.equal(document.getElementById('fwUploadRow').style.display,'flex');
-assert.equal(ageText(-1),'not yet received');
 ''')
         self.assertEqual(result.returncode,0,result.stderr)
 
