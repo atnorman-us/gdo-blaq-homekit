@@ -2,7 +2,17 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.6.1](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.6.1)**
+**Current release: [1.3.7.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.0)**
+
+## What's changed in 1.3.7.0
+
+### Update from GitHub release
+
+The Firmware card now offers **Update from GitHub release**. It looks up the latest stable release, shows release notes, and downloads the OTA image directly to the device over certificate-verified HTTPS. Existing image validation and the separate Confirm/Cancel step remain: downloading does not activate the image or reboot. Manual file upload remains available if lookup or download fails. Internet access and a correct device clock are required.
+
+### Known limitation
+
+The reported Security+ 1.0 opening-on-reboot issue remains unresolved. Avoid updating or rebooting affected Security+ 1.0 installations pending a fix. Direct GitHub downloading has not yet been validated on physical hardware.
 
 ## What's changed in 1.3.6.1
 
@@ -207,3 +217,7 @@ A real obstruction is reported immediately and is not automatically declared cle
 - **Pairing fault:** Check opener power, wiring, and whether it still recognizes the controller. The banner is based on sustained synchronization failure, not a definitive diagnosis of lost pairing.
 - **Home app state:** State tracking and watchdog recovery have been improved, but hardware and Home hub behavior still need testing on your installation. Repeatedly submitting an unchanged value does not force the HomeKit SDK to send another notification.
 - **After an update:** Verify local and remote Home control, final door state, obstruction reporting, and cancellation during the warning before relying on unattended automatic closing.
+
+### Update from GitHub release
+
+The Firmware card can look up the latest stable GitHub release and download its OTA image directly to the device over verified HTTPS. Review the release notes before downloading. The existing Confirm/Cancel step still controls reboot; downloading alone does not activate the image. Internet access and a correct device clock are required. File upload remains available as a fallback.

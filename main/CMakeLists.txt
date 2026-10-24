@@ -21,6 +21,7 @@ idf_component_register(
         esp_hap_platform
         esp_hap_extras
         esp_hap_apple_profiles
+        esp_http_client
         esp_http_server
         driver
         app_update

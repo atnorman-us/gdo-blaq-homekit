@@ -9,6 +9,8 @@
 
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
@@ -439,10 +441,9 @@ static void escape_json_version(const char *input, char *output, size_t capacity
     output[used] = '\0';
 }
 
-static esp_err_t firmware_update_post_handler(httpd_req_t *req)
+static esp_err_t firmware_receive(httpd_req_t *req, int image_size, esp_http_client_handle_t download)
 {
-    if (!authorize_mutation(req)) return ESP_FAIL;
-    if (req->content_len <= 0) {
+    if (image_size <= 0) {
         httpd_resp_send_err(req, HTTPD_411_LENGTH_REQUIRED, "Content-Length required");
         return ESP_FAIL;
     }
@@ -461,9 +462,9 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if ((size_t)req->content_len > target->size) {
+    if ((size_t)image_size > target->size) {
         ESP_LOGW(TAG, "Firmware upload (%d bytes) too large for OTA partition (%u bytes)",
-                 req->content_len, (unsigned)target->size);
+                 image_size, (unsigned)target->size);
         httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Image larger than OTA partition");
         return ESP_FAIL;
     }
@@ -484,7 +485,7 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
     ota_clear_pending();
 
     esp_ota_handle_t ota_handle = 0;
-    esp_err_t err = esp_ota_begin(target, req->content_len, &ota_handle);
+    esp_err_t err = esp_ota_begin(target, image_size, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin() failed: %s", esp_err_to_name(err));
         free(chunk);
@@ -494,13 +495,13 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
     }
 
     ESP_LOGI(TAG, "Firmware upload starting: %d bytes -> partition '%s'",
-             req->content_len, target->label);
+             image_size, target->label);
 
-    int remaining = req->content_len;
+    int remaining = image_size;
     bool ok = true;
     while (remaining > 0) {
         int to_read = remaining < OTA_UPLOAD_CHUNK_SIZE ? remaining : OTA_UPLOAD_CHUNK_SIZE;
-        int received = httpd_req_recv(req, chunk, to_read);
+        int received = (download ? esp_http_client_read(download, chunk, to_read) : httpd_req_recv(req, chunk, to_read));
         if (received <= 0) {
             ESP_LOGE(TAG, "Firmware upload: recv failed/closed early (%d bytes remaining)", remaining);
             ok = false;
@@ -550,10 +551,72 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
     escape_json_version(version, escaped_version, sizeof(escaped_version));
     char resp[280];
     int n = snprintf(resp, sizeof(resp), "{\"partition\":\"%s\",\"version\":\"%s\",\"size\":%d}",
-                      target->label, escaped_version, req->content_len);
+                      target->label, escaped_version, image_size);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, resp, (n > 0 && (size_t)n < sizeof(resp)) ? n : HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t firmware_update_post_handler(httpd_req_t *req)
+{
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    return firmware_receive(req, req->content_len, nullptr);
+}
+
+static esp_err_t firmware_github_post_handler(httpd_req_t *req)
+{
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    // Accept only a dotted numeric release tag, never an arbitrary fetch URL.
+    char tag[32] = {};
+    if (req->content_len < 1 || req->content_len >= (int)sizeof(tag)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid release tag");
+        return ESP_FAIL;
+    }
+    int used = 0;
+    while (used < req->content_len) {
+        int n = httpd_req_recv(req, tag + used, req->content_len - used);
+        if (n <= 0) return ESP_FAIL;
+        used += n;
+    }
+    for (int i = 0; i < used; ++i) {
+        if ((tag[i] < '0' || tag[i] > '9') && tag[i] != '.') {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid release tag");
+            return ESP_FAIL;
+        }
+    }
+    char url[256];
+    snprintf(url, sizeof(url), "https://github.com/atnorman-us/gdo-blaq-homekit/releases/download/%s/gdo-blaq-homekit-%s-ota.bin", tag, tag);
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.timeout_ms = 15000;
+    config.disable_auto_redirect = true;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) { httpd_resp_send_500(req); return ESP_FAIL; }
+    esp_err_t result = ESP_FAIL;
+    bool responded = false;
+    for (int redirects = 0; redirects < 5; ++redirects) {
+        if (esp_http_client_open(client, 0) != ESP_OK) break;
+        int64_t length = esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        if (status == 200 && length > 0 && length <= INT32_MAX) {
+            result = firmware_receive(req, (int)length, client);
+            responded = true;
+            break;
+        }
+        if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) break;
+        if (esp_http_client_set_redirection(client) != ESP_OK) break;
+        char redirected[2048];
+        if (esp_http_client_get_url(client, redirected, sizeof(redirected)) != ESP_OK ||
+            strncmp(redirected, "https://", 8) != 0) break;
+        esp_http_client_close(client);
+    }
+    esp_http_client_cleanup(client);
+    if (!responded) {
+        httpd_resp_set_status(req, "502 Bad Gateway");
+        httpd_resp_send(req, "GitHub download failed. Check internet access and device clock, or upload a downloaded OTA file.", HTTPD_RESP_USE_STRLEN);
+    }
+    return result;
 }
 
 static esp_err_t firmware_confirm_post_handler(httpd_req_t *req)
@@ -985,6 +1048,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    <div class=\"row\"><div class=\"label\"><span class=\"ic\">&#8635;</span>Other slot</div><span class=\"value mono\"><span id=\"fwOtherPartition\">?</span> &middot; <span id=\"fwOtherVersion\">?</span></span></div>"
         "    <div class=\"divider\"></div>"
         "    <div id=\"fwUploadRow\" class=\"btnrow\">"
+        "      <button onclick=\"updateFromGithub()\">Update from GitHub release</button>"
         "      <input type=\"file\" id=\"fwFile\" accept=\".bin\">"
         "      <button class=\"primary\" onclick=\"uploadFirmware()\">Upload</button>"
         "    </div>"
@@ -1107,6 +1171,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  }catch(e){alert('Password change failed: '+e.message);}"
         "}"
         "function renderOtaReview(s){"
+        "  if(githubUpdateBusy)return;"
         "  document.getElementById('fwRollbackButton').disabled=!s.ota_rollback_eligible;"
         "  document.getElementById('fwRollbackStatus').textContent=s.ota_rollback_eligible?'Available: '+s.other_fw_version:'Unavailable: other slot is empty, unconfirmed, or has unknown settings compatibility.';"
         "  document.getElementById('fwConfirmRow').style.display=s.ota_pending?'flex':'none';"
@@ -1308,6 +1373,30 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  }catch(e){"
         "    statusEl.textContent = 'Save failed: ' + e.message;"
         "  }"
+        "}"
+        "let githubUpdateBusy=false;"
+        "async function updateFromGithub(){"
+        " if(githubUpdateBusy)return;githubUpdateBusy=true;"
+        " const el=document.getElementById('fwStatus');"
+        " el.textContent='Checking latest GitHub release...';"
+        " try {"
+        "  const r=await fetch('https://api.github.com/repos/atnorman-us/gdo-blaq-homekit/releases/latest');"
+        "  if(!r.ok) throw new Error('GitHub release lookup failed ('+r.status+').');"
+        "  const release=await r.json();"
+        "  const tag=release.tag_name;"
+        "  if(typeof tag!=='string' || !/^[0-9]+(\\.[0-9]+)+$/.test(tag) || tag.length>31 || release.draft || release.prerelease) throw new Error('Unsupported release. Use file upload.');"
+        "  const name='gdo-blaq-homekit-'+tag+'-ota.bin';"
+        "  if(!Array.isArray(release.assets) || !release.assets.some(a=>a.name===name)) throw new Error('Release OTA image is not available yet.');"
+        "  if(!confirm('Download firmware '+tag+'? Review release notes first: '+release.html_url+'\\n'+(release.body||'')+'\\nThis stages the update only. Reboot requires a separate confirmation.')) {el.textContent='Download cancelled.';return;}"
+        "  const headers=await authHeaders();"
+        "  el.textContent='Downloading and validating '+tag+' on the device. This may take a few minutes...';"
+        "  document.getElementById('fwUploadRow').style.display='none';"
+        "  const update=await fetch('/firmware/github',{method:'POST',headers,body:tag});"
+        "  if(!update.ok){if(update.status===401)adminToken='';throw new Error(await update.text());}"
+        "  const info=await update.json();"
+        "  el.textContent='Validated: version '+info.version+'. Review before rebooting.';"
+        "  document.getElementById('fwConfirmRow').style.display='flex';"
+        " }catch(e){el.textContent='GitHub update failed: '+e.message+' You can still download the OTA file and upload it here.';document.getElementById('fwUploadRow').style.display='flex';}finally{githubUpdateBusy=false;}"
         "}"
         "async function uploadFirmware(){"
         "  const fileInput = document.getElementById('fwFile');"
@@ -1645,7 +1734,7 @@ static bool start_httpd_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = DIAG_WEB_PORT;
-    config.max_uri_handlers = 18;
+    config.max_uri_handlers = 19;
     config.lru_purge_enable = true;
     // Flash-write paths in the firmware upload handler want more headroom
     // than the 4KB default, and a ~1.7MB upload over a slow WiFi link
@@ -1683,6 +1772,14 @@ static bool start_httpd_server(void)
     favicon_uri.uri = "/favicon.ico";
     favicon_uri.method = HTTP_GET;
     favicon_uri.handler = favicon_get_handler;
+
+    httpd_uri_t github_uri = {};
+    github_uri.uri = "/firmware/github";
+    github_uri.method = HTTP_POST;
+    github_uri.handler = firmware_github_post_handler;
+    if (httpd_register_uri_handler(s_server, &github_uri) != ESP_OK) {
+        httpd_stop(s_server); s_server = nullptr; return false;
+    }
 
     httpd_uri_t restart_uri = {};
     restart_uri.uri = "/restart";
