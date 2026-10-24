@@ -2,7 +2,7 @@
 
 ## What this is
 
-This directory is the source for [espweb.terazone.com](https://espweb.terazone.com/), a static site plus a Cloudflare Pages Function that serves an [ESP Web Tools](https://esphome.github.io/esp-web-tools/) installer for this repo's HomeKit firmware. The Pages Function reads a small firmware manifest and binary firmware files out of an R2 bucket (`gdo-blaq-firmware`, bound as `FIRMWARE`), which GitHub Actions keeps in sync on every non-prerelease GitHub Release published from this repo.
+This directory is the source for [espweb.terazone.com](https://espweb.terazone.com/), a static site plus a Cloudflare Pages Function that serves an [ESP Web Tools](https://esphome.github.io/esp-web-tools/) installer for this repo's HomeKit firmware. The Pages Function reads a small firmware manifest and OTA/combined binary firmware files out of an R2 bucket (`gdo-blaq-firmware`, bound as `FIRMWARE`), which GitHub Actions keeps in sync on every non-prerelease GitHub Release published from this repo.
 
 ## Local development
 
@@ -41,3 +41,5 @@ If these secrets are missing, expired, or wrong, the R2 publish step now fails g
 - **R2 bucket:** `gdo-blaq-firmware` — holds `current.json` (the version/filename pointer) and the firmware binaries themselves.
 - **Cloudflare Pages project:** `gdo-blaq-espweb` — hosts this site, direct-upload only (no git integration).
 - **Custom domain:** `espweb.terazone.com`, mapped to the Pages project.
+
+The release publisher uploads the OTA image alongside the USB image before writing `current.json`. Its optional `ota` filename is exposed as `manifest.ota.path`; the installer uses that direct URL for manual OTA downloads, falling back to GitHub for older manifests. Firmware responses explicitly include Content-Length for the embedded updater.

@@ -43,6 +43,7 @@ async function handleManifest(env) {
   const manifest = {
     name: MANIFEST_NAME,
     version: current.version,
+    ota: current.ota ? { path: `/firmware/${current.ota}` } : null,
     builds: [
       {
         chipFamily: "ESP32-S3",
@@ -67,7 +68,8 @@ async function handleFirmwareFile(env, key) {
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
-  headers.set("cache-control", "public, max-age=3600");
+  headers.set("content-length", String(object.size));
+  headers.set("cache-control", "no-store");
   if (!headers.has("content-type")) {
     headers.set("content-type", "application/octet-stream");
   }

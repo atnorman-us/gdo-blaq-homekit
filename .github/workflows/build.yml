@@ -108,7 +108,12 @@ jobs:
           --file "release-assets/${FIRMWARE_FILE}" \
           --content-type application/octet-stream \
           --remote
-        jq -nc --arg v "$RELEASE_TAG" --arg f "$FIRMWARE_FILE" '{version:$v,file:$f}' > /tmp/current.json
+        OTA_FILE="gdo-blaq-homekit-${RELEASE_TAG}-ota.bin"
+        npx --yes wrangler@4 r2 object put "gdo-blaq-firmware/${OTA_FILE}" \
+          --file "release-assets/${OTA_FILE}" \
+          --content-type application/octet-stream \
+          --remote
+        jq -nc --arg v "$RELEASE_TAG" --arg f "$FIRMWARE_FILE" --arg ota "$OTA_FILE" '{version:$v,file:$f,ota:$ota}' > /tmp/current.json
         npx --yes wrangler@4 r2 object put "gdo-blaq-firmware/current.json" \
           --file /tmp/current.json \
           --content-type application/json \

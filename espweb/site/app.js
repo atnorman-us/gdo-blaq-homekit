@@ -29,7 +29,7 @@ fetch("/firmware/manifest.json")
     versionEl.textContent = `Version ${manifest.version}`;
 
     const v = encodeURIComponent(manifest.version);
-    otaLink.href = `https://github.com/atnorman-us/gdo-blaq-homekit/releases/download/${v}/gdo-blaq-homekit-${v}-ota.bin`;
+    otaLink.href = manifest.ota?.path || `https://github.com/atnorman-us/gdo-blaq-homekit/releases/download/${v}/gdo-blaq-homekit-${v}-ota.bin`;
     otaLink.textContent = `Download update file (${manifest.version})`;
     otaLink.removeAttribute("target");
   })

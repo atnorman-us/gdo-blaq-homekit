@@ -6,6 +6,8 @@ Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMa
 
 ## What's changed in 1.3.7.1
 
+Rebuilt in place with direct OTA downloads from espweb.terazone.com, avoiding GitHub's signed redirects, and an editable **Firmware URL** field. Downloads require verified HTTPS and a binary response; activation still requires a separate confirmation. The reported HTTPS download crash still needs hardware verification.
+
 Orderly software restarts now disconnect the opener UART transmit signal and release TX/RX as inputs before the UART peripheral resets. This covers firmware confirmation, manual restart, and software rollback through `esp_restart()`. Registration is required before initializing the opener interface. This mitigation is not yet verified on hardware and does not cover power loss, hard resets, or connecting control wires. The reported Security+ 1.0 opening-on-reboot issue remains unconfirmed as resolved. **The first update into this version still reboots through the old firmware, which lacks this protection.**
 
 ## What's changed in 1.3.7.0
@@ -225,3 +227,11 @@ A real obstruction is reported immediately and is not automatically declared cle
 ### Update from GitHub release
 
 The Firmware card can look up the latest stable GitHub release and download its OTA image directly to the device over verified HTTPS. Review the release notes before downloading. The existing Confirm/Cancel step still controls reboot; downloading alone does not activate the image. Internet access and a correct device clock are required. File upload remains available as a fallback.
+
+### Direct OTA mirror
+
+The latest-release updater still reads GitHub release metadata but downloads the selected OTA image directly from `https://espweb.terazone.com/firmware/`. It rejects redirects and non-binary responses, retains HTTPS certificate validation, and uses the existing Confirm/Cancel flow. The release workflow uploads both OTA and USB images to R2 before advancing the manifest. Direct download removes the signed GitHub redirect; the previously reported HTTPS crash still needs hardware verification.
+
+### Custom firmware URL
+
+The Firmware card includes an editable Firmware URL field and Download from URL button, alongside latest-release and file-upload options. Supply a direct HTTPS OTA `.bin` URL (up to 1024 characters); redirects and non-binary responses are rejected. Downloading requires the admin password and does not reboot. Review the validated version and explicitly Confirm or Cancel. The download shows stage text, not a byte-progress percentage.

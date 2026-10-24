@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
@@ -563,6 +564,54 @@ static esp_err_t firmware_update_post_handler(httpd_req_t *req)
     return firmware_receive(req, req->content_len, nullptr);
 }
 
+static esp_err_t firmware_download_header(esp_http_client_event_t *event)
+{
+    if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key && event->header_value &&
+        strcasecmp(event->header_key, "Content-Type") == 0) {
+        *static_cast<bool *>(event->user_data) =
+            strcasecmp(event->header_value, "application/octet-stream") == 0;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t firmware_download(httpd_req_t *req, const char *url)
+{
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.buffer_size_tx = 2048;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    bool binary_response = false;
+    config.event_handler = firmware_download_header;
+    config.user_data = &binary_response;
+    config.timeout_ms = 15000;
+    config.disable_auto_redirect = true;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) { httpd_resp_send_500(req); return ESP_FAIL; }
+    esp_err_t result = ESP_FAIL;
+    bool responded = false;
+    int download_status = 0;
+    // Direct R2-backed endpoint: fail on redirects, challenges, and HTML.
+    // Do not erase an OTA slot until the response is a sized binary image.
+    if (esp_http_client_open(client, 0) == ESP_OK) {
+        int64_t length = esp_http_client_fetch_headers(client);
+        download_status = esp_http_client_get_status_code(client);
+        if (binary_response && esp_http_client_get_status_code(client) == 200 &&
+            length > 0 && length <= INT32_MAX) {
+            result = firmware_receive(req, (int)length, client);
+            responded = true;
+        }
+    }
+    esp_http_client_cleanup(client);
+    if (!responded) {
+        httpd_resp_set_status(req, "502 Bad Gateway");
+        const char *message = download_status >= 300 && download_status < 400
+            ? "Redirect refused. Use a direct HTTPS OTA .bin download URL."
+            : "Download failed: expected a binary image with Content-Length. Check the URL, internet access, and device clock, or use file upload.";
+        httpd_resp_send(req, message, HTTPD_RESP_USE_STRLEN);
+    }
+    return result;
+}
+
 static esp_err_t firmware_github_post_handler(httpd_req_t *req)
 {
     if (!authorize_mutation(req)) return ESP_FAIL;
@@ -585,37 +634,48 @@ static esp_err_t firmware_github_post_handler(httpd_req_t *req)
         }
     }
     char url[256];
-    snprintf(url, sizeof(url), "https://github.com/atnorman-us/gdo-blaq-homekit/releases/download/%s/gdo-blaq-homekit-%s-ota.bin", tag, tag);
-    esp_http_client_config_t config = {};
-    config.url = url;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = 15000;
-    config.disable_auto_redirect = true;
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) { httpd_resp_send_500(req); return ESP_FAIL; }
-    esp_err_t result = ESP_FAIL;
-    bool responded = false;
-    for (int redirects = 0; redirects < 5; ++redirects) {
-        if (esp_http_client_open(client, 0) != ESP_OK) break;
-        int64_t length = esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        if (status == 200 && length > 0 && length <= INT32_MAX) {
-            result = firmware_receive(req, (int)length, client);
-            responded = true;
-            break;
-        }
-        if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) break;
-        if (esp_http_client_set_redirection(client) != ESP_OK) break;
-        char redirected[2048];
-        if (esp_http_client_get_url(client, redirected, sizeof(redirected)) != ESP_OK ||
-            strncmp(redirected, "https://", 8) != 0) break;
-        esp_http_client_close(client);
+    snprintf(url, sizeof(url), "https://espweb.terazone.com/firmware/gdo-blaq-homekit-%s-ota.bin", tag);
+    return firmware_download(req, url);
+}
+
+// Only direct HTTPS URLs. Credentials, fragments, whitespace, and control
+// characters are rejected; the device admin explicitly selects the host.
+static bool firmware_url_valid(const char *url)
+{
+    if (strncmp(url, "https://", 8) != 0) return false;
+    const char *path = strchr(url + 8, '/');
+    if (!path || path == url + 8) return false;
+    for (const char *p = url; *p; ++p) {
+        if ((unsigned char)*p <= 32 || (unsigned char)*p >= 127 || *p == '#' || *p == '\\') return false;
+        if (p < path && *p == '@') return false;
     }
-    esp_http_client_cleanup(client);
-    if (!responded) {
-        httpd_resp_set_status(req, "502 Bad Gateway");
-        httpd_resp_send(req, "GitHub download failed. Check internet access and device clock, or upload a downloaded OTA file.", HTTPD_RESP_USE_STRLEN);
+    const char *end = strchr(path, '?');
+    if (!end) end = url + strlen(url);
+    return end - path >= 4 && strncmp(end - 4, ".bin", 4) == 0;
+}
+
+static esp_err_t firmware_url_post_handler(httpd_req_t *req)
+{
+    if (!authorize_mutation(req)) return ESP_FAIL;
+    if (req->content_len < 1 || req->content_len > 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL must be 1-1024 characters");
+        return ESP_FAIL;
     }
+    char *url = (char *)calloc(req->content_len + 1, 1);
+    if (!url) { httpd_resp_send_500(req); return ESP_FAIL; }
+    int used = 0;
+    while (used < req->content_len) {
+        int n = httpd_req_recv(req, url + used, req->content_len - used);
+        if (n <= 0) { free(url); return ESP_FAIL; }
+        used += n;
+    }
+    if (strlen(url) != (size_t)used || !firmware_url_valid(url)) {
+        free(url);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use a direct HTTPS .bin URL without credentials or fragments");
+        return ESP_FAIL;
+    }
+    esp_err_t result = firmware_download(req, url);
+    free(url);
     return result;
 }
 
@@ -1048,7 +1108,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    <div class=\"row\"><div class=\"label\"><span class=\"ic\">&#8635;</span>Other slot</div><span class=\"value mono\"><span id=\"fwOtherPartition\">?</span> &middot; <span id=\"fwOtherVersion\">?</span></span></div>"
         "    <div class=\"divider\"></div>"
         "    <div id=\"fwUploadRow\" class=\"btnrow\">"
-        "      <button onclick=\"updateFromGithub()\">Update from GitHub release</button>"
+        "      <button onclick=\"updateFromGithub()\">Update from latest release</button>"
+        "<label for=\"fwUrl\">Firmware URL</label>"
+        "<input type=\"url\" id=\"fwUrl\" maxlength=\"1024\" style=\"width:100%\" value=\"https://espweb.terazone.com/firmware/gdo-blaq-homekit-1.3.7.1-ota.bin\">"
+        "<button onclick=\"updateFromUrl()\">Download from URL</button>"
+        "<span class=\"hint\">Direct HTTPS OTA .bin only. Redirects are not followed. USB combined images are not supported.</span>"
+
         "      <input type=\"file\" id=\"fwFile\" accept=\".bin\">"
         "      <button class=\"primary\" onclick=\"uploadFirmware()\">Upload</button>"
         "    </div>"
@@ -1389,7 +1454,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  if(!Array.isArray(release.assets) || !release.assets.some(a=>a.name===name)) throw new Error('Release OTA image is not available yet.');"
         "  if(!confirm('Download firmware '+tag+'? Review release notes first: '+release.html_url+'\\n'+(release.body||'')+'\\nThis stages the update only. Reboot requires a separate confirmation.')) {el.textContent='Download cancelled.';return;}"
         "  const headers=await authHeaders();"
-        "  el.textContent='Downloading and validating '+tag+' on the device. This may take a few minutes...';"
+        "  el.textContent='Downloading from espweb.terazone.com and validating '+tag+' on the device. This may take a few minutes...';"
         "  document.getElementById('fwUploadRow').style.display='none';"
         "  const update=await fetch('/firmware/github',{method:'POST',headers,body:tag});"
         "  if(!update.ok){if(update.status===401)adminToken='';throw new Error(await update.text());}"
@@ -1397,6 +1462,28 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "  el.textContent='Validated: version '+info.version+'. Review before rebooting.';"
         "  document.getElementById('fwConfirmRow').style.display='flex';"
         " }catch(e){el.textContent='GitHub update failed: '+e.message+' You can still download the OTA file and upload it here.';document.getElementById('fwUploadRow').style.display='flex';}finally{githubUpdateBusy=false;}"
+        "}"
+        "async function updateFromUrl(){"
+        " if(githubUpdateBusy)return;"
+        " const el=document.getElementById('fwStatus');"
+        " const raw=document.getElementById('fwUrl').value.trim();"
+        " try {"
+        "  const u=new URL(raw);"
+        "  if(u.protocol!=='https:' || u.username || u.password || u.hash || !u.pathname.endsWith('.bin') || raw.length>1024)throw new Error('Use a direct HTTPS OTA .bin URL without credentials or fragments.');"
+        " }catch(e){el.textContent='Invalid firmware URL: '+e.message;return;}"
+        " if(!confirm('Download this OTA image? '+raw+'\\nReboot requires a separate confirmation.'))return;"
+        " githubUpdateBusy=true;"
+        " try{"
+        "  const headers=await authHeaders();"
+        "  document.getElementById('fwUploadRow').style.display='none';"
+        "  el.textContent='Downloading and validating firmware from the URL...';"
+        "  const r=await fetch('/firmware/url',{method:'POST',headers,body:raw});"
+        "  if(!r.ok){if(r.status===401)adminToken='';throw new Error(await r.text());}"
+        "  const info=await r.json();"
+        "  el.textContent='Validated: version '+info.version+'. Review before rebooting.';"
+        "  document.getElementById('fwConfirmRow').style.display='flex';"
+        " }catch(e){el.textContent='URL update failed: '+e.message;document.getElementById('fwUploadRow').style.display='flex';}"
+        " finally{githubUpdateBusy=false;}"
         "}"
         "async function uploadFirmware(){"
         "  const fileInput = document.getElementById('fwFile');"
@@ -1734,7 +1821,7 @@ static bool start_httpd_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = DIAG_WEB_PORT;
-    config.max_uri_handlers = 19;
+    config.max_uri_handlers = 20;
     config.lru_purge_enable = true;
     // Flash-write paths in the firmware upload handler want more headroom
     // than the 4KB default, and a ~1.7MB upload over a slow WiFi link
@@ -1772,6 +1859,14 @@ static bool start_httpd_server(void)
     favicon_uri.uri = "/favicon.ico";
     favicon_uri.method = HTTP_GET;
     favicon_uri.handler = favicon_get_handler;
+
+    httpd_uri_t url_uri = {};
+    url_uri.uri = "/firmware/url";
+    url_uri.method = HTTP_POST;
+    url_uri.handler = firmware_url_post_handler;
+    if (httpd_register_uri_handler(s_server, &url_uri) != ESP_OK) {
+        httpd_stop(s_server); s_server = nullptr; return false;
+    }
 
     httpd_uri_t github_uri = {};
     github_uri.uri = "/firmware/github";
