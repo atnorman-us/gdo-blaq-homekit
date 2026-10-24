@@ -2,7 +2,11 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.7.0](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.0)**
+**Current release: [1.3.7.1](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.1)**
+
+## What's changed in 1.3.7.1
+
+Orderly software restarts now disconnect the opener UART transmit signal and release TX/RX as inputs before the UART peripheral resets. This covers firmware confirmation, manual restart, and software rollback through `esp_restart()`. Registration is required before initializing the opener interface. This mitigation is not yet verified on hardware and does not cover power loss, hard resets, or connecting control wires. The reported Security+ 1.0 opening-on-reboot issue remains unconfirmed as resolved. **The first update into this version still reboots through the old firmware, which lacks this protection.**
 
 ## What's changed in 1.3.7.0
 
