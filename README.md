@@ -6,7 +6,7 @@ Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMa
 
 ## What's changed in 1.3.7.1
 
-Rebuilt in place with direct OTA downloads from espweb.terazone.com, avoiding GitHub's signed redirects, and an editable **Firmware URL** field. Downloads require verified HTTPS and a binary response; activation still requires a separate confirmation. The reported HTTPS download crash still needs hardware verification.
+Rebuilt in place to remove GitHub/latest-release and editable-URL updates from the device dashboard and server. Download the OTA file to your computer and use manual file upload. Image validation, Confirm/Cancel, and UART shutdown protection remain.
 
 Orderly software restarts now disconnect the opener UART transmit signal and release TX/RX as inputs before the UART peripheral resets. This covers firmware confirmation, manual restart, and software rollback through `esp_restart()`. Registration is required before initializing the opener interface. This mitigation is not yet verified on hardware and does not cover power loss, hard resets, or connecting control wires. The reported Security+ 1.0 opening-on-reboot issue remains unconfirmed as resolved. **The first update into this version still reboots through the old firmware, which lacks this protection.**
 
@@ -224,14 +224,6 @@ A real obstruction is reported immediately and is not automatically declared cle
 - **Home app state:** State tracking and watchdog recovery have been improved, but hardware and Home hub behavior still need testing on your installation. Repeatedly submitting an unchanged value does not force the HomeKit SDK to send another notification.
 - **After an update:** Verify local and remote Home control, final door state, obstruction reporting, and cancellation during the warning before relying on unattended automatic closing.
 
-### Update from GitHub release
+### Firmware updates
 
-The Firmware card can look up the latest stable GitHub release and download its OTA image directly to the device over verified HTTPS. Review the release notes before downloading. The existing Confirm/Cancel step still controls reboot; downloading alone does not activate the image. Internet access and a correct device clock are required. File upload remains available as a fallback.
-
-### Direct OTA mirror
-
-The latest-release updater still reads GitHub release metadata but downloads the selected OTA image directly from `https://espweb.terazone.com/firmware/`. It rejects redirects and non-binary responses, retains HTTPS certificate validation, and uses the existing Confirm/Cancel flow. The release workflow uploads both OTA and USB images to R2 before advancing the manifest. Direct download removes the signed GitHub redirect; the previously reported HTTPS crash still needs hardware verification.
-
-### Custom firmware URL
-
-The Firmware card includes an editable Firmware URL field and Download from URL button, alongside latest-release and file-upload options. Supply a direct HTTPS OTA `.bin` URL (up to 1024 characters); redirects and non-binary responses are rejected. Downloading requires the admin password and does not reboot. Review the validated version and explicitly Confirm or Cancel. The download shows stage text, not a byte-progress percentage.
+Download the OTA `.bin` file to your computer, then select it in the diagnostics page's Firmware card and choose **Upload**. After validation, review the version and choose **Confirm** to reboot or **Cancel** to discard it. The device no longer offers GitHub or URL downloads. Use the OTA image, not the combined USB image.
