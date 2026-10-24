@@ -50,7 +50,7 @@ class PacketDurationTests(unittest.TestCase):
         return harness() + '\n#include "' + str(ROOT / 'components/gdolib/secplus.c') + '"\n' + stubs + r'''
 static void update_openings(int a,int b) {updates++;}
 static void update_paired_devices(int a,int b) {updates++;}
-''' + extra_stubs + function('components/gdolib/gdo.c', 'static void record_received_packet(') + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
+''' + extra_stubs + '\nstatic int64_t obstruction_confirm_due_us;\nstatic unsigned obstruction_confirm_attempts;\n' + function('components/gdolib/gdo.c', 'static void obstruction_confirm_poll(') + function('components/gdolib/gdo.c', 'static void obstruction_confirm_request(') + function('components/gdolib/gdo.c', 'static void record_received_packet(') + function('components/gdolib/gdo.c', 'static void log_rejected_packet(') \
     + function('components/gdolib/gdo.c', 'static void decode_packet(uint8_t *packet) {')
 
     def test_receive_age_tracks_reports_not_interpolation_or_echoes(self):
@@ -180,12 +180,46 @@ int main(void) {
  decode_packet(packet);
  assert(status_requests == 1 && updates == 0);
  assert(g_status.obstruction == GDO_OBSTRUCTION_STATE_MAX);
- // Once a real baseline is known, OBST_1 toggles exactly as before.
+ // A second event in the pending confirmation cycle shares the request.
  g_status.obstruction = GDO_OBSTRUCTION_STATE_CLEAR;
  now = 4000000; // clear the 1s debounce window
  assert(encode_wireline(124, 0x123456, 0x084, packet) == 0);
  decode_packet(packet);
  assert(updates == 1 && status_requests == 1);
+}
+''')
+
+    def test_closed_door_obstruction_confirmation_is_bounded(self):
+        source = self.packet_source().replace(
+            'static void update_obstruction_state(int a) {updates++;}',
+            function('components/gdolib/gdo.c', 'inline static void update_obstruction_state('))
+        run_c(source + r'''
+int main(void) {
+ uint8_t packet[19];
+ g_config.obst_from_status=true;
+ g_status.door=GDO_DOOR_STATE_CLOSED;
+ g_status.obstruction=GDO_OBSTRUCTION_STATE_CLEAR;
+ now=2000000;
+ assert(encode_wireline(123,0x123456,0x84,packet)==0); decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED && status_requests==1);
+ assert(encode_wireline(123,0x123456,0x85,packet)==0); decode_packet(packet); decode_packet(packet);
+ assert(status_requests==1); // duplicate events coalesce
+ now=3000000; obstruction_confirm_poll(); assert(status_requests==2);
+ now=4000000; obstruction_confirm_poll(); assert(status_requests==3);
+ now=5000000; obstruction_confirm_poll();
+ assert(status_requests==3 && obstruction_confirm_due_us==0);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED); // timeout is not clear
+ assert(encode_wireline(124,0x123456,0x84,packet)==0); decode_packet(packet);
+ assert(status_requests==4 && g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+ // Captured closed/clear STATUS cancels pending retries and clears the UI.
+ assert(encode_wireline(125,0x123456,0x40600281,packet)==0); decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_CLEAR && !obstruction_confirm_due_us);
+ now=6000000; obstruction_confirm_poll(); assert(status_requests==4);
+ // OBST_2 alone also requests confirmation; a blocked response stays blocked.
+ assert(encode_wireline(126,0x123456,0x85,packet)==0); decode_packet(packet);
+ assert(status_requests==5);
+ assert(encode_wireline(127,0x123456,0x40200281,packet)==0); decode_packet(packet);
+ assert(g_status.obstruction==GDO_OBSTRUCTION_STATE_OBSTRUCTED && !obstruction_confirm_due_us);
 }
 ''')
 
