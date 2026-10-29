@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Keep dependency fixes reproducible without unpublished submodule commits.
+find_program(GDO_PATCH_PYTHON NAMES python3 REQUIRED)
+execute_process(COMMAND "${GDO_PATCH_PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/scripts/apply-dependency-patches.py"
+                RESULT_VARIABLE GDO_PATCH_RESULT)
+if(NOT GDO_PATCH_RESULT EQUAL 0)
+  message(FATAL_ERROR "Unable to apply required GDO dependency patches")
+endif()
+
 if(DEFINED ENV{HOMEKIT_PATH})
   set(HOMEKIT_PATH $ENV{HOMEKIT_PATH})
 else()
