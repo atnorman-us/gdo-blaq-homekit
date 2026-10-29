@@ -1917,19 +1917,47 @@ static void wait_for_network_and_start_task(void *arg)
 // acts if the server was already running - if it's null, either it was
 // never started yet or wait_for_network_and_start_task is still in the
 // process of starting it for the first time, and this avoids racing that.
+//
+// The stop/start runs on its own task. This is called from the WiFi/IP event
+// handler, which runs on the default event loop's task: its stack is only
+// CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE (2304 bytes), and start_httpd_server()
+// builds the config and every URI handler record on the stack, which overflowed
+// it when the network came back.
+static volatile bool s_restart_task_running = false;
+static volatile bool s_restart_again = false;
+
+static void diag_restart_task(void *arg)
+{
+    do {
+        s_restart_again = false;
+        ESP_LOGI(TAG, "Restarting diagnostics web server after network change");
+        if (s_server) {
+            httpd_stop(s_server);
+            s_server = nullptr;
+        }
+        if (!start_httpd_server()) {
+            ESP_LOGE(TAG, "Diagnostics web server did not restart - will retry on the next network event");
+        }
+        // A network event that arrived mid-restart gets one more pass.
+    } while (s_restart_again);
+    s_restart_task_running = false;
+    vTaskDelete(NULL);
+}
+
 extern "C" void diag_webserver_restart(void)
 {
     if (!s_server && !s_server_started_once) {
         return;
     }
-
-    ESP_LOGI(TAG, "Restarting diagnostics web server after network change");
-    if (s_server) {
-        httpd_stop(s_server);
-        s_server = nullptr;
+    if (s_restart_task_running) {
+        s_restart_again = true;
+        return;
     }
-    if (!start_httpd_server()) {
-        ESP_LOGE(TAG, "Diagnostics web server did not restart - will retry on the next network event");
+    s_restart_task_running = true;
+    if (xTaskCreate(diag_restart_task, "diag_net_restart", 6144, NULL,
+                    tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        s_restart_task_running = false;
+        ESP_LOGE(TAG, "Could not start the diagnostics web server restart task");
     }
 }
 
