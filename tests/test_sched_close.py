@@ -22,7 +22,8 @@ PRELUDE = r'''
 static int guard_depth;
 struct ControlGuard { ControlGuard(){++guard_depth;} ~ControlGuard(){--guard_depth;} };
 static void activity_record(const char*, const char*) {}
-struct gdo_status_t { bool synced; int door, obstruction; uint32_t door_command_id; } current;
+struct gdo_status_t { bool synced; int door, obstruction; } current;
+static uint32_t s_door_command_id;
 static int last_door, last_obstruction;
 static uint32_t s_close_generation;
 static bool s_auto_close_triggered, s_user_close_pending;
@@ -37,8 +38,7 @@ static bool clock_ok; static uint16_t clock_min; static int32_t clock_day;
 static int warning_calls, warning_fail, saves, saved_day, refreshes, closes, notifies;
 static void (*warning_cb)(void);
 static int gdo_get_status(gdo_status_t *s) { *s = current; return ESP_OK; }
-static int gdo_door_close() { ++closes; return ESP_OK; }
-static void gdo_refresh_status() { ++refreshes; }
+static int send_door_request(bool) { ++closes; return ESP_OK; }
 static void notify_homekit_target_door_state_change(int) { ++notifies; }
 static int gdo_get_close_schedule(gdo_close_schedule_t *o) { *o = s_close_schedule; return ESP_OK; }
 static bool clock_sync_local_now(uint16_t *m, int32_t *d) { assert(guard_depth > 0); if(!clock_ok) return false; *m=clock_min; *d=clock_day; return true; }
@@ -48,7 +48,7 @@ static int close_schedule_last_day_save(int32_t d) { ++saves; if(save_fail) retu
 
 RESET = r'''
 static void reset() {
- current = {true, GDO_DOOR_STATE_OPEN, GDO_OBSTRUCTION_STATE_CLEAR, 7};
+ current = {true, GDO_DOOR_STATE_OPEN, GDO_OBSTRUCTION_STATE_CLEAR}; s_door_command_id = 7;
  last_door = GDO_DOOR_STATE_OPEN; last_obstruction = GDO_OBSTRUCTION_STATE_CLEAR;
  s_close_generation = 3; s_auto_close_triggered = false; s_user_close_pending = false;
  s_close_schedule = {true, 23*60, "UTC0"}; s_close_schedule_last_day = 0;
@@ -129,11 +129,11 @@ int main() {
         run_c(sources() + r'''
 int main() {
  reset(); current.obstruction=1; sched_close_check();
- assert(warning_calls==0 && refreshes==1 && saves==0 && s_close_schedule_last_day==0);
+ assert(warning_calls==0 && refreshes==0 && saves==0 && s_close_schedule_last_day==0);
  current.obstruction=GDO_OBSTRUCTION_STATE_CLEAR; clock_min=23*60+3;   /* clears later in window */
  sched_close_check(); assert(warning_calls==1 && saves==1);
  reset(); last_obstruction=1; sched_close_check();
- assert(warning_calls==0 && refreshes==1);
+ assert(warning_calls==0 && refreshes==0);
  return 0;
 }''', cpp=True)
 
@@ -173,7 +173,7 @@ int main() {
  assert(closes==1 && notifies==1 && !s_sched_close_pending);
  arm(); s_close_schedule.enabled=false; sched_close_warning_complete_cb(); assert(closes==0 && !s_sched_close_pending);
  arm(); ++s_close_generation; sched_close_warning_complete_cb(); assert(closes==0 && !s_sched_close_pending); /* user/state change */
- arm(); ++current.door_command_id; sched_close_warning_complete_cb(); assert(closes==0);
+ arm(); ++s_door_command_id; sched_close_warning_complete_cb(); assert(closes==0);
  arm(); current.obstruction=1; sched_close_warning_complete_cb(); assert(closes==0);
  arm(); last_obstruction=1; sched_close_warning_complete_cb(); assert(closes==0);
  arm(); current.door=GDO_DOOR_STATE_CLOSED; sched_close_warning_complete_cb(); assert(closes==0);

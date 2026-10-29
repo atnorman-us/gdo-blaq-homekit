@@ -14,18 +14,19 @@ class ControlTests(unittest.TestCase):
 #define TGT_CLOSED 1
 struct ControlGuard {};
 static void activity_record(const char*, const char*) {}
-struct gdo_status_t { bool synced; int door,obstruction; uint32_t door_command_id; } current;
+struct gdo_status_t { bool synced; int door,obstruction; } current;
+static uint32_t s_door_command_id;
 static int calls, last_door, last_obstruction;
 static bool s_auto_close_enabled, s_auto_close_triggered;
 static uint32_t s_auto_close_generation, s_close_generation, s_auto_close_command_id;
 static int64_t s_door_open_since_ms;
 static int64_t now_ms() {return 100;}
 static int gdo_get_status(gdo_status_t *s) {*s=current; return ESP_OK;}
-static int gdo_door_close() {++calls;return ESP_OK;}
+static int send_door_request(bool) {++calls;return ESP_OK;}
 static void notify_homekit_target_door_state_change(int) {}
 ''' + fn + r'''
 static void reset() {
- calls=0; current={true,0,0,7}; last_door=last_obstruction=0;
+ calls=0; current={true,0,0}; s_door_command_id=7; last_door=last_obstruction=0;
  s_auto_close_enabled=true; s_auto_close_generation=s_close_generation=3;
  s_auto_close_command_id=7; s_auto_close_triggered=true;
 }
@@ -36,7 +37,7 @@ int main() {
  reset(); current.door=2; auto_close_warning_complete_cb(); assert(calls==0);
  reset(); current.synced=false; auto_close_warning_complete_cb(); assert(calls==0);
  reset(); ++s_close_generation; auto_close_warning_complete_cb(); assert(calls==0);
- reset(); ++current.door_command_id; auto_close_warning_complete_cb(); assert(calls==0);
+ reset(); ++s_door_command_id; auto_close_warning_complete_cb(); assert(calls==0);
 }
 ''', cpp=True)
 

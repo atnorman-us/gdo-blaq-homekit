@@ -110,7 +110,7 @@ For an existing clone, initialize dependencies with:
 git submodule update --init --recursive
 ```
 
-CMake applies the fixes in `patches/` automatically. The two patched dependency submodules may therefore appear modified after configuration; their changes are maintained in the parent repository's patch files.
+CMake applies the fix in `patches/nvs_wifi_connect.patch` automatically. The `nvs_wifi_connect` submodule may therefore appear modified after configuration; its changes are maintained in the parent repository's patch file.
 
 The release version comes from `version.txt`. To run the host regression tests, use Python 3, a C/C++ compiler with AddressSanitizer/UndefinedBehaviorSanitizer support, and Node.js for the dashboard tests:
 

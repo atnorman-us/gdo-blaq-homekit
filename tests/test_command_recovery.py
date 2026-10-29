@@ -37,8 +37,7 @@ static bool s_user_close_pending;
 static volatile bool s_door_in_transition = false;
 static std::vector<std::pair<void(*)(void*), void*>> pending_tasks;
 static int gdo_get_status(gdo_status_t *p) {*p=current;return ESP_OK;}
-static int gdo_door_close() {++closes;return ESP_OK;}
-static int gdo_door_open() {++opens;return ESP_OK;}
+static int send_door_request(bool open) {open ? ++opens : ++closes;return ESP_OK;}
 static void pre_close_warning_run(uint32_t ms) {assert(ms==5000);++warnings;}
 static void notify_homekit_target_door_state_change(int) {}
 static void *pvPortMalloc(size_t n) {if(allocation_failure)return nullptr;++allocated;return malloc(n);}
@@ -114,9 +113,6 @@ static int64_t now_val;
 static int64_t now_ms() { return now_val; }
 static int gdo_set_rolling_code(uint32_t) { return ESP_OK; }
 static int gdo_sync() { return ESP_OK; }
-static bool s_protocol_pinned = false;
-static int protocol_resets = 0;
-static int gdo_reset_protocol() { ++protocol_resets; return ESP_OK; }
 static const char *gdo_protocol_type_to_string(int) { return "Security+ 2.0"; }
 static void xSemaphoreGive(void*) {}
 static void gdo_save_synced_protocol(int) {}
@@ -148,38 +144,23 @@ int main() {
 }
 ''', cpp=True)
 
-    def test_stale_link_requests_status_when_already_synced(self):
-        path='main/gdo-blaq-homekit.cpp'
-        source=(ROOT/path).read_text()
-        start=source.index('        int64_t last_alive_ms = s_last_status_event_ms;')
-        block=source[start:source.index('        // 3) Auto-close:',start)]
-        helper=function(path,'static esp_err_t request_gdo_status_recovery(') if 'static esp_err_t request_gdo_status_recovery(' in source else ''
+    def test_recovery_does_not_resync_a_synced_driver(self):
+        helper=function('main/gdo-blaq-homekit.cpp','static esp_err_t request_gdo_status_recovery(')
         run_c(r'''
 #include <cassert>
-#include <cstdint>
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 2
 #define ESP_LOGW(...) ((void)0)
-#define GDO_LINK_STALE_TIMEOUT_MS 300000
+#define TAG "test"
 using esp_err_t=int;
 struct gdo_status_t {bool synced;};
 static bool synced=true;
-static int refreshes,syncs;
-static int64_t s_last_status_event_ms=1;
-static int64_t last_rx=0;
-static int64_t gdo_get_last_rx_ms() {return last_rx;}
+static int syncs;
 static int gdo_get_status(gdo_status_t *s) {s->synced=synced;return ESP_OK;}
 static int gdo_sync() {if(synced)return ESP_ERR_INVALID_STATE;++syncs;return ESP_OK;}
-static int gdo_refresh_status() {++refreshes;return ESP_OK;}
-''' + helper + '\nstatic void tick(int64_t now) {\n' + block + r'''
-}
+''' + helper + r'''
 int main() {
- tick(300002); assert(refreshes==1 && syncs==0);
- synced=false;tick(600003);assert(syncs==1);
- /* Packets decoded without a state change (a wall panel's polls) keep the
-    link alive: no recovery request while the last RX is recent. */
- synced=true; last_rx=900000; tick(900500); assert(refreshes==1 && syncs==1);
- tick(1200000); assert(refreshes==1);          /* 299.5 s since last RX */
- tick(1200600); assert(refreshes==2);          /* 300.6 s: now stale */
+ assert(request_gdo_status_recovery()==ESP_OK && syncs==0);   /* synced: nothing to renegotiate */
+ synced=false; assert(request_gdo_status_recovery()==ESP_OK && syncs==1);
 }
 ''',cpp=True)

@@ -31,7 +31,7 @@ int main(void) {
  assert(retry_budget_step(&b,2,1,0,70000,8000)==RETRY_WAIT);
 }''')
 
-    def test_gdolib_refuses_to_retry_a_toggle_only_command(self):
+    def test_firmware_refuses_to_retry_a_toggle_only_command(self):
         from test_regressions import function
         run_c(r'''
 #include <assert.h>
@@ -41,18 +41,22 @@ typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_NOT_SUPPORTED 0x106
-static struct { uint32_t door_command_id; bool synced, toggle_only; int32_t door_target; } g_status;
+struct gdo_status_t { bool synced, toggle_only; int32_t door_target; };
+static gdo_status_t g_status;
+static uint32_t s_door_command_id;
 static int opens, closes;
-static esp_err_t door_open_impl(void) { ++opens; return ESP_OK; }
-static esp_err_t door_close_impl(void) { ++closes; return ESP_OK; }
-''' + function('components/gdolib/gdo.c', 'esp_err_t gdo_retry_door_command(uint32_t command_id) {') + r'''
+static esp_err_t gdo_get_status(gdo_status_t *s) { *s = g_status; return ESP_OK; }
+static esp_err_t gdo_door_open(void) { ++opens; return ESP_OK; }
+static esp_err_t gdo_door_close(void) { ++closes; return ESP_OK; }
+''' + function('main/gdo-blaq-homekit.cpp', 'static esp_err_t retry_door_request(uint32_t command_id)') + r'''
 int main(void) {
- g_status.door_command_id = 3; g_status.synced = true; g_status.door_target = 10000;
- assert(gdo_retry_door_command(3) == ESP_OK && closes == 1);
- assert(gdo_retry_door_command(2) == ESP_ERR_INVALID_STATE);
+ s_door_command_id = 3; g_status.synced = true; g_status.door_target = 10000;
+ assert(retry_door_request(3) == ESP_OK && closes == 1);
+ assert(retry_door_request(2) == ESP_ERR_INVALID_STATE);
+ assert(retry_door_request(0) == ESP_ERR_INVALID_STATE);
  g_status.toggle_only = true;   // Security+ 1.0 after sync
- assert(gdo_retry_door_command(3) == ESP_ERR_NOT_SUPPORTED);
+ assert(retry_door_request(3) == ESP_ERR_NOT_SUPPORTED);
  g_status.door_target = 0;
- assert(gdo_retry_door_command(3) == ESP_ERR_NOT_SUPPORTED);
+ assert(retry_door_request(3) == ESP_ERR_NOT_SUPPORTED);
  assert(opens == 0 && closes == 1);
-}''')
+}''', cpp=True)

@@ -18,5 +18,5 @@ def apply_patch(component, patch):
         raise RuntimeError(result.stderr)
 
 if __name__ == '__main__':
-    for name in ('gdolib', 'nvs_wifi_connect'):
+    for name in ('nvs_wifi_connect',):
         apply_patch(ROOT / 'components' / name, ROOT / 'patches' / (name + '.patch'))

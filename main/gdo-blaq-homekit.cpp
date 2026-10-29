@@ -64,9 +64,6 @@ static const char* TAG = "test_main";
 //                                       transition in either direction) -
 //                                       deliberately generous since there's
 //                                       no real data yet to size it tighter.
-//   GDO_LINK_STALE_TIMEOUT_MS (5min)  - the outermost safety net: catches a
-//                                       fully dead UART link, independent of
-//                                       whatever the door is doing.
 // If you're tuning one of these because of a false-positive/negative seen in
 // a real log, the fix usually belongs in exactly one of these buckets - check
 // which failure mode actually happened before changing a number.
@@ -97,19 +94,6 @@ static const char* TAG = "test_main";
 // *position threshold* (how close to 0 counts as fully open). Don't
 // assume changing one should change the other.
 #define GDO_DOOR_STALL_MOVEMENT_MIN    200
-
-// If we haven't seen *any* GDO event (of any kind) in this long, the UART
-// link itself is probably dead (not just "door is idle") - kick a resync.
-//
-// 5 minutes, not 60s: confirmed via a real Sec+2.0 capture that this
-// protocol doesn't send periodic idle status frames the way Sec+1.0 with
-// smart panel does (which chatters roughly once a second even when
-// nothing's happening). On that V2 capture, 61 seconds of total silence
-// was completely normal idle behavior, not a stalled link - a 60s
-// threshold was forcing an unnecessary gdo_sync() during ordinary idle
-// periods. 5 minutes gives real margin above that while still catching a
-// genuinely dead link in a reasonable time.
-#define GDO_LINK_STALE_TIMEOUT_MS      300000
 
 #define GDO_WATCHDOG_PERIOD_MS         5000
 
@@ -195,9 +179,8 @@ static int64_t s_sync_first_failure_ms = 0;
 // count gets exceeded by something else pairing, or an opener firmware
 // update resets it. When that happens, sync retries forever with no
 // visible difference from ordinary transient RX noise, and (since every
-// GDO event, including a failed sync attempt, refreshes
-// s_last_status_event_ms) the link-staleness watchdog never trips either -
-// the device looks perpetually "about to sync any second" instead of
+// GDO event, including a failed sync attempt, counts as link activity) nothing
+// else flags it either - the device looks perpetually "about to sync any second" instead of
 // "stuck." Set once retrying has gone on far longer than any real
 // transient condition should take; surfaced via gdo_diag_get_pairing_fault()
 // for the diagnostics dashboard. Purely informational - doesn't change
@@ -215,7 +198,6 @@ static gdo_learn_state_t       last_learn       = GDO_LEARN_STATE_MAX;
 static SemaphoreHandle_t s_gdo_synced_sem = nullptr;
 static SemaphoreHandle_t s_gdo_protocol_identified_sem = nullptr;
 static volatile bool     s_gdo_protocol_identified = false;
-static volatile int64_t          s_last_status_event_ms = 0;
 static volatile bool             s_door_in_transition   = false;
 static volatile int64_t          s_transition_start_ms  = 0;
 static volatile gdo_door_state_t s_transition_target    = GDO_DOOR_STATE_MAX;
@@ -243,12 +225,37 @@ public:
     ~ControlGuard() { xSemaphoreGiveRecursive(s_control_mutex); }
 };
 
+// gdolib does not number requests, so the firmware does: every open or close
+// it issues gets a new id, and the watchdog's retry repeats the pending one
+// without taking another id, so each request has a single retry budget.
+static volatile uint32_t s_door_command_id = 0;
+
+static esp_err_t send_door_request(bool open)
+{
+    ++s_door_command_id;
+    return open ? gdo_door_open() : gdo_door_close();
+}
+
+// Repeat an unchanged pending request. Never on a toggle-only (Security+ 1.0)
+// opener: a second TOGGLE against stale state can reverse or stop the door.
+static esp_err_t retry_door_request(uint32_t command_id)
+{
+    gdo_status_t status;
+    if (!command_id || command_id != s_door_command_id ||
+        gdo_get_status(&status) != ESP_OK || !status.synced)
+        return ESP_ERR_INVALID_STATE;
+    if (status.toggle_only) return ESP_ERR_NOT_SUPPORTED;
+    if (status.door_target == 0) return gdo_door_open();
+    if (status.door_target == 10000) return gdo_door_close();
+    return ESP_ERR_INVALID_STATE;
+}
+
 // User commands cancel a warning that was already pending. Warnings run
 // outside this lock so settings and newer commands can cancel them.
 extern "C" esp_err_t gdo_control_open(void) {
     ControlGuard guard;
     ++s_close_generation;
-    esp_err_t err = gdo_door_open();
+    esp_err_t err = send_door_request(true);
     activity_record("HomeKit", err == ESP_OK ? "Open sent" : "Open failed");
     return err;
 }
@@ -274,7 +281,7 @@ static void user_close_task(void *arg)
             esp_err_t err = gdo_get_status(&status);
             if (err == ESP_OK && status.synced &&
                 status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
-                err = gdo_door_close();
+                err = send_door_request(false);
                 activity_record("HomeKit", err == ESP_OK ? "Close sent" : "Close failed");
             } else {
                 err = ESP_ERR_INVALID_STATE;
@@ -348,7 +355,9 @@ static esp_err_t request_gdo_status_recovery(void)
     gdo_status_t status;
     esp_err_t err = gdo_get_status(&status);
     if (err != ESP_OK) return err;
-    err = status.synced ? gdo_refresh_status() : gdo_sync();
+    // A synced driver has nothing to renegotiate and gdolib has no public
+    // status request; its own heartbeat and obstruction polls refresh status.
+    err = status.synced ? ESP_OK : gdo_sync();
     if (err != ESP_OK) ESP_LOGW(TAG, "GDO status recovery request failed (%d)", err);
     return err;
 }
@@ -1056,11 +1065,6 @@ static esp_err_t close_schedule_last_day_save(int32_t day)
 
 static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg)
 {
-    // Any event at all (light, lock, position, obstruction, ...) means the
-    // serial link to the opener is alive. Used by the watchdog task below to
-    // detect a fully dead link vs. a door that's just legitimately idle.
-    s_last_status_event_ms = now_ms();
-
     // g_status.protocol is also used internally by gdolib to select the
     // protocol it is currently probing, so a non-zero value alone is not
     // proof that an opener answered. Only events produced from received GDO
@@ -1123,19 +1127,6 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             s_sync_retry_count++;
             uint32_t shift = (s_sync_retry_count > 4) ? 4 : (s_sync_retry_count - 1);
             uint32_t jump = 100u << shift;
-
-            // "Security+ 2.0" is only gdolib's fallback once the V1 probes
-            // hear nothing, and gdolib keeps that fallback for the rest of
-            // the boot. If the opener was wired up (or powered) after the
-            // probe ran, a V1 opener then sits unsynced forever. Unless the
-            // protocol was pinned from a previously confirmed sync, re-run
-            // the full detection every third failed attempt.
-            if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2 && !s_protocol_pinned &&
-                (s_sync_retry_count % 3) == 0) {
-                if (gdo_reset_protocol() == ESP_OK) {
-                    ESP_LOGW(TAG, "Security+ 2.0 sync keeps failing and was never confirmed - re-running protocol detection");
-                }
-            }
 
             if (gdo_set_rolling_code(status->rolling_code + jump) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to set rolling code");
@@ -1370,7 +1361,7 @@ static void auto_close_warning_complete_cb(void)
         status.door == GDO_DOOR_STATE_OPEN && status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR &&
         last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR && s_auto_close_enabled &&
         s_auto_close_generation == s_close_generation &&
-        s_auto_close_command_id == status.door_command_id;
+        s_auto_close_command_id == s_door_command_id;
     if (!valid) {
         activity_record("auto-close", "Close warning cancelled");
         ESP_LOGI(TAG, "Auto-close cancelled during warning");
@@ -1379,7 +1370,7 @@ static void auto_close_warning_complete_cb(void)
         if (last_door == GDO_DOOR_STATE_OPEN) s_door_open_since_ms = now_ms();
         return;
     }
-    if (gdo_door_close() == ESP_OK) {
+    if (send_door_request(false) == ESP_OK) {
         activity_record("auto-close", "Close sent after warning");
         notify_homekit_target_door_state_change(TGT_CLOSED);
     }
@@ -1401,14 +1392,14 @@ static void sched_close_warning_complete_cb(void)
         status.door == GDO_DOOR_STATE_OPEN && status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR &&
         last_obstruction == GDO_OBSTRUCTION_STATE_CLEAR && s_close_schedule.enabled &&
         s_sched_close_generation == s_close_generation &&
-        s_sched_close_command_id == status.door_command_id;
+        s_sched_close_command_id == s_door_command_id;
     s_sched_close_pending = false;
     if (!valid) {
         activity_record("schedule", "Close warning cancelled");
         ESP_LOGI(TAG, "Scheduled close cancelled during warning");
         return;
     }
-    if (gdo_door_close() == ESP_OK) {
+    if (send_door_request(false) == ESP_OK) {
         activity_record("schedule", "Close sent after warning");
         notify_homekit_target_door_state_change(TGT_CLOSED);
     }
@@ -1467,7 +1458,6 @@ static void sched_close_check(void)
         // day, so a later tick inside the window can still fire.
         activity_record("schedule", "Skipped: obstruction not clear");
         ESP_LOGW(TAG, "Scheduled close: obstruction not Clear - holding off");
-        gdo_refresh_status();
         return;
     }
 
@@ -1480,7 +1470,7 @@ static void sched_close_check(void)
     activity_record("schedule", "Close warning started");
     ESP_LOGW(TAG, "Scheduled close: door open at scheduled time - sounding warning and closing");
     s_sched_close_generation = s_close_generation;
-    s_sched_close_command_id = current.door_command_id;
+    s_sched_close_command_id = s_door_command_id;
     s_sched_close_pending = true;
     if (pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
                                     sched_close_warning_complete_cb) != ESP_OK) {
@@ -1517,23 +1507,6 @@ static void gdo_watchdog_task(void *arg)
         //    cheap read, unlike gdo_sync() which renegotiates the rolling
         //    code) and re-derive the real position ourselves.
         if (s_door_in_transition) {
-            // Actively ask the opener for a fresh status update while a
-            // transition is known to be in progress, rather than only
-            // waiting for it to volunteer one. Confirmed via real captures
-            // that some transitions produce zero telemetry between the
-            // start and end frames, leaving HomeKit showing stale state
-            // for the door's full ~10-15s travel time. This can't fix that
-            // if the opener genuinely never answers an on-demand request,
-            // but it's worth trying - requires gdo_refresh_status() to be
-            // added to gdolib (see gdo_refresh_status_patch.md); this call
-            // is a no-op error (logged, harmless) until that's applied.
-            esp_err_t refresh_err = gdo_refresh_status();
-            if (refresh_err == ESP_OK) {
-                ESP_LOGD(TAG, "Requesting status refresh during transition");
-            } else {
-                ESP_LOGD(TAG, "Status refresh request failed: %s", esp_err_to_name(refresh_err));
-            }
-
             gdo_status_t status;
             esp_err_t err = gdo_get_status(&status);
 
@@ -1677,9 +1650,9 @@ static void gdo_watchdog_task(void *arg)
                      (status.door_target == 10000 && status.door == GDO_DOOR_STATE_OPEN));
                 // No retry on a toggle-only (Security+ 1.0) opener: a second
                 // TOGGLE against stale state can reverse or stop the door.
-                // gdo_retry_door_command() refuses it as well; this keeps the
+                // retry_door_request() refuses it as well; this keeps the
                 // 5 s close warning from sounding for a command never sent.
-                retry_action_t action = retry_budget_step(&retry_budget, status.door_command_id,
+                retry_action_t action = retry_budget_step(&retry_budget, s_door_command_id,
                                                           pending, !status.toggle_only,
                                                           now, GDO_MOTOR_ENGAGE_TIMEOUT_MS);
                 if (action == RETRY_SEND) {
@@ -1692,7 +1665,7 @@ static void gdo_watchdog_task(void *arg)
                     if (generation == s_close_generation && gdo_get_status(&fresh) == ESP_OK &&
                         fresh.door == status.door && fresh.door_target == status.door_target &&
                         (fresh.door_target != 10000 || fresh.obstruction == GDO_OBSTRUCTION_STATE_CLEAR)) {
-                        esp_err_t retry_err = gdo_retry_door_command(status.door_command_id);
+                        esp_err_t retry_err = retry_door_request(s_door_command_id);
                         activity_record("watchdog", retry_err == ESP_OK ? "Door command resent" : "Door retry failed");
                     } else {
                         activity_record("watchdog", "Door retry cancelled after state change");
@@ -1714,32 +1687,6 @@ static void gdo_watchdog_task(void *arg)
                     }
                 }
             }
-        }
-
-        // 2) Fully silent link: no status frames of any kind in a long
-        //    time. Distinct from #1 - this fires even while idle, so it
-        //    catches a dead UART link that #1 alone wouldn't notice.
-        // Any decoded packet counts as life, not only a state change: in
-        // "with smart panel" mode the wall panel polls constantly but an idle
-        // door produces no events, and the recovery poll this used to send
-        // every five minutes collided with the panel's traffic. A misread
-        // status byte then surfaced as a half-second Locked/Unlocked flap in
-        // the Home app.
-        int64_t last_alive_ms = s_last_status_event_ms;
-        int64_t last_rx_ms = gdo_get_last_rx_ms();
-        if (last_rx_ms > last_alive_ms) last_alive_ms = last_rx_ms;
-        if (last_alive_ms != 0 &&
-            (now - last_alive_ms) > GDO_LINK_STALE_TIMEOUT_MS) {
-
-            ESP_LOGW(TAG,
-                     "Nothing received from the GDO in %" PRId64 " ms - requesting status recovery",
-                     now - last_alive_ms);
-
-            request_gdo_status_recovery();
-
-            // Debounce: don't fire again every watchdog tick while waiting
-            // for the link to recover.
-            s_last_status_event_ms = now;
         }
 
         // 3) Auto-close: door has been continuously OPEN (confirmed, not
@@ -1769,7 +1716,7 @@ static void gdo_watchdog_task(void *arg)
                     gdo_get_auto_close_remaining_ms() != 0 ||
                     current.obstruction != GDO_OBSTRUCTION_STATE_CLEAR) continue;
                 s_auto_close_generation = s_close_generation;
-                s_auto_close_command_id = current.door_command_id;
+                s_auto_close_command_id = s_door_command_id;
                 s_auto_close_triggered = true;
                 activity_record("auto-close", "Close warning started");
                 if (pre_close_warning_run_async(PRE_CLOSE_WARNING_DURATION_MS,
@@ -1788,13 +1735,6 @@ static void gdo_watchdog_task(void *arg)
                 // Don't set s_auto_close_triggered - re-check next tick
                 // rather than giving up on this open-duration cycle
                 // entirely, in case obstruction clears shortly after.
-                //
-                // Actively request a fresh status update rather than just
-                // passively waiting for gdolib to volunteer one on its own
-                // schedule - we're specifically waiting on obstruction to
-                // clear right now, so there's real value in asking instead
-                // of only reacting to whatever happens to arrive next.
-                gdo_refresh_status();
             }
         }
 
