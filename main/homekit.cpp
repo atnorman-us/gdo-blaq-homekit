@@ -12,6 +12,9 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_mac.h>
+#include <esp_wifi.h>
+#include <esp_netif.h>
+#include <esp_event.h>
 
 #include <hap.h>
 #include <hap_apple_servs.h>
@@ -55,6 +58,51 @@ struct GDOEvent {
 static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 
+
+// nvs_wifi_connect only retries while it is bringing the connection up at
+// boot, then drops its event handlers. Without these, a router reboot or a
+// brief Wi-Fi outage leaves the opener offline until it is power-cycled.
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected, retrying");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "Got IP, network restored");
+    }
+}
+
+// Backstop for a connection that is up but stuck (no AP or no address, with
+// no disconnect event to react to): force a fresh connect attempt.
+static void network_watchdog_task(void* pvParameters)
+{
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        esp_netif_t* sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        // Only a station has anything to reconnect; in setup (softAP) mode
+        // there is no STA interface.
+        if (esp_wifi_get_mode(&mode) != ESP_OK || mode != WIFI_MODE_STA || !sta_netif) {
+            continue;
+        }
+
+        wifi_ap_record_t ap_info;
+        esp_netif_ip_info_t ip_info = {};
+        bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+        // esp_netif_get_ip_info() succeeds with 0.0.0.0 while DHCP is still
+        // running, so check the address itself.
+        bool ip_ok = (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) && ip_info.ip.addr != 0;
+
+        if (!wifi_ok || !ip_ok) {
+            ESP_LOGW(TAG, "Network lost, reconnecting");
+            esp_wifi_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_wifi_connect();
+        }
+    }
+}
 
 /********************************** MAIN LOOP CODE *****************************************/
 
@@ -139,6 +187,10 @@ void homekit_task_entry(void* ctx) {
     app_wifi_init();
 
     hap_start();
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    xTaskCreate(network_watchdog_task, "net_watchdog", 4096, NULL, 5, NULL);
 
     GDOEvent e;
 
