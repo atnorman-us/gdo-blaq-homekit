@@ -2,7 +2,13 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.7.1](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.1)**
+**Current release: [1.3.7.2](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.2)**
+
+## What's changed in 1.3.7.2
+
+Fixes a crash that could open a Security+ 1.0 door. When the network came back after a drop, the diagnostics web server was restarted from the system event task, whose small stack overflowed. The chip panicked and reset, and a toggle-only Security+ 1.0 opener can read that reset as a button press. The restart now runs on its own task. The Last Reset field on the diagnostics page showed "Panic/exception" when this happened. On a Security+ 1.0 opener, three block/unblock cycles on this release, one with the door open, finished without a restart or any door movement. A panic from any other cause still skips the UART shutdown protection and can still move the door.
+
+This release also builds against upstream gdolib 29eec37 instead of a patched copy. That brings the corrected battery state strings, a delayed openings request on Security+ 2.0 openers that ignore an immediate one, and upstream's Security+ 1.0 and obstruction handling. Openings and battery were checked on a Security+ 2.0 opener. Watch obstruction and light/lock behavior on Security+ 1.0.
 
 ## What's changed in 1.3.7.1
 
