@@ -129,7 +129,7 @@ This is native HomeKit firmware. Release 1.3.5.0 does not introduce a Matter mig
 
 ## Diagnostics dashboard and admin password
 
-Open **`http://gdo-blaq.local:8080/`** on the same network as the device. If mDNS does not resolve, use **`http://<device-ip>:8080/`** instead.
+Open **`http://gdo-blaq-xxxxxx.local:8080/`** on the same network as the device, where `xxxxxx` is the last six hex digits of its MAC address (the same digits as its HomeKit name, "Garage Door XXXXXX"). If mDNS does not resolve, use **`http://<device-ip>:8080/`** instead.
 
 On first use, set an **8–64-character admin password** using the dashboard's setup banner. The dashboard prompts with a masked password field for protected actions and retains the entered password only in the current page's memory. Saved credentials survive a reboot. This replaces the earlier generated admin-token workflow; an older token is not the new admin password.
 
