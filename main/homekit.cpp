@@ -13,6 +13,7 @@ static const char *TAG = "HOMEKIT";
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_mac.h>
+#include "bootloader_random.h"
 
 #include <hap_apple_servs.h>
 #include <hap_apple_chars.h>
@@ -357,7 +358,15 @@ void homekit_task_entry(void* ctx) {
 
     homekit_notif_queue_init(); // already created earlier by app_main() in the normal case; idempotent
 
+    // hap_init() creates the accessory ID and Ed25519 long-term keys on first
+    // boot (esp_hap_database.c), via esp_random(). Wi-Fi is not started yet,
+    // so without an entropy source the RNG is only pseudo-random and every
+    // freshly flashed blaQ got the same ID and keys - Home then treats two
+    // doors as one accessory. Enable the SAR ADC entropy source for the call;
+    // nothing else uses the ADC or RF at this point.
+    bootloader_random_enable();
     hap_init(HAP_TRANSPORT_WIFI);
+    bootloader_random_disable();
 
     hap_acc_cfg_t config;
     config.name = device_name;

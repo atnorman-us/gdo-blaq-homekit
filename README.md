@@ -4,6 +4,12 @@ Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMa
 
 **Current release: [1.3.7.2](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.2)**
 
+## What's changed in 1.3.7.3
+
+Fixes units flashed from scratch coming up with the same HomeKit accessory ID and long-term keys. The ID and keys are generated on first boot before Wi-Fi starts, when the chip's random number generator had no entropy source, so freshly erased units could produce identical values. Home then treated two doors as one accessory: only one appeared in Add Accessory, and commands could reach the wrong door. The entropy source is now enabled while the identity is created. Units already in the field keep the identity stored on the device, so an OTA update does not change a duplicate ID. A unit that shares an ID with another needs to be removed from Home, USB-flashed with erase-flash, and added again.
+
+The mDNS hostname is now `gdo-blaq-xxxxxx.local`, using the same six hex digits as the "Garage Door XXXXXX" accessory name, instead of `gdo-blaq.local` on every unit. **Bookmarks to `gdo-blaq.local` stop working after this update.** The Wi-Fi setup page now shows the unit's own hostname and Home name after saving.
+
 ## What's changed in 1.3.7.2
 
 Fixes a crash that could open a Security+ 1.0 door. When the network came back after a drop, the diagnostics web server was restarted from the system event task, whose small stack overflowed. The chip panicked and reset, and a toggle-only Security+ 1.0 opener can read that reset as a button press. The restart now runs on its own task. The Last Reset field on the diagnostics page showed "Panic/exception" when this happened. On a Security+ 1.0 opener, three block/unblock cycles on this release, one with the door open, finished without a restart or any door movement. A panic from any other cause still skips the UART shutdown protection and can still move the door.
@@ -135,7 +141,7 @@ This is native HomeKit firmware. Release 1.3.5.0 does not introduce a Matter mig
 
 ## Diagnostics dashboard and admin password
 
-Open **`http://gdo-blaq.local:8080/`** on the same network as the device. If mDNS does not resolve, use **`http://<device-ip>:8080/`** instead.
+Open **`http://gdo-blaq-xxxxxx.local:8080/`** on the same network as the device, where `xxxxxx` is the last six hex digits of its MAC address (the same digits as its HomeKit name, "Garage Door XXXXXX"). If mDNS does not resolve, use **`http://<device-ip>:8080/`** instead.
 
 On first use, set an **8–64-character admin password** using the dashboard's setup banner. The dashboard prompts with a masked password field for protected actions and retains the entered password only in the current page's memory. Saved credentials survive a reboot. This replaces the earlier generated admin-token workflow; an older token is not the new admin password.
 
