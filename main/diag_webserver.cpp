@@ -15,6 +15,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "mdns.h"
 #include "nvs.h"
@@ -50,7 +51,7 @@ extern "C" int homekit_get_connected_session_count(void);
 static const char *TAG = "DIAGWEB";
 #define DIAG_WEB_PORT 8080
 #define LOG_BUFFER_CAPACITY (64 * 1024)
-#define DIAG_MDNS_HOSTNAME "gdo-blaq"
+#define DIAG_MDNS_HOSTNAME_PREFIX "gdo-blaq"
 
 // Persistent so diag_webserver_restart() can stop and recreate it after a
 // WiFi bounce - the underlying httpd socket doesn't reliably survive an
@@ -177,7 +178,7 @@ static bool reject_unless_own_page(httpd_req_t *req)
     ESP_LOGW(TAG, "Refusing cross-origin request (Host=%s Origin=%s Sec-Fetch-Site=%s%s)",
              host, origin, site, bad_header ? ", oversized header" : "");
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
-                        "Cross-origin request refused - open the diagnostics page by the device's IP address or gdo-blaq.local");
+                        "Cross-origin request refused - open the diagnostics page by the device's IP address or its gdo-blaq-xxxxxx.local name");
     return false;
 }
 
@@ -1873,7 +1874,7 @@ static void wait_for_network_and_start_task(void *arg)
     }
     s_server_started_once = true;
 
-    // Advertise http://gdo-blaq.local:8080/ so the diagnostics page doesn't
+    // Advertise http://gdo-blaq-xxxxxx.local:8080/ so the diagnostics page doesn't
     // require hunting for the device's IP. mdns_init() is safe to call even
     // though esp_hap_core (HomeKit) already calls it during hap_start() -
     // the real implementation just returns ESP_OK if already initialized,
@@ -1883,12 +1884,23 @@ static void wait_for_network_and_start_task(void *arg)
     // renames the existing HAP service's host reference - harmless, since
     // HomeKit pairing identity lives in the HAP service's TXT/instance
     // records, not the hostname.
+    //
+    // The hostname carries the same device-unique MAC bytes as the accessory
+    // name. A fixed "gdo-blaq" made two units contend for it (mDNS renames
+    // one to gdo-blaq-2), and when they sit on networks joined by an mDNS
+    // reflector the HAP service's host reference could end up pointing at
+    // the other unit or a stale address.
     esp_err_t mdns_err = mdns_init();
     if (mdns_err == ESP_OK) {
-        mdns_hostname_set(DIAG_MDNS_HOSTNAME);
+        uint8_t mac[6] = {0};
+        char hostname[32];
+        esp_efuse_mac_get_default(mac);
+        snprintf(hostname, sizeof(hostname), "%s-%02x%02x%02x",
+                 DIAG_MDNS_HOSTNAME_PREFIX, mac[3], mac[4], mac[5]);
+        mdns_hostname_set(hostname);
         mdns_instance_name_set("GDO Diagnostics");
         mdns_service_add("GDO Diagnostics", "_http", "_tcp", DIAG_WEB_PORT, NULL, 0);
-        ESP_LOGI(TAG, "mDNS advertised as http://%s.local:%d/", DIAG_MDNS_HOSTNAME, DIAG_WEB_PORT);
+        ESP_LOGI(TAG, "mDNS advertised as http://%s.local:%d/", hostname, DIAG_WEB_PORT);
     } else {
         ESP_LOGW(TAG, "mdns_init() failed: %s - diagnostics page will only be reachable by IP",
                  esp_err_to_name(mdns_err));

@@ -425,7 +425,7 @@ index c6d8eff..2ff4fc1 100644
 +        setButtons(false);
 +        var sta = $('nvsApStaMode').value === 'modeSta';
 +        setStatus(sta
-+            ? 'Saved. The device is rebooting and will join "' + $('nvsStaSsid').value + '". Reconnect this computer to your own WiFi, then open http://gdo-blaq.local:8080/ to find it.'
++            ? 'Saved. The device is rebooting and will join "' + $('nvsStaSsid').value + '". Reconnect this computer to your own WiFi, then open http://gdo-blaq-xxxxxx.local:8080/ (the last six hex digits of its MAC) or find its IP in your router.'
 +            : 'Saved. The device is rebooting and will start the access point "' + $('nvsApSsid').value + '".', 'ok');
 +        sendJson({ name: 'Wifi_Restart', msg: 'restart' });
 +    });
