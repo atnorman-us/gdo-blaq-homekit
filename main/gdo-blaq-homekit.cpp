@@ -5,6 +5,10 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_rom_gpio.h"
+#include "soc/gpio_sig_map.h"
+#include "driver/gpio.h"
 #include "wifi.h"
 
 #include "gdo.h"
@@ -84,16 +88,34 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
     }
 }
 
+// Board UART pins are shared by initialization and the restart protection.
+#define GDO_UART_TX_PIN GPIO_NUM_1
+#define GDO_UART_RX_PIN GPIO_NUM_2
+
+// esp_restart() invokes this before resetting the UART peripheral. Disconnect
+// its matrix route first so losing UART inversion cannot drive the opener line.
+// Then release both pins as inputs.
+// No queued door commands, delays, allocation, or driver teardown here.
+// This covers orderly software restarts, not power loss or a hard reset.
+static void gdo_uart_shutdown(void)
+{
+    esp_rom_gpio_connect_out_signal(GDO_UART_TX_PIN, SIG_GPIO_OUT_IDX, false, false);
+    gpio_set_direction(GDO_UART_TX_PIN, GPIO_MODE_INPUT);
+    gpio_set_direction(GDO_UART_RX_PIN, GPIO_MODE_INPUT);
+}
+
 extern "C" void app_main(void)
 {
     gdo_config_t gdo_conf;
     gdo_conf.invert_uart = true;
     gdo_conf.obst_from_status = true;
     gdo_conf.uart_num = UART_NUM_1;
-    gdo_conf.uart_tx_pin = GPIO_NUM_1;
-    gdo_conf.uart_rx_pin = GPIO_NUM_2;
+    gdo_conf.uart_tx_pin = GDO_UART_TX_PIN;
+    gdo_conf.uart_rx_pin = GDO_UART_RX_PIN;
     gdo_conf.obst_in_pin = GPIO_NUM_5;
 
+    // Do not start the opener interface if restart protection cannot register.
+    ESP_ERROR_CHECK(esp_register_shutdown_handler(gdo_uart_shutdown));
     ESP_ERROR_CHECK(gdo_init(&gdo_conf));
     ESP_ERROR_CHECK(gdo_start(gdo_event_handler, NULL));
 
