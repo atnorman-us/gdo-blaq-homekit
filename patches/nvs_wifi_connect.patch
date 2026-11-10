@@ -167,10 +167,10 @@ index d59140f..58ae79d 100644
  
      return ESP_ERR_INVALID_ARG;
 diff --git a/source/nvs_wifi_connect.html b/source/nvs_wifi_connect.html
-index c6d8eff..2ff4fc1 100644
+index c6d8eff..facf13a 100644
 --- a/source/nvs_wifi_connect.html
 +++ b/source/nvs_wifi_connect.html
-@@ -1,198 +1,172 @@
+@@ -1,198 +1,182 @@
  <!DOCTYPE html>
 +<html lang="en">
  <head>
@@ -373,6 +373,8 @@ index c6d8eff..2ff4fc1 100644
 +    var reconnectAttempts = 0;
 +    var rebooting = false;
 +    var MAX_RECONNECT = 10;
++    var deviceHostname = '';   // sent by the device, e.g. gdo-blaq-786e6c
++    var deviceHomeName = '';   // sent by the device, e.g. Garage Door 786E6C
 +
 +    function $(id) { return document.getElementById(id); }
 +    function setStatus(text, cls) { var el = $('status'); el.textContent = text; el.className = cls || ''; }
@@ -419,13 +421,19 @@ index c6d8eff..2ff4fc1 100644
 +        return true;
 +    }
 +
++    function whereToFind() {
++        if (!deviceHostname) return 'find the device\'s IP address in your router.';
++        return 'open http://' + deviceHostname + '.local:8080/ or find its IP address in your router.' +
++            (deviceHomeName ? ' In the Home app it appears as "' + deviceHomeName + '".' : '');
++    }
++
 +    $('Wifi_Restart').addEventListener('click', function () {
 +        if (!sendWifiData()) return;
 +        rebooting = true;
 +        setButtons(false);
 +        var sta = $('nvsApStaMode').value === 'modeSta';
 +        setStatus(sta
-+            ? 'Saved. The device is rebooting and will join "' + $('nvsStaSsid').value + '". Reconnect this computer to your own WiFi, then open http://gdo-blaq.local:8080/ to find it.'
++            ? 'Saved. The device is rebooting and will join "' + $('nvsStaSsid').value + '". Reconnect this computer to your own WiFi, then ' + whereToFind()
 +            : 'Saved. The device is rebooting and will start the access point "' + $('nvsApSsid').value + '".', 'ok');
 +        sendJson({ name: 'Wifi_Restart', msg: 'restart' });
 +    });
@@ -439,6 +447,8 @@ index c6d8eff..2ff4fc1 100644
 +        try {
 +            var obj = JSON.parse(data);
 +            if (obj.name === 'scanResult') { addScanResult(obj.msg, obj.rssi); return; }
++            if (obj.name === 'deviceHostname') { deviceHostname = obj.msg; return; }
++            if (obj.name === 'deviceHomeName') { deviceHomeName = obj.msg; return; }
 +            var el = $(obj.name);
 +            if (!el) return;
 +            el.value = obj.msg;
@@ -526,10 +536,18 @@ index c6d8eff..2ff4fc1 100644
 \ No newline at end of file
 +</html>
 diff --git a/source/nvs_wifi_connect_http_server.c b/source/nvs_wifi_connect_http_server.c
-index b45134e..f7726e7 100644
+index b45134e..262e947 100644
 --- a/source/nvs_wifi_connect_http_server.c
 +++ b/source/nvs_wifi_connect_http_server.c
-@@ -23,30 +23,102 @@ enum
+@@ -10,6 +10,7 @@
+ 
+ 
+ #include "jsmn.h"
++#include "esp_mac.h"
+ 
+ static const char *TAG = "nvs_wifi_connect_http_server";
+ 
+@@ -23,30 +24,102 @@ enum
  static int srv_restart = 0;
  static nvs_wifi_connect_register_uri_handler_t srv_register_uri_handler;
  
@@ -651,7 +669,7 @@ index b45134e..f7726e7 100644
      return ESP_OK;
  }
  static void send_json_string(char *str, httpd_req_t *req)
-@@ -59,35 +131,43 @@ static void send_json_string(char *str, httpd_req_t *req)
+@@ -59,35 +132,58 @@ static void send_json_string(char *str, httpd_req_t *req)
      httpd_ws_send_frame(req, &ws_pkt);
  }
  // read & send initial wifi data from nvs
@@ -666,6 +684,20 @@ index b45134e..f7726e7 100644
 +    if (nvs_get_str(nvs_handle, key, nvs_data, &required_size) != ESP_OK) return;
 +    if (json_escape(nvs_data, escaped, sizeof(escaped)) < 0) return;
 +    snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"msg\":\"%s\"}", key, escaped);
++    send_json_string(buf, req);
++}
++// Tells the page the names this unit will use once it joins the user's
++// network, so the confirmation can name them instead of a placeholder. Must
++// match the mDNS hostname in main/diag_webserver.cpp and the accessory name in
++// main/homekit.cpp: both use MAC bytes 3-5 of the default (base) MAC.
++static void send_device_names(httpd_req_t *req)
++{
++    uint8_t mac[6] = {0};
++    char buf[96];
++    if (esp_efuse_mac_get_default(mac) != ESP_OK) return;
++    snprintf(buf, sizeof(buf), "{\"name\":\"deviceHostname\",\"msg\":\"gdo-blaq-%02x%02x%02x\"}", mac[3], mac[4], mac[5]);
++    send_json_string(buf, req);
++    snprintf(buf, sizeof(buf), "{\"name\":\"deviceHomeName\",\"msg\":\"Garage Door %02X%02X%02X\"}", mac[3], mac[4], mac[5]);
 +    send_json_string(buf, req);
 +}
 +// One frame per scanned network: {"name":"scanResult","msg":"<ssid>","rssi":-63}
@@ -687,6 +719,7 @@ index b45134e..f7726e7 100644
 +// simply not resending the field when it is left blank.
 +static void send_nvs_data(httpd_req_t *req)
 +{
++    send_device_names(req);
      nvs_handle_t nvs_handle;
 -    size_t required_size = 0;
 -
@@ -720,7 +753,7 @@ index b45134e..f7726e7 100644
  }
  // write wifi data from ws to nvs
  static void set_nvs_data(char *jsonstr, httpd_req_t *req)
-@@ -95,11 +175,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+@@ -95,11 +191,12 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
      char key[16];
      char value[64];
      nvs_handle_t nvs_handle;
@@ -735,7 +768,7 @@ index b45134e..f7726e7 100644
      }
      else
      {
-@@ -107,7 +188,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
+@@ -107,7 +204,7 @@ static void set_nvs_data(char *jsonstr, httpd_req_t *req)
          {
              if (nvs_set_str(nvs_handle, key, value)) // write key/value to nvs
              {
@@ -744,7 +777,7 @@ index b45134e..f7726e7 100644
              }
              nvs_commit(nvs_handle);
              nvs_close(nvs_handle);
-@@ -150,6 +231,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
+@@ -150,6 +247,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
          ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
          return ret;
      }
@@ -752,7 +785,7 @@ index b45134e..f7726e7 100644
      if (ws_pkt.len)
      {
          /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
-@@ -198,6 +280,7 @@ static httpd_handle_t start_webserver(void)
+@@ -198,6 +296,7 @@ static httpd_handle_t start_webserver(void)
  {
      httpd_handle_t server = NULL;
      httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -760,7 +793,7 @@ index b45134e..f7726e7 100644
      // Start the httpd server
      if (httpd_start(&server, &config) == ESP_OK)
      {
-@@ -260,7 +343,6 @@ static void full_stop_httpd_server(void *arg, esp_event_base_t event_base,
+@@ -260,7 +359,6 @@ static void full_stop_httpd_server(void *arg, esp_event_base_t event_base,
              ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler));
              ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler));
              ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, &connect_handler));
@@ -768,7 +801,7 @@ index b45134e..f7726e7 100644
              ESP_ERROR_CHECK(esp_event_handler_unregister(NVS_WIFI_CONNECT_STOP_HTTPD, NVS_WIFI_CONNECT_STOP_HTTPD_EVENT, &full_stop_httpd_server));
              ESP_LOGI(TAG, "Unregister handlers OK");
          }
-@@ -291,11 +373,14 @@ httpd_handle_t nvs_wifi_connect_start_http_server(int restart, nvs_wifi_connect_
+@@ -291,11 +389,14 @@ httpd_handle_t nvs_wifi_connect_start_http_server(int restart, nvs_wifi_connect_
      ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
      ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
  
