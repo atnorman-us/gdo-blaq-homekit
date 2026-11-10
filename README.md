@@ -2,13 +2,15 @@
 
 Native HomeKit firmware for Konnected's GDO blaQ, supporting Chamberlain, LiftMaster, Craftsman, and Merlin garage door openers using Security+ or Security+ 2.0.
 
-**Current release: [1.3.7.2](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.2)**
+**Current release: [1.3.7.3](https://github.com/atnorman-us/gdo-blaq-homekit/releases/tag/1.3.7.3)**
 
 ## What's changed in 1.3.7.3
 
 Fixes units flashed from scratch coming up with the same HomeKit accessory ID and long-term keys. The ID and keys are generated on first boot before Wi-Fi starts, when the chip's random number generator had no entropy source, so freshly erased units could produce identical values. Home then treated two doors as one accessory: only one appeared in Add Accessory, and commands could reach the wrong door. The entropy source is now enabled while the identity is created. Units already in the field keep the identity stored on the device, so an OTA update does not change a duplicate ID. A unit that shares an ID with another needs to be removed from Home, USB-flashed with erase-flash, and added again.
 
 The mDNS hostname is now `gdo-blaq-xxxxxx.local`, using the same six hex digits as the "Garage Door XXXXXX" accessory name, instead of `gdo-blaq.local` on every unit. **Bookmarks to `gdo-blaq.local` stop working after this update.** The Wi-Fi setup page now shows the unit's own hostname and Home name after saving.
+
+The shutdown handler that releases the opener UART pins before a software restart, which keeps a Security+ 1.0 opener from reading the restart as a button press, now also pulls the TX pin down. This matches upstream and the konnected-esphome panic handler, so both firmwares leave the pin in the same idle state. It covers orderly software restarts only. A panic, power loss, or a hard reset can still move the door.
 
 ## What's changed in 1.3.7.2
 

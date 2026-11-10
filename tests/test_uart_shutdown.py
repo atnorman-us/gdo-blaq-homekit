@@ -16,10 +16,13 @@ static void esp_rom_gpio_connect_out_signal(int pin,int sig,int invert,int oe) {
 }
 static int gpio_set_direction(int pin,int mode) {
  assert(mode==GPIO_MODE_INPUT);
- assert((step==1 && pin==1)||(step==2 && pin==2)); ++step;return 0;
+ assert((step==1 && pin==1)||(step==3 && pin==2)); ++step;return 0;
+}
+static int gpio_pulldown_en(int pin) {
+ assert(step==2 && pin==1); ++step;return 0;
 }
 ''' + function('main/gdo-blaq-homekit.cpp','static void gdo_uart_shutdown(void)') + r'''
-int main(void){gdo_uart_shutdown();assert(step==3);step=0;gdo_uart_shutdown();assert(step==3);}
+int main(void){gdo_uart_shutdown();assert(step==4);step=0;gdo_uart_shutdown();assert(step==4);}
 ''', cpp=True)
 
     def test_shutdown_registered_before_uart_is_connected(self):
