@@ -14,6 +14,8 @@
 #include "esp_rom_gpio.h"
 #include "soc/gpio_sig_map.h"
 #include "driver/gpio.h"
+#include "hal/gpio_hal.h"
+#include "hal/gpio_ll.h"
 #include "wifi.h"
 #include <inttypes.h> 
 
@@ -1815,18 +1817,38 @@ extern "C" bool gdo_wait_for_identified_protocol(uint32_t timeout_ms,
 #define GDO_UART_TX_PIN GPIO_NUM_1
 #define GDO_UART_RX_PIN GPIO_NUM_2
 
-// esp_restart() invokes this before resetting the UART peripheral. Disconnect
-// its matrix route first so losing UART inversion cannot drive the opener line.
-// Then release both pins as inputs, with TX pulled down so the opener line
-// stays idle (matches the konnected-esphome panic handler).
-// No queued door commands, delays, allocation, or driver teardown here.
-// This covers orderly software restarts, not power loss or a hard reset.
-static void gdo_uart_shutdown(void)
+// Idle the opener line: disconnect TX from the UART signal route so losing
+// UART inversion cannot drive it, stop driving the pin, and pull it down.
+// Shared by the restart and panic paths. A panic can happen with the flash
+// cache unusable, so this uses only ROM and register-level calls and stays in
+// IRAM.
+static void IRAM_ATTR gdo_uart_release_tx(void)
 {
     esp_rom_gpio_connect_out_signal(GDO_UART_TX_PIN, SIG_GPIO_OUT_IDX, false, false);
+    gpio_ll_output_disable(GPIO_HAL_GET_HW(GPIO_PORT_0), GDO_UART_TX_PIN);
+    gpio_ll_pulldown_en(GPIO_HAL_GET_HW(GPIO_PORT_0), GDO_UART_TX_PIN);
+}
+
+// esp_restart() invokes this before resetting the UART peripheral. Release TX,
+// then release both pins as inputs.
+// No queued door commands, delays, allocation, or driver teardown here.
+// This covers orderly software restarts. A panic goes through
+// __wrap_esp_panic_handler below; power loss or a hard reset are not covered.
+static void gdo_uart_shutdown(void)
+{
+    gdo_uart_release_tx();
     gpio_set_direction(GDO_UART_TX_PIN, GPIO_MODE_INPUT);
-    gpio_pulldown_en(GDO_UART_TX_PIN);
     gpio_set_direction(GDO_UART_RX_PIN, GPIO_MODE_INPUT);
+}
+
+// A panic resets through esp_restart_noos(), which skips shutdown handlers.
+// main/CMakeLists.txt links with --wrap=esp_panic_handler, so the panic path
+// calls this first, releases TX, then continues into the real handler.
+extern "C" void __real_esp_panic_handler(void *info);
+extern "C" void IRAM_ATTR __wrap_esp_panic_handler(void *info)
+{
+    gdo_uart_release_tx();
+    __real_esp_panic_handler(info);
 }
 
 extern "C" void app_main(void)

@@ -10,7 +10,7 @@ Fixes units flashed from scratch coming up with the same HomeKit accessory ID an
 
 The mDNS hostname is now `gdo-blaq-xxxxxx.local`, using the same six hex digits as the "Garage Door XXXXXX" accessory name, instead of `gdo-blaq.local` on every unit. **Bookmarks to `gdo-blaq.local` stop working after this update.** The Wi-Fi setup page now shows the unit's own hostname and Home name after saving.
 
-The shutdown handler that releases the opener UART pins before a software restart, which keeps a Security+ 1.0 opener from reading the restart as a button press, now also pulls the TX pin down. This matches upstream and the konnected-esphome panic handler, so both firmwares leave the pin in the same idle state. It covers orderly software restarts only. A panic, power loss, or a hard reset can still move the door.
+A Security+ 1.0 opener can read a reset of the chip as a button press and move the door. Orderly restarts already release the opener UART pins first, and the TX pin is now also pulled down so the line stays idle, matching upstream and the konnected-esphome panic handler. A panic skipped that protection because it resets through a different path. The panic handler is now wrapped so it releases the TX pin before the chip resets. On a Security+ 1.0 opener, three forced panics without the wrap each moved the door, and three with it did not. Restoring power after a breaker cycle did not move the door on a Security+ 1.0 or 2.0 opener. Resets done by hardware, such as power loss, a brownout, or the RTC watchdog, bypass the panic handler and are not covered.
 
 ## What's changed in 1.3.7.2
 
